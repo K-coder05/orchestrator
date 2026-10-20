@@ -8,6 +8,7 @@
 > - If a CLI flag, output format or error message named here doesn't match the installed tool, trust the tool (`--help`, real output), record what you found in `docs/adapters.md`, and tell me.
 > - Never run `sudo` or `brew`, and never install anything system-wide. Project-local `pip`/`npm` installs are fine.
 > - Every phase ends with its gate tests passing on real data. I run the gate; you make sure the tests and tooling exist to run it.
+> - Domain terms (Task, Attempt, Occurrence, Step, Checkpoint, Effective priority, etc.) are defined in `CONTEXT.md`. Use them exactly. Architecture decisions live in `docs/adr/`.
 
 ---
 
@@ -40,11 +41,12 @@ The orchestrator picks the agent by task type. `--agent <name>` overrides it on 
 ### 1.1 Machine
 - 14" MacBook Pro, Apple M3, 16 GB RAM, ~150 GB free, macOS 26. **These are placeholders and defaults only.** Store them in config and never hard-code them. `orch doctor` reads the real values from the machine.
 - It's a laptop. It sleeps in a backpack roughly 9am–6pm on weekdays. Most nights it sits plugged in at home, lid open, roughly midnight–8am.
+- **macOS is the only supported host** (`docs/adr/0001-macos-only-host.md`). Development happens on the Mac itself. All OS-specific calls (`launchd`, `caffeinate`, `pmset`, Keychain, hardware/version probes) sit behind one thin host seam with a fake implementation for tests, so core logic is testable on any OS. Only the gate requires the Mac.
 - Nightshift must survive sleep and missed runs. It holds the machine awake with `caffeinate` **only while a task is running**, and releases it when nothing runs.
 - Installed by me: Claude Code, Codex CLI, Gemini CLI, Node 22, Python 3.12, git, Homebrew, VS Code. I will also install the TeX toolchain myself, plus anything else listed in §1.9. No Docker until Phase 4.
 
 ### 1.2 Stack
-- Python 3.12 core, FastAPI, SQLite.
+- Python 3.12+ core (`requires-python = ">=3.12"`; don't use 3.13-only features), FastAPI, SQLite.
 - Dashboard frontend: HTMX or a small React app. Pick one, explain why in `docs/decisions.md`, then stick with it.
 - macOS `launchd` keeps the daemon running.
 - Claude Code may choose other libraries if it explains why in `docs/decisions.md`.
@@ -59,12 +61,14 @@ The orchestrator picks the agent by task type. `--agent <name>` overrides it on 
 | `~/.config/nightshift/config.yaml` | My config, not in the repo |
 | `~/.config/nightshift/.env` (mode `0600`) or macOS Keychain | Secrets: API keys, Telegram bot token, calendar iCal URLs. Never committed, never logged, never written into reports |
 | `~/agents/` | Task data only (no code) |
-| `~/agents/tasks/YYYY-MM-DD_<slug>_<id>/` | One folder per one-off task run. `<id>` is 4 lowercase base36 characters, unique. Example: `2026-10-20_resume-acme-swe-intern_k3f9/` |
-| `~/agents/recurring/<schedule-name>/YYYY-MM-DD/` | One folder per recurring run |
+| `~/agents/tasks/YYYY-MM-DD_<slug>_<id>/` | One folder per one-off Task. `<id>` is 4 lowercase base36 characters, unique. Example: `2026-10-20_resume-acme-swe-intern_k3f9/` |
+| `~/agents/recurring/<schedule-name>/YYYY-MM-DD/` | One folder per Occurrence (a Task created by a Schedule) |
 | `~/agents/data/nightshift.db` | SQLite database |
 | `~/agents/data/applications.csv` | Application tracker. Nightshift owns it; I'll sync it to a Google Sheet later (not in scope) |
 | `~/agents/data/snapshots/` | Scrape snapshots and diffs |
 | `~/agents/archive/` | Archived outputs and zipped logs (Phase 4) |
+
+Retries, resumes and failovers are new **Attempts** inside the same Task folder; they never create a new folder.
 
 **Every task folder contains:**
 - `task.yaml`: the request and settings
@@ -89,6 +93,8 @@ The orchestrator picks the agent by task type. `--agent <name>` overrides it on 
 - On by default for research, scraping and job tasks.
 - Off by default for coding and comedy tasks, unless the task turns it on (`--internet on`).
 
+**Web access on internet-on tasks:** allow only the agent's built-in fetch/search tools, with LinkedIn domains denied. Deny network commands in Bash (`curl`, `wget`, `python -c`, `nc`, and similar). A Bash deny-list can be bypassed, so `docs/safety.md` lists it as *best effort*, not enforced. `robots.txt` and site terms are *instruction-only*.
+
 Enforce these limits with each agent's own permission, sandbox and allowlist settings, generated per task. **No blanket skip-permissions mode outside a sandbox.**
 
 In `docs/safety.md`, list which limits are *technically enforced* and which are *instruction-only*. For example, Bash network access may not be fully blockable without Docker. Be honest about gaps; don't paper over them.
@@ -110,6 +116,8 @@ In `docs/safety.md`, list which limits are *technically enforced* and which are 
 **Claude usage windows.** Claude has a rolling 5-hour window plus a weekly cap. I don't know the exact numbers. **Codex (and Gemini, from Phase 2) are tracked the same way:** learned baselines, reset detection and probing, each with its own windows.
 - Nightshift learns a **baseline** for each window from real limit hits. The baseline is the usage it recorded in that window up to the moment of the hit.
 - Use the **lowest of the last 3 observations** (conservative).
+- Record every usage field an adapter reports per Attempt (input, output and cache tokens, request count, reported cost). The baseline unit is **reported cost-equivalent**, since it already weights model differences.
+- Known gap: Nightshift sees only its own usage, not my interactive use, so recorded usage at a hit undercounts the window. This errs low (conservative). Document it in `docs/adapters.md`.
 - Until a baseline exists, pause only on actual rate-limit errors.
 - Detect resets from reset times in rate-limit errors. If an error has no parseable reset time, probe with a minimal request at a configurable interval (default 30 min).
 
@@ -210,6 +218,8 @@ Every transition is written to the DB, with a timestamp and reason.
 - **Normal:** runs in order.
 - **Background:** runs only when nothing else is waiting.
 
+`task.yaml` stores only the priority I assigned. The **effective priority** is recalculated every time the queue is evaluated: the assigned priority, raised to urgent once the deadline is within 24 hours. Queue ordering always uses the effective priority.
+
 **Deadlines:**
 - `--deadline` always wins.
 - Otherwise templates fill it in when one exists: a posting's stated close date, or a course due date from a calendar feed.
@@ -221,7 +231,8 @@ Every transition is written to the DB, with a timestamp and reason.
 
 ### 2.4 Approval and planning
 
-- **Time estimates:** templates set `estimated_minutes`. For free-form tasks, the agent estimates in a quick planning call.
+- **Time estimates:** templates set `estimated_minutes`. For free-form tasks, the agent estimates in a quick planning call, and also proposes the `task_type`.
+- **Free-form confirmation:** every free-form `orch add` prints the estimate and the proposed `task_type` and asks y/n, whatever the estimate. `--type T` overrides the proposed type; `--yes` skips the prompt. This is separate from plan approval below: tasks of 30 minutes or less still get no `plan.md` and never wait in `awaiting_approval`.
 - **Tasks estimated over 30 minutes:** Nightshift has the agent expand the one-line prompt into a short `plan.md`. The task then needs my approval before it can run.
 - **Tasks estimated at 30 minutes or less** start right away.
 - **Scheduled templates are pre-approved**, so nothing stalls at 2am waiting for me.
@@ -232,7 +243,11 @@ Each schedule has a cron-style rule plus its own catch-up rule:
 - run within N hours, else skip; or
 - run on next wake.
 
-**Never stack duplicates.** Several missed runs of the same schedule become one run.
+**Never stack duplicates.** Several missed fires of the same schedule become one Occurrence.
+
+Each schedule also has an **overlap rule** for when it fires while its previous Occurrence hasn't reached a terminal state (`done`, `partial`, `failed`, `cancelled`):
+- `skip` (default): don't create a new Occurrence; log the skipped fire.
+- `replace`: cancel the unfinished Occurrence and create a fresh one.
 
 The daemon keeps its own scheduler state in SQLite. On every start and every wake, it compares the time now with each schedule's last run and applies that schedule's catch-up rule.
 
@@ -249,7 +264,7 @@ The daemon keeps its own scheduler state in SQLite. On every start and every wak
 ### 2.7 Failures
 
 - **Max runtime:** 2 hours by default, 6 hours for overnight coding tasks. Any template can set its own cap.
-- **Retries:** up to 2, waiting 10 minutes before the first and 30 minutes before the second. The second retry may switch to another agent only for task types that allow failover (§2.8): Codex for coding tasks, Gemini for the task types that fail over to Gemini.
+- **Retries:** only **Failed Attempts** (crash, runtime cap hit, or failed post-hook) count toward the retry budget. Attempts ended by a usage pause do not. Up to 2 retries, waiting 10 minutes before the first and 30 minutes before the second. The second retry may switch to another agent only for task types that allow failover (§2.8): Codex for coding tasks, Gemini for the task types that fail over to Gemini.
 - **Stuck detection (Phase 3).** An agent counts as stuck after 15 minutes with no new log output and no file changes, or after the same tool call 3 times in a row. Then:
   1. Save state and stop the agent.
   2. Retry once, with a note about what it was looping on.
@@ -306,7 +321,7 @@ All agents sit behind one interface. Adding another agent later must not change 
 
 Rules for specific task types:
 - **Research:** every claim cites a URL. Minimum 5 distinct sources. Claims without a source are labeled *unverified*. Length fits the question, but a report-template result is never under one page.
-- **Resume:** show a diff against `master.tex` and a one-line reason for each changed bullet. Never invent experience or numbers. Every change must trace to content already in `master.tex`.
+- **Resume:** show a diff against `master.tex` and a one-line reason for each changed bullet. Never invent experience or numbers. Every change must trace to content already in `master.tex`: `changes.md` cites the source line number(s) in `master.tex` for each changed bullet.
 - **Comedy:** keep my voice. Flag any premise or tag that sounds close to a well-known comic's bit.
 
 ### 2.12 Notifications (Telegram, from Phase 2)
@@ -353,21 +368,21 @@ Telegram rules:
    - **`resume-tailor`** (input: posting URL)
      - Reads `~/Documents/career/resume/master.tex` and the cover-letter LaTeX template path from config.
      - Outputs `output/resume.tex`, `output/resume.pdf`, `output/cover_letter.pdf`, `output/cover_letter.txt` and `output/changes.md` (each changed bullet → its reason).
-     - Post-hook: compile both, and **fail the task if the resume PDF isn't exactly 1 page**. Include a unified diff against `master.tex` in the report. Pull the posting's close date as the deadline when one is stated.
+     - Post-hook: compile both, and **fail the task if the resume PDF isn't exactly 1 page**. Also fail it if any changed bullet in `changes.md` lacks a citation, if a cited `master.tex` line doesn't exist, or if any number in `resume.tex` (percentages, counts, amounts) doesn't appear in `master.tex`. Include a unified diff against `master.tex` in the report. Pull the posting's close date as the deadline when one is stated.
      - Never submits anything.
    - **`posting-scan`** (daily)
      - Checks the configured tracker repos and target company career pages, applying the rules in §1.8.
      - Writes `output/proposed_rows.csv`. A post-hook merges new rows into the tracker (§1.7).
-     - The report lists only postings that are new since the last run.
+     - The report lists only **new postings**: rows the merge actually appended to the tracker. Nightshift writes this section from the merge result, not the agent. Rows dropped as duplicates appear as a count only.
      - **Runs on Claude in Phase 1**; moves to Gemini in Phase 2.
-10. **Schedules.** `orch schedule add|list|enable|disable|run-now|remove`. Set up the daily posting scan at **6:30am**, catch-up "within 12 hours, else skip".
+10. **Schedules.** `orch schedule add|list|enable|disable|run-now|remove`. Set up the daily posting scan at **6:30am**, catch-up "within 12 hours, else skip", overlap `skip`.
 11. **Priorities, deadlines, time windows and long-task gating** (§2.3).
 12. **Runtime caps and retries** (§2.7), same agent only. Stuck detection waits for Phase 3.
 13. **Rate-limit hard pause and resume** (§2.6), including detecting the reset time and probing when the error doesn't give one. Record every limit hit in `limit_observations`, so the baseline starts building now. Proactive thresholds wait for Phase 2.
 14. **Reports** (§2.11). Nightshift fills in time and usage from adapter data.
-15. **Fault injection for testing:** `orch add ... --simulate-rate-limit-after <N steps>`. It must exercise the real pause/resume path, not a mock of it.
+15. **Fault injection for testing:** `orch add ... --simulate-rate-limit-after <N steps>`, where a step is one tool call seen in the agent's output stream. It must exercise the real pause/resume path, not a mock of it.
 16. **CLI commands:**
-    - `orch add "<prompt>" [--template T] [--agent A] [--priority P] [--deadline D] [--at TIME] [--internet on|off]`
+    - `orch add "<prompt>" [--template T] [--type T] [--agent A] [--priority P] [--deadline D] [--at TIME] [--internet on|off] [--yes]`
     - `orch list [--status S]`, `orch show <id>`, `orch logs <id> [-f]`, `orch report <id>`
     - `orch cancel | pause | resume | retry <id>`, `orch priority <id> <P>`
     - `orch usage`, `orch doctor`
@@ -382,11 +397,12 @@ Gemini, failover other than coding to Codex, Telegram, the dashboard, spend caps
   - the resume compiles to exactly 1 page;
   - nothing is submitted.
 
-  Run it again with `--simulate-rate-limit-after` set midway. It must pause, have a current `progress.md`, and resume to an equivalent result.
+  Run it again with `--simulate-rate-limit-after` set midway. It must pause, have a current `progress.md`, and resume to an equivalent result: the same output files exist and every post-hook check above passes. Byte-identical output is not required.
 - **Test 2, recurring scrape.** Use the daily 6:30am `posting-scan` schedule. Passes if:
   - two runs in a row produce no duplicate tracker rows;
   - the second run reports only new postings;
   - a run missed while the laptop slept catches up exactly once.
+- **Acceptance test 3 (not part of the gate, but required): coding failover.** A free-form coding task with `--simulate-rate-limit-after` set midway moves from Claude to Codex, starts a fresh Codex session from `plan.md` + `progress.md`, and finishes. Runs on the real CLIs; unit tests with a fake adapter cover the same path underneath.
 
 ---
 
@@ -456,4 +472,6 @@ Gemini, failover other than coding to Codex, Telegram, the dashboard, spend caps
 
 ## 7. Open decisions
 
-None right now. If new ones come up, add them here, and don't implement them until they're resolved in this file.
+If new ones come up, add them here, and don't implement them until they're resolved in this file.
+
+- **(Phase 2) Paid credits vs. failover order.** When Claude is out and a task fails over to Gemini, but the Gemini subscription quota is also gone: does the paid-credit rule (§1.5) apply to the failover target, or does the task wait?
