@@ -307,6 +307,16 @@ is ahead, else the trailing `length` (config `usage.windows.claude`:
   ignores SIGTERM is SIGKILLed after 15s. A Codex adapter needs no change for
   this; it goes through the same watchdog.
 
+### Web fetch on big pages (posting-scan, 2026-10-21)
+
+WebFetch hands a page to a small model with the agent's question and returns
+its answer, not the raw page. On a ~140 KB internship-tracker README, haiku
+read it "in two filtered chunks" and two runs an hour apart proposed
+different subsets (186 vs 204 rows, 30 of run 2's not in run 1). Treat a
+posting-scan as a sample, not an exhaustive read; the Tracker merge dedupes
+whatever comes back. Shell network is off, so the agent can't `curl` the
+raw file instead.
+
 ### Known gap: interactive use is invisible to Nightshift
 
 Nightshift records usage only from its own calls (Attempts, planning calls,

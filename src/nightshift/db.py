@@ -245,6 +245,27 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX schedule_runs_name ON schedule_runs(schedule_name, id);
     """,
+    # 7: Tracker merges (§1.7).
+    """
+    -- One row per run of a posting-scan Task's merge_tracker post-hook: what
+    -- Nightshift appended to the Tracker (applications.csv) from the agent's
+    -- Proposed rows. `result` is the JSON MergeResult (appended rows with
+    -- their Tracker ids, duplicates, rejected rows); the report's New
+    -- postings section is written from these rows only.
+    CREATE TABLE tracker_merges (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id       TEXT NOT NULL REFERENCES tasks(id),
+        run_id        INTEGER REFERENCES runs(id),
+        at            TEXT NOT NULL,
+        tracker_path  TEXT NOT NULL,
+        proposed      INTEGER NOT NULL,
+        appended      INTEGER NOT NULL,
+        duplicates    INTEGER NOT NULL,
+        invalid       INTEGER NOT NULL,
+        result        TEXT NOT NULL
+    );
+    CREATE INDEX tracker_merges_task ON tracker_merges(task_id, id);
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -714,3 +735,20 @@ class Database:
         return self.conn.execute(
             "SELECT * FROM tasks WHERE schedule_name = ? ORDER BY created_at, rowid",
             (schedule_name,)).fetchall()
+
+    # -- Tracker merges (§1.7) ---------------------------------------------------
+    def record_tracker_merge(self, task_id: str, *, run_id: int | None, at: str,
+                             tracker_path: str, proposed: int, appended: int, duplicates: int,
+                             invalid: int, result: dict[str, Any]) -> int:
+        with self.tx() as c:
+            cur = c.execute(
+                "INSERT INTO tracker_merges (task_id, run_id, at, tracker_path, proposed, "
+                "appended, duplicates, invalid, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, run_id, at, tracker_path, proposed, appended, duplicates, invalid,
+                 json.dumps(result)))
+            return int(cur.lastrowid)
+
+    def tracker_merges(self, task_id: str) -> list[sqlite3.Row]:
+        """A Task's Tracker merges, oldest first."""
+        return self.conn.execute("SELECT * FROM tracker_merges WHERE task_id = ? ORDER BY id",
+                                 (task_id,)).fetchall()

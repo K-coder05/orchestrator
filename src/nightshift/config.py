@@ -188,6 +188,13 @@ class Config:
         return self.data_dir / "nightshift.db"
 
     @property
+    def tracker_path(self) -> Path:
+        """The Tracker, ``applications.csv`` (§1.7): ``tracker.path``, else
+        ``<agents_root>/data/applications.csv``."""
+        custom = (self.data.get("tracker") or {}).get("path")
+        return Path(str(custom)).expanduser() if custom else self.data_dir / "applications.csv"
+
+    @property
     def env_path(self) -> Path:
         return self.config_dir / ENV_FILENAME
 

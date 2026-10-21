@@ -148,6 +148,11 @@ if os.environ.get("FAKE_RESUME"):
     if os.environ.get("FAKE_TOUCH_INPUT"):
         Path("input/master.tex").write_text("tampered\n")
 
+if os.environ.get("FAKE_PROPOSED"):
+    # What a posting-scan agent writes (templates/posting-scan.yaml): the
+    # file named by FAKE_PROPOSED, copied to output/proposed_rows.csv.
+    Path("output/proposed_rows.csv").write_text(Path(os.environ["FAKE_PROPOSED"]).read_text())
+
 result = os.environ.get("FAKE_RESULT", "done")
 if result != "none":
     Path("output/haiku.txt").write_text("quiet night\n")

@@ -1,0 +1,86 @@
+# posting-scan (§3.1 item 9): the daily internship scan. Usage:
+#   orch schedule add posting-scan --template posting-scan --cron "30 6 * * *" \
+#       --catch-up "within 12h"
+#   orch add "Scan for new internship postings" --template posting-scan   (one-off)
+#
+# The agent checks the public tracker repos and career pages listed in
+# config (templates.posting_scan.tracker_repos / career_pages), applies the
+# §1.8 match and screen-out rules, and writes Proposed rows to
+# output/proposed_rows.csv with the Tracker's columns. It never sees or
+# writes the Tracker. Nightshift's merge_tracker post-hook validates the
+# rows, dedupes them against the Tracker (normalized posting_url, then
+# normalized company+role+season) and appends only new ones with status=new.
+# The report's New postings section is written by Nightshift from the merge
+# result; duplicates appear only as a count. Runs on Claude in Phase 1.
+name: posting-scan
+description: Daily scan of tracker repos and career pages for matching internships
+task_type: scraping
+agent: claude
+estimated_minutes: 20
+max_runtime_minutes: 60
+long: false
+internet: "on"
+
+values:
+  season: {config: templates.posting_scan.season}
+  tracker_repos: {config: templates.posting_scan.tracker_repos}
+  career_pages: {config: templates.posting_scan.career_pages}
+
+post_hooks:
+  - hook: require_outputs
+    files: [output/proposed_rows.csv]
+  - hook: merge_tracker
+    proposed: output/proposed_rows.csv
+
+prompt: |
+  Find internship postings that match my rules, for Nightshift to add to my
+  application tracker. My request: "{{request}}"
+
+  Check these sources with your web fetch and search tools:
+
+  Public internship tracker repos (read each repo's README listing; for a
+  GitHub repo, fetching https://raw.githubusercontent.com/<owner>/<repo>/HEAD/README.md
+  works best):
+  {{tracker_repos}}
+
+  Target company career pages:
+  {{career_pages}}
+
+  If both lists say "(none configured)", write `needs_you.json` asking me to
+  fill in `templates.posting_scan.tracker_repos` and `career_pages` in my
+  config, and stop.
+
+  A posting MATCHES only when all of these hold:
+  - It is a {{season}} internship.
+  - The role is software engineering (SWE), backend, infrastructure or ML
+    engineering.
+  - It is located in the Bay Area, Seattle, NYC, or remote in the US.
+    A posting elsewhere that meets every other rule is kept, with notes set
+    to exactly `low-priority location`.
+  Screen OUT (never propose): MS/PhD-only roles, new-grad or full-time
+  roles, and roles needing a security clearance. Skip closed postings.
+
+  Never visit LinkedIn (linkedin.com, lnkd.in) or follow links to it, and
+  respect robots.txt and site terms. Never log in, create an account, apply
+  or fill in any form.
+
+  Write every matching posting to `output/proposed_rows.csv`, a CSV file
+  whose first line is exactly this header:
+
+      id,company,role,location,season,posting_url,source,date_found,deadline,status,resume_version,notes
+
+  One row per posting: leave `id`, `status` and `resume_version` empty
+  (Nightshift sets them). `season` is "{{season}}". `posting_url` is the
+  posting's own page (the company's job page or application page, not the
+  repo), with tracking parameters removed. `source` is where you found it
+  (the repo or career page URL). `date_found` is today as YYYY-MM-DD.
+  `deadline` is the stated close date as YYYY-MM-DD, or empty. Quote any
+  field containing a comma. Write the header even when nothing matches.
+  Keep `progress.md` current as you finish each source.
+
+  Don't try to work out which postings are new: Nightshift compares your
+  rows with my tracker after you finish, drops duplicates and adds the rest,
+  then writes the list of new postings into `report.md` itself. In your
+  report, don't list postings; in the Summary say which sources you checked,
+  how many rows you proposed, and which sources failed to load (also under
+  Open issues).

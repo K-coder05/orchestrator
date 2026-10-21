@@ -45,6 +45,10 @@ def build_policy(cfg: Config, *, task_id: str, workspace: Path, internet: str) -
     read_only = [p for p in _paths(perms.get("read_only_dirs")) if p != ws]
     # The data dir is never agent-accessible, whatever the config says (§1.4).
     no_access = _paths([data_dir, *(perms.get("no_access_dirs") or [])])
+    # So is the Tracker (§1.7), when `tracker.path` puts it somewhere else.
+    tracker_dir = _path(cfg.tracker_path.parent)
+    if not _inside(tracker_dir, data_dir) and tracker_dir not in no_access:
+        no_access.append(tracker_dir)
 
     for ro in [ws, *read_only]:
         for na in no_access:

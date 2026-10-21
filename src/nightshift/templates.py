@@ -19,6 +19,10 @@ Variables in ``prompt``:
   where the agent can't reach it, and the ``inputs_unchanged`` hook checks
   the agent left its copy alone.
 
+- each of ``values``: a config value (``config: <dotted key>``), rendered
+  into the prompt: a list becomes one ``- item`` line per entry (``(none
+  configured)`` when empty), anything else its text.
+
 ``deadline: {from_output: <file>, field: <key>}``: after every Attempt,
 Nightshift reads that JSON file the agent wrote and, if the Task has no
 deadline yet (``--deadline`` always wins), sets it from the field (§2.3).
@@ -28,6 +32,8 @@ failing one is a Failed Attempt (§2.7). Hook names map to ``HOOKS``.
 
 ``report_diffs: [{file: <output>, against: <input file>}]``: Nightshift adds
 a unified diff of each output against the pristine input to ``report.md``.
+A template with a ``merge_tracker`` post-hook (posting-scan) also gets a New
+postings section there, written from the Tracker merge result (§3.1 item 9).
 """
 
 from __future__ import annotations
@@ -45,7 +51,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from . import latex, trace
+from . import latex, trace, tracker
 from .config import Config
 from .db import Database
 from .failures import PostHook, PostHookFailed
@@ -69,7 +75,8 @@ BUILTIN_DIR = Path(__file__).resolve().parents[2] / "templates"
 
 REQUIRED = ("task_type", "agent", "estimated_minutes", "max_runtime_minutes", "long",
             "internet", "prompt")
-OPTIONAL = ("name", "description", "inputs", "files", "deadline", "post_hooks", "report_diffs")
+OPTIONAL = ("name", "description", "inputs", "files", "values", "deadline", "post_hooks",
+            "report_diffs")
 _VAR = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _URL = re.compile(r"https?://[^\s<>\"'`]+")
 
@@ -98,6 +105,7 @@ class Template:
     description: str = ""
     inputs: dict[str, dict] = field(default_factory=dict)
     files: dict[str, dict] = field(default_factory=dict)
+    values: dict[str, dict] = field(default_factory=dict)
     deadline: dict | None = None
     post_hooks: list[dict] = field(default_factory=list)
     report_diffs: list[dict] = field(default_factory=list)
@@ -175,6 +183,17 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
         if not isinstance(spec, dict) or not isinstance(spec.get("config"), str):
             raise TemplateError(f"template {name!r}: file {var!r} needs config: <dotted key>")
         _rel_path(name, f"file {var!r} to", spec.get("to"))
+    values = data.get("values") or {}
+    if not isinstance(values, dict):
+        raise TemplateError(f"template {name!r}: values must be a mapping")
+    for var, spec in values.items():
+        if not isinstance(spec, dict) or set(spec) != {"config"} or not isinstance(
+                spec["config"], str):
+            raise TemplateError(f"template {name!r}: value {var!r} needs config: <dotted key>")
+    clash = sorted((set(inputs) & set(files)) | (set(inputs) & set(values))
+                   | (set(files) & set(values)) | ({"request"} & (set(inputs) | set(files) | set(values))))
+    if clash:
+        raise TemplateError(f"template {name!r}: variable(s) {', '.join(clash)} defined twice")
     deadline = data.get("deadline")
     if deadline is not None:
         if not isinstance(deadline, dict) or not isinstance(deadline.get("field"), str):
@@ -200,7 +219,7 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
         _rel_path(name, "report_diffs file", d.get("file"))
         _input_file(name, files, "report_diffs against", d.get("against"))
 
-    known = {"request", *inputs, *files}
+    known = {"request", *inputs, *files, *values}
     used = set(_VAR.findall(data["prompt"]))
     if used - known:
         raise TemplateError(
@@ -211,7 +230,7 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
         max_runtime_minutes=data["max_runtime_minutes"], long=data["long"],
         internet=data["internet"], prompt=data["prompt"],
         description=str(data.get("description") or ""), inputs=dict(inputs), files=dict(files),
-        deadline=deadline, post_hooks=list(hooks), report_diffs=list(diffs),
+        values=dict(values), deadline=deadline, post_hooks=list(hooks), report_diffs=list(diffs),
     )
 
 
@@ -255,6 +274,28 @@ def config_value(cfg: Config, dotted: str) -> Any:
     return node
 
 
+def render_value(value: Any) -> str:
+    """A config value as prompt text: a list is one ``- item`` per line."""
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "(none configured)"
+        lines = []
+        for item in value:
+            if isinstance(item, dict):
+                item = ", ".join(f"{k}: {v}" for k, v in item.items())
+            lines.append(f"- {item}")
+        return "\n".join(lines)
+    if value is None or value == "":
+        return "(none configured)"
+    return str(value)
+
+
+def denied_domains(cfg: Config) -> list[str]:
+    return [str(d).lower().strip()
+            for d in (cfg.data.get("permissions") or {}).get("denied_domains") or []
+            if str(d).strip()]
+
+
 def _denied_domain(cfg: Config, host: str) -> str | None:
     host = host.lower().rstrip(".")
     for dom in (cfg.data.get("permissions") or {}).get("denied_domains") or []:
@@ -290,6 +331,8 @@ def instantiate(cfg: Config, tpl: Template, request: str) -> Instance:
             raise TemplateError(f"{spec['config']}: {src} does not exist")
         files.append(InputFile(var=var, source=src, to=spec["to"], content=src.read_bytes()))
         values[var] = spec["to"]
+    for var, spec in tpl.values.items():
+        values[var] = render_value(config_value(cfg, spec["config"]))
     prompt = _VAR.sub(lambda m: values[m.group(1)], tpl.prompt)
     return Instance(template=tpl, request=request, prompt=prompt, values=values, files=files)
 
@@ -530,11 +573,66 @@ def _build_trace(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHook:
     return _named(hook, "trace_changes")
 
 
+def _validate_merge(name: str, h: dict) -> None:
+    unknown = sorted(set(h) - {"hook", "proposed"})
+    if unknown:
+        raise TemplateError(f"template {name!r}: merge_tracker has unknown keys {', '.join(unknown)}")
+    _rel_path(name, "merge_tracker proposed", h.get("proposed"))
+
+
+def posting_season(cfg: Config) -> str:
+    return str(config_value(cfg, "templates.posting_scan.season") or "Summer 2027")
+
+
+def _build_merge(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHook:
+    """Merge the agent's Proposed rows into the Tracker (§1.7). Nightshift
+    code does it, never the agent. Rows this Task appended in an earlier
+    Attempt are recognized (not appended twice, still its New postings)."""
+
+    def hook(folder: Path, row: Mapping[str, Any]) -> None:
+        path = _regular_file(folder, h["proposed"])
+        say = lambda line: log_line(folder, line, cfg.secrets.redact, cfg.timezone)  # noqa: E731
+        db = Database(cfg.db_path, tz=cfg.timezone)  # hooks run in the runner's thread
+        try:
+            own = [r["id"] for m in db.tracker_merges(row["id"])
+                   for r in json.loads(m["result"]).get("appended") or []]
+            try:
+                res = tracker.merge(cfg.tracker_path, _read_text(path, h["proposed"]),
+                                    season=posting_season(cfg), today=now(cfg.timezone).date(),
+                                    denied_domains=denied_domains(cfg), own_ids=own)
+            except tracker.TrackerError as exc:
+                raise PostHookFailed(str(exc)) from None
+            attempts = db.attempts(row["id"])
+            db.record_tracker_merge(
+                row["id"], run_id=attempts[-1]["id"] if attempts else None,
+                at=iso(now(cfg.timezone)), tracker_path=str(cfg.tracker_path),
+                proposed=res.proposed, appended=len(res.appended),
+                duplicates=res.dropped_duplicates, invalid=len(res.invalid),
+                result=res.as_dict())
+        finally:
+            db.close()
+        say(f"tracker merge: {res.proposed} proposed row(s): {len(res.appended)} appended to "
+            f"{cfg.tracker_path}, {res.dropped_duplicates} duplicate(s) dropped, "
+            f"{len(res.invalid)} rejected"
+            + (f", {len(res.already_appended)} already appended by this Task"
+               if res.already_appended else ""))
+        for r in res.appended:
+            say(f"  appended id {r['id']}: {r['company']} | {r['role']} | {r['posting_url']}")
+        for d in res.duplicates:
+            what = f"Tracker id {d.matches}" if d.matches else "an earlier row of the file"
+            say(f"  duplicate ({d.by}) of {what}{' (this Task)' if d.own else ''}: "
+                f"{d.row.get('company')} | {d.row.get('role')} | {d.row.get('posting_url')}")
+        for r in res.invalid:
+            say(f"  rejected line {r.line}: {r.reason}")
+    return _named(hook, "merge_tracker")
+
+
 HOOKS: dict[str, HookKind] = {
     "require_outputs": HookKind(_validate_require, _build_require),
     "compile_latex": HookKind(_validate_compile, _build_compile),
     "inputs_unchanged": HookKind(_validate_nothing, _build_unchanged),
     "trace_changes": HookKind(_validate_trace, _build_trace, file_keys=("master",)),
+    "merge_tracker": HookKind(_validate_merge, _build_merge),
 }
 
 
@@ -557,6 +655,26 @@ def post_hooks(cfg: Config, row: Mapping[str, Any], host: Host | None = None) ->
 REPORT_DIFF_MAX_LINES = 400
 
 
+def new_postings(cfg: Config, row: Mapping[str, Any]) -> str:
+    """The report's New postings section: every Tracker row this Task's
+    merges appended (across its Attempts), and the latest merge's counts of
+    dropped duplicates and rejected rows. Written from the DB, never from
+    the agent's files."""
+    db = Database(cfg.db_path, tz=cfg.timezone)
+    try:
+        merges = db.tracker_merges(row["id"])
+    finally:
+        db.close()
+    if not merges:
+        return ("### New postings\n\nThe Tracker merge did not run, so nothing was appended "
+                "to the Tracker (see `logs/nightshift.log`).")
+    appended = [r for m in merges for r in json.loads(m["result"]).get("appended") or []]
+    last = merges[-1]
+    return tracker.new_postings_section(
+        appended, dropped_duplicates=int(last["duplicates"]), invalid=int(last["invalid"]),
+        tracker_path=Path(last["tracker_path"]))
+
+
 def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
     """The Nightshift-written part of a template Task's ``report.md``: each
     ``report_diffs`` item as a unified diff of an output against the pristine
@@ -568,10 +686,12 @@ def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
         tpl = load(cfg, row["template"])
     except TemplateError:
         return None
-    if not tpl.report_diffs:
-        return None
-    folder = Path(row["folder"])
     parts = []
+    if any(h["hook"] == "merge_tracker" for h in tpl.post_hooks):
+        parts.append(new_postings(cfg, row))
+    if not tpl.report_diffs:
+        return "\n\n".join(parts) or None
+    folder = Path(row["folder"])
     for d in tpl.report_diffs:
         against = Path(d["against"]).name
         title = f"### Diff: {d['file']} against {against}"

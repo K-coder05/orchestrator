@@ -851,3 +851,95 @@ lasting consequences go in `docs/adr/` instead.
   nothing. A real lid-close sleep/wake was not run (it needs the user;
   Nightshift never runs `pmset`); wake detection is covered with
   `FakeHost(awake_clock=...)` and a fake clock.
+
+## Phase 1, issue #13: `posting-scan` template and Tracker merge
+
+- **Template** `templates/posting-scan.yaml`: Task type `scraping`
+  (internet on, not long), Claude, estimate 20 min (no plan approval for a
+  daily scan), cap 60 min. The prompt carries the §1.8 match and screen-out
+  rules, the Tracker's header line and the configured sources. Post-hooks:
+  `require_outputs [output/proposed_rows.csv]`, then `merge_tracker`.
+- **Config-sourced prompt variables.** New template key `values:
+  {var: {config: <dotted key>}}`; a list renders as one `- item` per line,
+  empty/missing as `(none configured)`. posting-scan uses
+  `templates.posting_scan.{season, tracker_repos, career_pages}` (lists
+  default empty: "config lists that I fill in"). Both empty: the prompt
+  says write `needs_you.json` and stop (one cheap Attempt) rather than a
+  config error, so a Schedule added before the lists are filled is visible
+  in the morning instead of silently erroring. A variable defined twice
+  (request/inputs/files/values) is a template error.
+- **Tracker location**: `tracker.path` (null = `<agents_root>/data/
+  applications.csv`, §1.3), `Config.tracker_path`. Outside the data dir,
+  its folder is added to every Task's no-access dirs.
+- **Merge** (`nightshift.tracker`, deterministic, pure parts testable):
+  - *Proposed rows file*: the header must be exactly the Tracker's 12
+    columns (any order or case); otherwise the hook fails the Attempt (a
+    retry gets to fix it). A row with the wrong field count, or one that
+    fails validation, is rejected on its own (logged with its line number,
+    counted in the report), not the whole file.
+  - *Validation*: `company, role, location, season, posting_url, source`
+    required; http(s) URL not on `permissions.denied_domains`; season equal
+    (normalized) to `templates.posting_scan.season`; a backstop screen-out
+    of role titles saying PhD/MS-only, new grad/entry level, full-time or
+    clearance; `date_found` blank -> today, else `YYYY-MM-DD`; a
+    non-date `deadline` ("rolling") is moved into `notes` instead of
+    rejecting the posting. `id` = next integer after the highest numeric
+    Tracker id; `status=new`; `resume_version` empty. Values are flattened
+    to one line, capped at 500 chars, and formula-leading values get `'`.
+  - *URL normalization* (dedupe key only; the stored URL is the agent's):
+    lowercase, `http`=`https`, `www.` dropped, default ports, fragment and
+    trailing/double slashes dropped, tracking params dropped (`utm_*`,
+    `gclid`, `fbclid`, `ref`, `source`, `gh_src`, `lever-source`, ... see
+    `TRACKING_PARAMS`), other params kept and sorted (Greenhouse's
+    `gh_jid` is the job id, not tracking).
+  - *(company, role, season)*: words lowercased, punctuation dropped;
+    company suffixes (Inc, LLC, Corp, Co, ...) dropped; role synonyms
+    (internship=intern, engineering/developer=engineer, SWE/SDE=software
+    engineer, ML=machine learning, infra=infrastructure); season forms
+    `2027 Summer`, `Summer '27`, `SU27` -> `summer 2027`.
+  - *Order*: URL first, then the key; against the Tracker and earlier rows
+    of the same file. Consequence of the spec's secondary key: one role
+    listed per city (separate URLs) is one Tracker row. The merge keeps a
+    matching-location listing over a `low-priority location` one (the
+    real run had 17 such collapses, e.g. American Express listing one role
+    in 7 cities).
+  - *Writing*: under an `fcntl` lock file next to the Tracker; the full
+    file is written to a temp file, fsynced and renamed over the old one.
+    Existing bytes are kept exactly (a missing final newline is added).
+    No change -> the file isn't rewritten. A Tracker with other columns
+    is never touched (the Attempt fails, retries can't fix it; you can).
+- **Merge record, retries.** Migration 7 `tracker_merges` (one row per
+  hook run: counts plus the JSON `MergeResult`, appended rows with their
+  ids). A second merge for the same Task (another Attempt, e.g. after a
+  retry) passes the ids this Task already appended as `own_ids`: matches
+  against them are "already appended by this Task", not duplicates and
+  not appended twice, and the report still lists them as this Task's New
+  postings.
+- **Report.** `templates.report_appendix` adds `### New postings` under the
+  Nightshift appendix for any template with a `merge_tracker` hook, from
+  `tracker_merges` only: a table of every row this Task appended
+  (company, role, location, deadline, link, notes), then "Dropped as
+  duplicates: N." and, if any, "Rejected as invalid or screened out: N"
+  (from the latest merge). No merge -> "The Tracker merge did not run".
+  The prompt tells the agent not to list postings in its own sections.
+- **Real-machine check (2026-10-21, 04:33-04:54 PDT).** Scratch config,
+  real `claude` (haiku), one tracker repo
+  (`github.com/vanshb03/Summer2027-Internships`), no career pages, two
+  one-off `orch add "Daily posting scan" --template posting-scan` runs
+  through `orch daemon run --exit-when-idle`. Run 1 (`partial`, 6m31s,
+  $0.16 cost-equivalent): 186 Proposed rows, 169 appended, 17 dropped as
+  duplicates (same role listed per city), 0 rejected. Run 2 (`done`,
+  13m25s, $0.65): 204 proposed, 30 appended, 174 dropped as duplicates.
+  Tracker afterwards: 199 rows, 199 distinct normalized URLs and 199
+  distinct keys; run 1's bytes unchanged at the head of the file. Each
+  report's New postings section listed exactly its appended rows. The 30
+  "new" in run 2 are mostly postings run 1 missed: the agent reads the big
+  README through WebFetch's summarizing fetch, so coverage varies from run
+  to run (dedupe makes that harmless). Haiku also let a few non-matching
+  rows through (e.g. a Toronto co-op, defense contractors) that the
+  title-based backstop can't catch. Cost grows with the README size; a
+  daily scan of several big repos may want a cheaper source format later.
+- **Not done here**: giving the agent a read-only snapshot of the Tracker
+  (it would save it re-proposing known postings; dedupe makes it
+  unnecessary for correctness). The Gate Test 2 schedule run belongs to
+  the Gate work.

@@ -100,6 +100,21 @@ checked by Nightshift, not left to the agent:
 | Every changed resume line traces to `master.tex` | **Technically enforced** (mechanically; meaning is for you) | The `trace_changes` post-hook fails the Attempt if a changed body line of `output/resume.tex` has no `changes.md` entry, an entry cites no `master.tex` line or a line that doesn't exist (or only blank ones), or has no reason. It reads Nightshift's pristine copy of `master.tex`, which the agent can't reach. It can't tell whether a reword *means* the same as the cited line (e.g. "multi-user" -> "collaborative"): the unified diff in the report is there for that review. |
 | No invented numbers | **Technically enforced** | Every number in the resume's document body (percentages, counts, amounts, years) must appear somewhere in `master.tex`. LaTeX lengths and comments are skipped. A real number used in a new context (a "40%" moved to another bullet) still passes. |
 
+### The Tracker (§1.7)
+
+`posting-scan` agents never write the Tracker (`applications.csv`). They
+write Proposed rows to `output/proposed_rows.csv` in their own Task folder;
+the `merge_tracker` post-hook (Nightshift code, after the Attempt) validates,
+dedupes and appends them (`nightshift.tracker`).
+
+| Limit | Status | How |
+|---|---|---|
+| Agents can't read or write the Tracker | **Technically enforced** | It lives in the data dir (`<agents_root>/data/applications.csv`), which is no-access for every Task. If `tracker.path` puts it elsewhere, its folder is added to the Task's no-access dirs (a clash with a read-only dir is a config error). |
+| Only valid rows are appended, always `status=new` | **Technically enforced** | Header must be the Tracker's columns; required fields; `posting_url` must be http(s) and not on a denied domain (no LinkedIn rows); season must be `templates.posting_scan.season`; dates `YYYY-MM-DD`. `id`, `status` and `resume_version` are Nightshift's: the agent's values are ignored. Values are flattened to one line, capped at 500 chars, and a leading `=`, `+` or `@` gets a `'` so a later spreadsheet sync can't run a formula. |
+| §1.8 match rules | **Instruction-only**, with a **best-effort** backstop | The agent applies the rules (prompt). Nightshift rejects rows whose season isn't the configured one, and roles whose title says PhD/MS-only, new grad, full-time or clearance (word patterns; a title that doesn't say it passes). |
+| No duplicate Tracker rows | **Technically enforced** | Dedupe by normalized `posting_url`, then normalized `(company, role, season)`, against the Tracker and within the file; under a file lock; the file is rewritten via a temp file and an atomic rename, existing rows copied byte for byte. A Tracker whose header isn't the Tracker's columns is never touched (the Attempt fails). |
+| The report's New postings are only rows really appended | **Technically enforced** | Written by Nightshift from the `tracker_merges` record, not from anything the agent wrote. |
+
 ## Limits
 
 ### Files (§1.4)

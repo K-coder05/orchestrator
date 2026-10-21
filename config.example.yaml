@@ -109,6 +109,14 @@ templates:
   resume_tailor:
     master_tex: ~/Documents/career/resume/master.tex
     cover_letter_template: ~/Documents/career/resume/cover_letter_template.tex
+  # Inputs of the posting-scan template (§1.8). Fill these in: the public
+  # internship tracker repos (GitHub URLs) and your target companies' career
+  # page URLs the daily scan checks. Never LinkedIn.
+  posting_scan:
+    # Only postings for this season match; Nightshift rejects other rows.
+    season: Summer 2027
+    tracker_repos: []
+    career_pages: []
   # How post-hooks compile LaTeX. They run Nightshift-side after the Attempt,
   # sandboxed: no network, nothing under your home folder readable except
   # the Task folder and readable_dirs, writes only in the Task folder.
@@ -122,6 +130,11 @@ templates:
     readable_dirs:
       - ~/Library/texmf
       - ~/Library/texlive
+
+tracker:
+  # The application Tracker (§1.7). Only Nightshift writes it, never an
+  # agent. null = <agents_root>/data/applications.csv.
+  path: null
 
 daemon:
   # launchd LaunchAgent label; the plist is ~/Library/LaunchAgents/<label>.plist.
