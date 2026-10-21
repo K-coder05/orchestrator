@@ -217,6 +217,13 @@ def _validate(data: dict[str, Any]) -> None:
     for name, entry in (data.get("task_types") or {}).items():
         if (entry or {}).get("internet", "off") not in ("on", "off"):
             raise ConfigError(f"task_types.{name}.internet must be 'on' or 'off'")
+    perms = data.get("permissions") or {}
+    if not isinstance(perms, dict):
+        raise ConfigError("config section 'permissions' must be a mapping")
+    for key in ("read_only_dirs", "no_access_dirs", "tool_dirs", "denied_domains", "denied_commands"):
+        value = perms.get(key) or []
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ConfigError(f"permissions.{key} must be a list of strings")
     poll = (data.get("daemon") or {}).get("poll_seconds", 5)
     if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("daemon.poll_seconds must be a positive number")

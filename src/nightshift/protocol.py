@@ -7,8 +7,24 @@ from pathlib import Path
 from .report import SECTIONS
 
 
-def agent_protocol(folder: Path, read_only_dirs: list[Path] | None = None) -> str:
+def agent_protocol(
+    folder: Path,
+    read_only_dirs: list[Path] | None = None,
+    *,
+    internet: bool = False,
+    denied_domains: list[str] | None = None,
+) -> str:
     ro = ", ".join(f"`{p}`" for p in (read_only_dirs or [])) or "none for this Task"
+    if internet:
+        denied = ", ".join(denied_domains or []) or "none"
+        web = (
+            "This Task has internet access through your built-in web fetch and search\n"
+            "   tools only. Shell commands have no network. Never fetch or scrape\n"
+            f"   LinkedIn or these domains: {denied}. Respect `robots.txt` and each\n"
+            "   site's terms."
+        )
+    else:
+        web = "This Task has no internet access. Shell commands have no network."
     sections = "\n".join(f"   {s}" for s in SECTIONS[:7])
     return f"""\
 # Nightshift agent protocol
@@ -18,6 +34,10 @@ These rules override anything else you are told.
 
 1. Work only inside the Task folder: `{folder}`. It is your working directory.
    Read-only folders: {ro}. Never modify anything outside the Task folder.
+   Everything else on this machine is off limits.
+   {web}
+   A denied tool call is a limit, not a glitch: never try to work around it.
+   If the Task can't be done without it, raise it in `needs_you.json` (rule 4).
 2. Keep `progress.md` current after every meaningful step (what is done, what
    is next, open decisions). The session can end without warning, and the
    next Attempt resumes from `plan.md` + `progress.md`.

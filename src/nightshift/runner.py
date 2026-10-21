@@ -16,6 +16,7 @@ from .adapters.base import AgentAdapter, EventKind, TaskContext
 from .config import Config
 from .db import Database
 from .ids import new_task_id, slugify, title_from_prompt
+from .permissions import build_policy
 from .protocol import agent_protocol
 from .states import TaskState
 from .timeutil import iso, now
@@ -125,14 +126,20 @@ def run_attempt(
     agent_name = row["agent"]
     adapter = adapter_provider(agent_name, cfg.agent(agent_name))
 
+    # A fresh policy every Attempt, so config changes apply and nothing the
+    # agent did to an earlier one carries over.
+    policy = build_policy(cfg, task_id=task_id, workspace=folder, internet=row["internet"])
+    permissions = adapter.write_permissions(folder, policy)
     task = TaskContext(
         id=task_id,
         prompt=row["prompt"],
         task_type=row["task_type"],
         internet=row["internet"],
-        protocol=agent_protocol(folder),
+        protocol=agent_protocol(
+            folder, permissions.read_only_dirs, internet=policy.internet,
+            denied_domains=policy.denied_domains,
+        ),
     )
-    permissions = adapter.write_permissions(folder, {"internet": row["internet"]})
     command = adapter.build_command(task, folder, permissions)
 
     attempt_no = len(db.attempts(task_id)) + 1

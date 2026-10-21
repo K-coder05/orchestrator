@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from nightshift.adapters import get_adapter
-from nightshift.adapters.base import Event, EventKind, Permissions, TaskContext
+from nightshift.adapters.base import Event, EventKind, PermissionPolicy, TaskContext
 from nightshift.adapters.claude import ClaudeAdapter
 from nightshift.protocol import agent_protocol
 
@@ -97,9 +97,14 @@ def _task(folder: Path) -> TaskContext:
                        protocol=agent_protocol(folder))
 
 
+def _policy(tmp_path: Path, internet: bool = False) -> PermissionPolicy:
+    return PermissionPolicy(workspace=tmp_path / "ws", internet=internet,
+                            settings_dir=tmp_path / "data" / "permissions" / "k3f9")
+
+
 def test_build_command_headless_with_protocol(tmp_path):
     a = ClaudeAdapter({"binary": "claude", "model": "haiku"})
-    perms = a.write_permissions(tmp_path, {"internet": "off"})
+    perms = a.write_permissions(tmp_path, _policy(tmp_path))
     cmd = a.build_command(_task(tmp_path), tmp_path, perms)
     argv = cmd.argv
     assert argv[:2] == ["claude", "-p"]
@@ -108,7 +113,7 @@ def test_build_command_headless_with_protocol(tmp_path):
     assert argv[argv.index("--model") + 1] == "haiku"
     assert argv[argv.index("--permission-prompts") + 1] == "none"
     assert "--dangerously-skip-permissions" not in argv
-    assert "WebFetch" in argv[argv.index("--disallowedTools") + 1]
+    assert "WebFetch" not in argv[argv.index("--tools") + 1]
     protocol = argv[argv.index("--append-system-prompt") + 1]
     assert str(tmp_path) in protocol and "progress.md" in protocol and "needs_you.json" in protocol
     # The prompt goes on stdin, never as an argument.
@@ -116,13 +121,15 @@ def test_build_command_headless_with_protocol(tmp_path):
 
 
 def test_internet_on_allows_web_tools(tmp_path):
-    perms = ClaudeAdapter().write_permissions(tmp_path, {"internet": "on"})
-    assert "WebFetch" in perms.allowed_tools and "WebFetch" not in perms.disallowed_tools
+    perms = ClaudeAdapter().write_permissions(tmp_path, _policy(tmp_path, internet=True))
+    assert "WebFetch" in perms.tools and "WebFetch" in perms.allow
 
 
 def test_resume_command_reinjects_protocol(tmp_path):
     a = ClaudeAdapter()
-    cmd = a.resume_command("sess-1", "continue", task=_task(tmp_path), permissions=Permissions())
+    perms = a.write_permissions(tmp_path, _policy(tmp_path))
+    cmd = a.resume_command("sess-1", "continue", task=_task(tmp_path), permissions=perms)
     assert cmd.argv[cmd.argv.index("--resume") + 1] == "sess-1"
     assert "--append-system-prompt" in cmd.argv
+    assert cmd.argv[cmd.argv.index("--settings") + 1] == str(perms.settings_file)
     assert cmd.stdin == "continue"

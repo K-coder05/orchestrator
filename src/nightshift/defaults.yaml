@@ -72,5 +72,70 @@ task_types:
   resume: {internet: "on"}
   study: {internet: "on"}
 
+permissions:
+  # Per-Task agent access (§1.4). The Task folder is the only writable place.
+  # docs/safety.md says which of these limits are technically enforced.
+  # Folders every Task may read but never write. Missing folders are skipped.
+  read_only_dirs:
+    - ~/Documents/career
+    - ~/Documents/comedy
+    - ~/school
+  # Never readable or writable. <agents_root>/data is always added.
+  no_access_dirs:
+    - ~/.ssh
+    - ~/.gnupg
+    - ~/.aws
+    - ~/.config/nightshift
+    - ~/Library/Keychains
+    - ~/Library/Cookies
+    - ~/Library/Safari
+    - ~/Library/Application Support/Google/Chrome
+    - ~/Library/Application Support/Firefox
+    - ~/Library/Application Support/BraveSoftware
+    - ~/Library/Application Support/Arc
+  # Under your home folder, shell commands can read only the Task folder, the
+  # read-only folders and these tool installs (so `node`, `uv` etc. still run).
+  tool_dirs:
+    - ~/.nvm
+    - ~/.local/bin
+    - ~/.local/share/uv
+    - ~/.bun
+    - ~/.cargo/bin
+    - ~/.pyenv
+  # Web fetch never goes to these domains or their subdomains (§1.6).
+  denied_domains:
+    - linkedin.com
+    - lnkd.in
+    - licdn.com
+  # Shell commands the agent may not run. Shell commands have no network
+  # anyway (the sandbox blocks it); this list is a best-effort second layer.
+  denied_commands:
+    - curl
+    - wget
+    - nc
+    - ncat
+    - netcat
+    - socat
+    - telnet
+    - ftp
+    - sftp
+    - scp
+    - ssh
+    - rsync
+    - python -c
+    - python3 -c
+    - node -e
+    - perl -e
+    - ruby -e
+    - osascript
+    - open
+    - security
+    - sudo
+    - brew
+    - launchctl
+    - pmset
+    - git push
+    - gh
+
 secrets:
   keychain_service: nightshift

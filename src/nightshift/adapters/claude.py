@@ -13,6 +13,7 @@ from .base import (
     Command,
     Event,
     EventKind,
+    PermissionPolicy,
     Permissions,
     RateLimit,
     TaskContext,
@@ -21,8 +22,40 @@ from .base import (
 
 # Tools that change files; tool_use blocks for these also yield FILE_CHANGE.
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
-BASE_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
+# The only tools that exist in a Task's session (`--tools`). Bash runs inside
+# Claude Code's sandbox; web tools exist only on internet-on Tasks.
+BASE_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
 WEB_TOOLS = ["WebFetch", "WebSearch"]
+# Flags that would switch permission checks off or widen the per-Task policy.
+# Nightshift never passes them itself and refuses them in
+# agents.claude.extra_args (§1.4).
+FORBIDDEN_ARGS = (
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--permission-mode",
+    "--permission-prompts",
+    "--setting-sources",
+    "--settings",
+    "--tools",
+    "--allowedTools",
+    "--allowed-tools",
+    "--add-dir",
+    "--mcp-config",
+)
+
+
+def _forbidden(args: list[str]) -> list[str]:
+    return [
+        a for a in args
+        if "bypassPermissions" in a or any(a == f or a.startswith(f + "=") for f in FORBIDDEN_ARGS)
+    ]
+
+
+def _rule_path(path: Path) -> str:
+    # In Claude Code permission rules "/x" is relative to the settings file;
+    # an absolute path needs a leading "//" (verified on 2.1.306: "/abs/**"
+    # did not match and an Edit outside went through).
+    return "/" + str(path) + "/**"
 
 
 class ClaudeAdapter(AgentAdapter):
@@ -39,16 +72,25 @@ class ClaudeAdapter(AgentAdapter):
 
     # -- invocation ----------------------------------------------------------
     def _base_argv(self, permissions: Permissions) -> list[str]:
+        if permissions.settings_file is None or not permissions.tools:
+            raise ValueError("refusing to start Claude without a per-Task permission policy")
+        if permissions.permission_mode == "bypassPermissions":
+            raise ValueError("bypassPermissions is never used (§1.4)")
+        bad = _forbidden(self.extra_args)
+        if bad:
+            raise ValueError(f"agents.claude.extra_args may not contain {bad} (§1.4)")
         argv = [self.binary, "-p", "--output-format", "stream-json", "--verbose"]
         if self.model:
             argv += ["--model", self.model]
         argv += ["--permission-mode", permissions.permission_mode]
         # Headless: anything that would prompt is denied, never left hanging.
         argv += ["--permission-prompts", "none"]
-        if permissions.allowed_tools:
-            argv += ["--allowedTools", ",".join(permissions.allowed_tools)]
-        if permissions.disallowed_tools:
-            argv += ["--disallowedTools", ",".join(permissions.disallowed_tools)]
+        # --restricted ignores user/project/local settings (their allow rules
+        # and hooks), confines the file tools to the working dirs and refuses
+        # bypassPermissions; --strict-mcp-config drops the user's MCP servers.
+        argv += ["--restricted", "--strict-mcp-config"]
+        argv += ["--tools", ",".join(permissions.tools)]
+        argv += ["--settings", str(permissions.settings_file)]
         for d in permissions.read_only_dirs:
             argv += ["--add-dir", str(d)]
         return argv + self.extra_args
@@ -69,23 +111,66 @@ class ClaudeAdapter(AgentAdapter):
         task: TaskContext | None = None,
         permissions: Permissions | None = None,
     ) -> Command:
-        argv = self._base_argv(permissions or Permissions()) + ["--resume", session_id]
+        if permissions is None:
+            raise ValueError("a resumed Attempt needs the Task's permissions too")
+        argv = self._base_argv(permissions) + ["--resume", session_id]
         if task is not None:
             argv += ["--append-system-prompt", task.protocol]
         return Command(argv=argv, stdin=prompt)
 
-    def write_permissions(self, workspace: Path, policy: dict[str, Any]) -> Permissions:
-        # Minimal Phase-1 policy; issue #4 generates the full one.
-        allowed = list(BASE_TOOLS)
-        disallowed: list[str] = []
-        if policy.get("internet") == "on":
-            allowed += WEB_TOOLS
-        else:
-            disallowed += WEB_TOOLS
+    def write_permissions(self, workspace: Path, policy: PermissionPolicy) -> Permissions:
+        """Claude Code settings for one Task; see docs/safety.md for what each
+        part enforces. Writes ``<settings_dir>/claude-settings.json``."""
+        tools = list(BASE_TOOLS) + (list(WEB_TOOLS) if policy.internet else [])
+        allow = list(WEB_TOOLS) if policy.internet else []
+        deny: list[str] = []
+        for d in policy.no_access_dirs:
+            deny += [f"Read({_rule_path(d)})", f"Edit({_rule_path(d)})"]
+        for d in policy.read_only_dirs:
+            deny.append(f"Edit({_rule_path(d)})")  # Edit rules cover Write too
+        for cmd in policy.denied_commands:
+            deny.append(f"Bash({cmd}:*)")
+        if policy.internet:
+            for dom in policy.denied_domains:
+                deny += [f"WebFetch(domain:{dom})", f"WebFetch(domain:*.{dom})"]
+        # Only dirs that exist are added; a missing one stays denied for writes.
+        read_only = [d for d in policy.read_only_dirs if d.is_dir()]
+        sandbox = {
+            "enabled": True,
+            # Sandboxed commands run without a prompt; the deny rules above
+            # still apply first.
+            "autoAllowBashIfSandboxed": True,
+            # No escape hatch: a command can never ask to run unsandboxed.
+            "allowUnsandboxedCommands": False,
+            # Shell commands get no network at all, on every Task: web access
+            # is only through WebFetch/WebSearch (§1.4).
+            "network": {"allowedDomains": []},
+            "filesystem": {
+                "denyRead": [str(p) for p in [*policy.private_roots, *policy.no_access_dirs]],
+                "allowRead": [str(p) for p in [policy.workspace, *read_only, *policy.tool_dirs]],
+                "denyWrite": [str(p) for p in [*policy.read_only_dirs, *policy.no_access_dirs]],
+            },
+        }
+        settings = {
+            "permissions": {
+                "allow": allow,
+                "deny": deny,
+                "disableBypassPermissionsMode": "disable",
+            },
+            "sandbox": sandbox,
+        }
+        if policy.settings_dir is None:
+            raise ValueError("PermissionPolicy.settings_dir is required")
+        policy.settings_dir.mkdir(parents=True, exist_ok=True)
+        settings_file = policy.settings_dir / "claude-settings.json"
+        settings_file.write_text(json.dumps(settings, indent=2) + "\n")
         return Permissions(
-            allowed_tools=allowed,
-            disallowed_tools=disallowed,
-            read_only_dirs=[Path(p) for p in policy.get("read_only_dirs", [])],
+            tools=tools,
+            allow=allow,
+            deny=deny,
+            read_only_dirs=read_only,
+            sandbox=sandbox,
+            settings_file=settings_file,
         )
 
     # -- stream ----------------------------------------------------------------

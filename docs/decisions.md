@@ -185,3 +185,50 @@ lasting consequences go in `docs/adr/` instead.
   `[file]`, `[error]`, `[result]`); `--raw` prints the JSON lines. `-f`
   follows new lines and new Attempts until the Task is no longer queued or
   running. `orch list --status` is repeatable.
+
+## Phase 1, issue #4: per-Task agent permissions
+
+- **Policy in core, settings in the adapter.** `nightshift.permissions.build_policy`
+  builds an agent-agnostic `PermissionPolicy` (workspace, internet, read-only
+  dirs, no-access dirs, private roots, tool dirs, denied domains, denied
+  commands, settings dir) from the new `permissions:` config section and the
+  Task. `AgentAdapter.write_permissions(workspace, policy)` now takes that
+  dataclass instead of a dict. It's rebuilt before every Attempt.
+- **Claude: four layers.** `--restricted` (ignores user/project/local
+  settings, confines file tools to the working dirs, refuses bypass),
+  `--tools` (web tools exist only when internet is on), a per-Task
+  `--settings` file with allow/deny rules, and Claude Code's Bash sandbox with
+  no unsandboxed escape. Full status of each limit is in `docs/safety.md`.
+- **Settings file lives in `<agents_root>/data/permissions/<task-id>/`**,
+  not the Task folder: the agent can't read or edit its own policy, and the
+  stored command shows a real path to audit.
+- **Shell commands get no network on any Task.** The spec allows web access
+  only through the built-in fetch/search tools, so the sandbox's network
+  allowlist is empty even on internet-on Tasks. The `curl`/`wget`/`python -c`
+  deny-list is kept as the best-effort second layer the spec asks for.
+  Consequence: no `pip`/`npm install` from the network inside Tasks.
+- **Bash reads under home are allowlisted.** The sandbox denies reads of `~`
+  and `agents_root` and re-allows the Task folder, read-only folders and
+  `permissions.tool_dirs` (`~/.nvm`, `~/.local/bin`, ...), so the agent can't
+  read anything personal through the shell. Reads outside home stay open
+  (denying `/` breaks every tool); documented as a gap.
+- **Missing read-only folders are skipped** for `--add-dir`/`allowRead` (this
+  Mac has none of `~/Documents/career`, `~/Documents/comedy`, `~/school`) but
+  keep their write-deny rules. A read-only dir that overlaps a no-access dir
+  (or the Task folder inside one) is a `ConfigError`.
+- **The adapter refuses unsafe commands.** `build_command`/`resume_command`
+  raise without a generated policy, and `agents.claude.extra_args` may not
+  contain flags that skip or widen permissions.
+- **Protocol** now names the read-only folders, the internet rule, the denied
+  domains, `robots.txt`/site terms (instruction-only) and says a denied tool
+  call must never be worked around.
+- **Real-machine verification** is opt-in: `NIGHTSHIFT_REAL_AGENT=1 pytest
+  tests/test_permissions_real.py` runs two haiku Tasks through `run_attempt`
+  with the real policy. They swap the protocol for an audit brief, because
+  with the real protocol the agent refuses to even try an escape (it wrote
+  `needs_you.json` instead), which would leave the limits untested. Both
+  passed on 2026-10-20. `example.org` stands in for LinkedIn so the test never
+  contacts LinkedIn.
+- **Known side effect: no local git commits inside Tasks** (the sandbox
+  protects `.git/config` and `.git/hooks`). Stricter than §1.6; to revisit
+  when coding Tasks need commits.

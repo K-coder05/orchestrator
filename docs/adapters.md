@@ -21,10 +21,34 @@ using `claude --help` and real headless runs on 2026-10-20.
 claude -p --output-format stream-json --verbose \
   [--model <model>] \
   --permission-mode acceptEdits --permission-prompts none \
-  --allowedTools Read,Write,Edit,Glob,Grep \
-  --disallowedTools WebFetch,WebSearch        # internet off; allowed when on
+  --restricted --strict-mcp-config \
+  --tools Bash,Read,Write,Edit,Glob,Grep[,WebFetch,WebSearch]  # web only when internet is on
+  --settings <agents_root>/data/permissions/<task-id>/claude-settings.json \
   [--add-dir <read-only dir> ...] \
   --append-system-prompt "<agent protocol §2.10>"
+```
+
+The settings file holds the per-Task allow/deny rules and sandbox settings
+(`ClaudeAdapter.write_permissions`); what each part enforces is in
+`docs/safety.md`. Shape:
+
+```json
+{
+  "permissions": {
+    "allow": ["WebFetch", "WebSearch"],
+    "deny": ["Read(//<data dir>/**)", "Edit(//<data dir>/**)", "Edit(//<read-only dir>/**)",
+             "Bash(curl:*)", "Bash(python3 -c:*)", "WebFetch(domain:linkedin.com)",
+             "WebFetch(domain:*.linkedin.com)"],
+    "disableBypassPermissionsMode": "disable"
+  },
+  "sandbox": {
+    "enabled": true, "autoAllowBashIfSandboxed": true, "allowUnsandboxedCommands": false,
+    "network": {"allowedDomains": []},
+    "filesystem": {"denyRead": ["<home>", "<agents_root>", "<no-access dirs>"],
+                   "allowRead": ["<task folder>", "<read-only dirs>", "<tool dirs>"],
+                   "denyWrite": ["<read-only dirs>", "<no-access dirs>"]}
+  }
+}
 ```
 
 - Run with the Task folder as the working directory.
@@ -51,15 +75,16 @@ claude -p --output-format stream-json --verbose \
 | `--session-id <uuid>` | Use a specific session ID (must be a UUID). | no |
 | `--fork-session` | When resuming, create a new session ID. | no |
 | `--no-session-persistence` | Sessions not saved, can't be resumed (only with `--print`). | no (we need resume) |
-| `--allowedTools, --allowed-tools <tools...>` | Comma or space separated tool names to allow, e.g. `"Bash(git *) Edit"`. | yes |
-| `--disallowedTools, --disallowed-tools <tools...>` | Comma or space separated tool names to deny. | yes |
-| `--tools <tools...>` | Restrict the built-in tool set (`""` disables all). | no (issue #4 may use it) |
+| `--allowedTools, --allowed-tools <tools...>` | Comma or space separated tool names to allow, e.g. `"Bash(git *) Edit"`. | no (allow rules are in `--settings`) |
+| `--disallowedTools, --disallowed-tools <tools...>` | Comma or space separated tool names to deny. | no (deny rules are in `--settings`) |
+| `--tools <tools...>` | Restrict the built-in tool set (`""` disables all). | yes: the only tools in the session |
 | `--permission-mode` | `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. | `acceptEdits` |
 | `--permission-prompts host\|none` | Who answers permission prompts with `--print`. `none`: anything that would prompt is denied automatically. | `none` |
-| `--add-dir <directories...>` | Additional directories to allow tool access to. | read-only dirs (issue #4 policy) |
-| `--settings <file-or-json>` | Extra settings (permissions, sandbox) from a file or JSON. | not yet (issue #4) |
-| `--setting-sources user,project,local` | Which setting sources load. | not yet |
-| `--restricted` | Removes Bash/code-running tools and WebFetch unless `--tools` names them, confines file tools to working dirs, refuses bypassPermissions. | not yet (candidate for issue #4) |
+| `--add-dir <directories...>` | Additional directories to allow tool access to. | existing read-only dirs (writes denied by rules) |
+| `--settings <file-or-json>` | Extra settings (permissions, sandbox) from a file or JSON. **Settings that fail validation are silently ignored with `-p`.** | yes: per-Task settings file |
+| `--setting-sources user,project,local` | Which setting sources load. | no (`--restricted` already ignores them) |
+| `--restricted` | Removes Bash/code-running tools and WebFetch unless `--tools` names them, ignores user/project/local settings, confines file tools to working dirs, refuses bypassPermissions. | yes |
+| `--strict-mcp-config` | Only MCP servers from `--mcp-config`. | yes (none) |
 | `--append-system-prompt <prompt>` | Append to the default system prompt. | yes: agent protocol |
 | `--model <model>` | Alias (`fable`, `opus`, `sonnet`, `haiku` worked) or full name. | from config `agents.claude.model` |
 | `--fallback-model <model>` | Fallback when the default model is overloaded. | no |
@@ -114,14 +139,34 @@ stored too, so no reported field is lost.
 
 ### Behaviour notes
 
-- With `--permission-mode acceptEdits` and `--permission-prompts none`,
-  read-only Bash commands (`cd … && ls`, `cat`) ran without being in
-  `--allowedTools`; a `cd` plus output redirection was denied automatically
-  and reported as `permission_denied`. So `--allowedTools` isn't an exhaustive
-  allowlist under `acceptEdits`. Issue #4 must set the real policy
-  (`--tools`/`--restricted`/`--settings`) and document it in `docs/safety.md`.
-- The user's own `~/.claude` settings, hooks and CLAUDE.md load into agent
-  sessions unless `--setting-sources` limits them (issue #4).
+- With `--permission-mode acceptEdits` and `--permission-prompts none` alone,
+  read-only Bash commands ran without being in `--allowedTools`, so
+  `--allowedTools` isn't an exhaustive allowlist. Hence `--tools` (tools not
+  named don't exist), `--restricted` and the sandbox.
+- **Permission rule paths:** `Edit(/abs/path/**)` is relative to the settings
+  file and did *not* match (an Edit in a "denied" folder went through).
+  Absolute paths need `//`: `Edit(//abs/path/**)` was denied with "File is in a
+  directory that is denied by your permission settings." `Edit` rules also
+  block `Write`.
+- `--restricted` refuses file tools outside the working dirs with
+  `permission_denied` / "--restricted: path outside the working directory".
+- Sandbox blocks show up as the shell's own error (`operation not
+  permitted`, exit 1); a blocked network connection as `CONNECT tunnel failed,
+  response 403` plus a `<sandbox_violations>` block, and a `permission_denied`
+  event with `tool_name: SandboxNetworkAccess`.
+- Sandbox `filesystem.allowRead` re-allows paths inside a `denyRead` root
+  (`~` denied, `~/.nvm` allowed: `node --version` ran, `ls ~/Documents` failed).
+  `~` is accepted in sandbox paths; Nightshift passes resolved absolute paths.
+- Bash's `$TMPDIR` inside the sandbox is `/tmp/claude-<uid>` (writable);
+  other `/tmp` paths are not.
+- The sandbox blocks writes to `.git/config` and `.git/hooks`, so `git init`
+  and `git add` fail in a Task, and `git commit` is auto-denied (needs a
+  prompt). A heredoc redirected to a file was also auto-denied.
+- Internet-on Tasks get explicit `WebFetch`/`WebSearch` allow rules so a
+  fetch never hits a (auto-denied) per-domain prompt. Denied domains get both
+  `WebFetch(domain:x)` and `WebFetch(domain:*.x)`; with both, `x` and `www.x`
+  were denied ("WebFetch denied access to domain:www.x") and other domains
+  were fetched. Deny wins over allow.
 
 ### Known gap: Nightshift sees only its own usage
 
