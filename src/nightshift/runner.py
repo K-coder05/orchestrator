@@ -20,7 +20,7 @@ from .permissions import build_policy
 from .protocol import agent_protocol
 from .states import TaskState
 from .timeutil import iso, now
-from .workspace import TaskSpec, create_task_folder
+from .workspace import PLAN_PENDING, PLAN_STUB, TaskSpec, create_task_folder
 
 AdapterProvider = Callable[[str, dict], AgentAdapter]
 
@@ -40,8 +40,18 @@ def create_task(
     agent: str | None = None,
     priority: str | None = None,
     internet: str | None = None,
+    estimated_minutes: int | None = None,
+    template: str | None = None,
+    needs_approval: bool = False,
+    reason: str = "created by orch add",
 ) -> NewTask:
-    """Create a free-form Task: DB row, Task folder, ``task.yaml``; state queued."""
+    """Create a Task: DB row, Task folder, ``task.yaml``.
+
+    It starts ``queued`` and approved, or ``awaiting_approval`` (not approved)
+    when ``needs_approval`` is set because its estimate is over the plan
+    threshold (§2.4; see ``nightshift.planning``). Planning happens before
+    this is called.
+    """
     created = now(cfg.timezone)
     ttype = task_type or cfg.default("task_type")
     agent_name = agent or cfg.default("agent")
@@ -59,16 +69,19 @@ def create_task(
         agent_override=agent is not None,
         priority=priority or cfg.default("priority"),
         internet=internet or cfg.internet_default(ttype),
+        template=template,
+        estimated_minutes=estimated_minutes,
         max_runtime_minutes=int(cfg.default("max_runtime_minutes")),
-        # Free-form planning and plan approval arrive with issue #5; until
-        # then a Task is treated as <= 30 minutes and starts right away.
-        approved=True,
-        approved_at=iso(created),
+        approved=not needs_approval,
+        approved_at=None if needs_approval else iso(created),
         created_at=iso(created),
     )
-    folder = create_task_folder(cfg.tasks_dir, spec, created)
+    folder = create_task_folder(
+        cfg.tasks_dir, spec, created, plan=PLAN_PENDING if needs_approval else PLAN_STUB
+    )
     fields = spec.to_dict() | {"folder": str(folder)}
-    db.insert_task(fields, TaskState.QUEUED, "created by orch add")
+    state = TaskState.AWAITING_APPROVAL if needs_approval else TaskState.QUEUED
+    db.insert_task(fields, state, reason)
     return NewTask(spec=spec, folder=folder)
 
 

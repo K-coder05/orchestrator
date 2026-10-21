@@ -46,6 +46,18 @@ Nightshift runs `claude -p` in the Task folder with:
   widen it (`--dangerously-skip-permissions`, `bypassPermissions`,
   `--settings`, `--add-dir`, `--tools`, `--permission-mode`, ...).
 
+## Planning calls
+
+Free-form `orch add` makes up to two quick planning calls (estimate, plan)
+before a Task exists or runs. They are confined harder than Attempts:
+`--tools ""` (no file, shell or web tools at all: technically enforced),
+`--restricted --strict-mcp-config` (no user settings, hooks or MCP servers),
+no saved session, and a working directory of `<agents_root>/data/planning/`.
+The prompt is the Task's one-line prompt; the agent's plan is saved to
+`plan.md` by Nightshift, not by the agent. Nothing an agent writes during
+planning can approve a Task: only `orch approve` or a yes at the `orch add`
+prompt can, and every decision is recorded in the `approvals` table.
+
 ## Limits
 
 ### Files (§1.4)

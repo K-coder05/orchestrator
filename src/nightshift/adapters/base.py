@@ -112,6 +112,17 @@ class Usage:
         return self.__dict__.copy()
 
 
+@dataclass
+class PlanningReply:
+    """What a planning call returned (§2.4): no tools, one answer, no session."""
+
+    ok: bool
+    structured: dict[str, Any] | None = None  # the answer, validated against the schema
+    text: str | None = None
+    error: str | None = None
+    usage: list[Usage] = field(default_factory=list)
+
+
 class AgentAdapter(ABC):
     name: str
 
@@ -156,6 +167,16 @@ class AgentAdapter(ABC):
     def write_permissions(self, workspace: Path, policy: PermissionPolicy) -> Permissions:
         """Generate the per-Task allowlist, deny rules, sandbox settings and
         added read-only dirs, writing any settings file the agent needs."""
+
+    @abstractmethod
+    def planning_command(self, prompt: str, *, system: str, schema: dict[str, Any]) -> Command:
+        """A quick one-shot call with no tools that answers ``prompt`` as JSON
+        matching ``schema`` (used for free-form estimates and plans, §2.4).
+        It must not give the agent any file, shell or web access."""
+
+    @abstractmethod
+    def parse_planning_output(self, stdout: str, exit_code: int) -> PlanningReply:
+        """Turn a planning call's output into a ``PlanningReply``."""
 
     def result_ok(self) -> bool | None:
         """Whether the agent reported success (None if it never reported)."""

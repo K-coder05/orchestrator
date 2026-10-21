@@ -91,6 +91,39 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX usage_events_run ON usage_events(run_id);
     """,
+    # 2: plan approvals and the usage of planning calls (§2.4).
+    """
+    -- One row per decision on a Task that was awaiting approval.
+    CREATE TABLE approvals (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id            TEXT NOT NULL REFERENCES tasks(id),
+        decision           TEXT NOT NULL CHECK (decision IN ('approved', 'denied')),
+        at                 TEXT NOT NULL,
+        via                TEXT NOT NULL,
+        estimated_minutes  INTEGER,
+        plan_sha256        TEXT
+    );
+    CREATE INDEX approvals_task ON approvals(task_id, id);
+
+    -- Planning calls are not Attempts (no session, no Task state change), so
+    -- their usage has its own table. task_id is NULL when the estimate was
+    -- declined and no Task was created.
+    CREATE TABLE planning_usage (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id                TEXT REFERENCES tasks(id),
+        kind                   TEXT NOT NULL,
+        agent                  TEXT NOT NULL,
+        model                  TEXT,
+        at                     TEXT NOT NULL,
+        input_tokens           INTEGER,
+        output_tokens          INTEGER,
+        cache_creation_tokens  INTEGER,
+        cache_read_tokens      INTEGER,
+        requests               INTEGER,
+        cost_usd               REAL,
+        raw                    TEXT
+    );
+    """,
 ]
 
 TASK_COLUMNS = (
@@ -284,6 +317,80 @@ class Database:
                         json.dumps(u.get("raw")) if u.get("raw") is not None else None,
                     ),
                 )
+
+    def record_planning_usage(
+        self, task_id: str | None, kind: str, agent: str, usage: list[dict], *, at: str | None = None
+    ) -> None:
+        at = at or self._now()
+        with self.tx() as c:
+            for u in usage:
+                c.execute(
+                    "INSERT INTO planning_usage (task_id, kind, agent, model, at, input_tokens, "
+                    "output_tokens, cache_creation_tokens, cache_read_tokens, requests, cost_usd, "
+                    "raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        task_id, kind, agent, u.get("model"), at,
+                        u.get("input_tokens"), u.get("output_tokens"),
+                        u.get("cache_creation_tokens"), u.get("cache_read_tokens"),
+                        u.get("requests"), u.get("cost_usd"),
+                        json.dumps(u.get("raw")) if u.get("raw") is not None else None,
+                    ),
+                )
+
+    def planning_usage(self, task_id: str | None = None) -> list[sqlite3.Row]:
+        if task_id is None:
+            return self.conn.execute("SELECT * FROM planning_usage ORDER BY id").fetchall()
+        return self.conn.execute(
+            "SELECT * FROM planning_usage WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+
+    # -- Approvals ------------------------------------------------------------
+    def decide_approval(
+        self,
+        task_id: str,
+        *,
+        approved: bool,
+        via: str,
+        to_state: TaskState,
+        reason: str,
+        plan_sha256: str | None,
+    ) -> str:
+        """Record an approval decision, set ``approved``/``approved_at`` and
+        move the Task out of ``awaiting_approval``, all in one transaction.
+        Returns the decision time."""
+        with self.tx() as c:
+            row = c.execute(
+                "SELECT state, estimated_minutes FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            current = TaskState(row["state"])
+            if current != TaskState.AWAITING_APPROVAL:
+                raise ValueError(f"Task {task_id} is {current}, not awaiting approval")
+            check_transition(current, to_state)
+            at = self._now()
+            c.execute(
+                "UPDATE tasks SET approved = ?, approved_at = ?, state = ?, state_changed_at = ? "
+                "WHERE id = ?",
+                (int(approved), at if approved else None, str(to_state), at, task_id),
+            )
+            c.execute(
+                "INSERT INTO approvals (task_id, decision, at, via, estimated_minutes, plan_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, "approved" if approved else "denied", at, via,
+                 row["estimated_minutes"], plan_sha256),
+            )
+            c.execute(
+                "INSERT INTO transitions (task_id, from_state, to_state, at, reason) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, str(current), str(to_state), at, reason),
+            )
+        return at
+
+    def approvals(self, task_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM approvals WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
 
     def usage_for_task(self, task_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(

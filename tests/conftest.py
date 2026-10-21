@@ -32,3 +32,15 @@ def db(cfg):
     d = Database(cfg.db_path, tz=cfg.timezone)
     yield d
     d.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_planning_calls(monkeypatch):
+    """`orch add` in tests must use the fake planner (the `planner` fixture),
+    never the real agent CLI."""
+    from nightshift import cli
+
+    def refuse(name, settings):
+        raise AssertionError("test ran a real planning call; use the planner fixture")
+
+    monkeypatch.setattr(cli, "planning_provider", refuse)

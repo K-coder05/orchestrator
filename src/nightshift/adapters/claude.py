@@ -15,6 +15,7 @@ from .base import (
     EventKind,
     PermissionPolicy,
     Permissions,
+    PlanningReply,
     RateLimit,
     TaskContext,
     Usage,
@@ -65,6 +66,8 @@ class ClaudeAdapter(AgentAdapter):
         settings = settings or {}
         self.binary: str = settings.get("binary") or "claude"
         self.model: str | None = settings.get("model")
+        # Planning calls are quick estimates; a small model is enough.
+        self.planning_model: str | None = settings.get("planning_model") or self.model
         self.extra_args: list[str] = list(settings.get("extra_args") or [])
         self._session_id: str | None = None
         self._result: dict[str, Any] | None = None
@@ -117,6 +120,54 @@ class ClaudeAdapter(AgentAdapter):
         if task is not None:
             argv += ["--append-system-prompt", task.protocol]
         return Command(argv=argv, stdin=prompt)
+
+    def planning_command(self, prompt: str, *, system: str, schema: dict[str, Any]) -> Command:
+        """``claude -p`` with no tools at all, a replaced system prompt and a
+        JSON schema for the answer. Nothing is saved as a session.
+
+        ``--tools ""`` leaves the session without file, shell or web tools,
+        so no per-Task permission policy is needed; ``--restricted`` still
+        keeps the user's settings and hooks out. ``extra_args`` are not used.
+        """
+        argv = [self.binary, "-p", "--output-format", "json"]
+        if self.planning_model:
+            argv += ["--model", self.planning_model]
+        argv += [
+            "--tools", "",
+            "--restricted", "--strict-mcp-config",
+            "--permission-prompts", "none",
+            "--no-session-persistence",
+            "--system-prompt", system,
+            "--json-schema", json.dumps(schema, separators=(",", ":")),
+        ]
+        return Command(argv=argv, stdin=prompt)
+
+    def parse_planning_output(self, stdout: str, exit_code: int) -> PlanningReply:
+        msg: dict[str, Any] | None = None
+        for line in reversed(stdout.strip().splitlines()):
+            try:
+                cand = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(cand, dict) and cand.get("type") == "result":
+                msg = cand
+                break
+        if msg is None:
+            return PlanningReply(ok=False, error=f"no result from claude (exit code {exit_code})")
+        usage = _usage_from_result(msg, requests=None)
+        structured = msg.get("structured_output")
+        if structured is None and isinstance(msg.get("result"), str):
+            try:  # older CLIs put the JSON answer in the result text only
+                structured = json.loads(msg["result"])
+            except json.JSONDecodeError:
+                structured = None
+        if exit_code != 0 or msg.get("is_error"):
+            err = str(msg.get("result") or msg.get("subtype") or f"exit code {exit_code}")
+            return PlanningReply(ok=False, error=err, text=msg.get("result"), usage=usage)
+        if not isinstance(structured, dict):
+            return PlanningReply(ok=False, error="claude did not return a JSON answer",
+                                 text=msg.get("result"), usage=usage)
+        return PlanningReply(ok=True, structured=structured, text=msg.get("result"), usage=usage)
 
     def write_permissions(self, workspace: Path, policy: PermissionPolicy) -> Permissions:
         """Claude Code settings for one Task; see docs/safety.md for what each
@@ -304,39 +355,7 @@ class ClaudeAdapter(AgentAdapter):
     def usage_from_run(self) -> list[Usage]:
         if not self._result:
             return []
-        r = self._result
-        requests = len(self._message_ids) or None
-        model_usage = r.get("modelUsage") or {}
-        if model_usage:
-            out = []
-            for model, mu in model_usage.items():
-                out.append(
-                    Usage(
-                        model=model,
-                        input_tokens=mu.get("inputTokens"),
-                        output_tokens=mu.get("outputTokens"),
-                        cache_creation_tokens=mu.get("cacheCreationInputTokens"),
-                        cache_read_tokens=mu.get("cacheReadInputTokens"),
-                        # Request count is per Attempt; attribute it to the first model.
-                        requests=requests if not out else None,
-                        cost_usd=mu.get("costUSD"),
-                        raw=mu,
-                    )
-                )
-            return out
-        u = r.get("usage") or {}
-        return [
-            Usage(
-                model=None,
-                input_tokens=u.get("input_tokens"),
-                output_tokens=u.get("output_tokens"),
-                cache_creation_tokens=u.get("cache_creation_input_tokens"),
-                cache_read_tokens=u.get("cache_read_input_tokens"),
-                requests=requests,
-                cost_usd=r.get("total_cost_usd"),
-                raw=u,
-            )
-        ]
+        return _usage_from_result(self._result, requests=len(self._message_ids) or None)
 
     def result_ok(self) -> bool | None:
         if self._result is None:
@@ -347,3 +366,38 @@ class ClaudeAdapter(AgentAdapter):
         if self._result is None or self.result_ok():
             return None
         return str(self._result.get("result") or self._result.get("subtype"))
+
+
+def _usage_from_result(r: dict[str, Any], *, requests: int | None) -> list[Usage]:
+    """One ``Usage`` per model from a ``result`` line (see docs/adapters.md)."""
+    model_usage = r.get("modelUsage") or {}
+    if model_usage:
+        out = []
+        for model, mu in model_usage.items():
+            out.append(
+                Usage(
+                    model=model,
+                    input_tokens=mu.get("inputTokens"),
+                    output_tokens=mu.get("outputTokens"),
+                    cache_creation_tokens=mu.get("cacheCreationInputTokens"),
+                    cache_read_tokens=mu.get("cacheReadInputTokens"),
+                    # Request count is per Attempt; attribute it to the first model.
+                    requests=requests if not out else None,
+                    cost_usd=mu.get("costUSD"),
+                    raw=mu,
+                )
+            )
+        return out
+    u = r.get("usage") or {}
+    return [
+        Usage(
+            model=None,
+            input_tokens=u.get("input_tokens"),
+            output_tokens=u.get("output_tokens"),
+            cache_creation_tokens=u.get("cache_creation_input_tokens"),
+            cache_read_tokens=u.get("cache_read_input_tokens"),
+            requests=requests,
+            cost_usd=r.get("total_cost_usd"),
+            raw=u,
+        )
+    ]

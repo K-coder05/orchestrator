@@ -232,3 +232,63 @@ lasting consequences go in `docs/adr/` instead.
 - **Known side effect: no local git commits inside Tasks** (the sandbox
   protects `.git/config` and `.git/hooks`). Stricter than §1.6; to revisit
   when coding Tasks need commits.
+
+## Phase 1, issue #5: free-form planning, confirmation and plan approvals
+
+- **Two planning calls, both tool-less.** The estimate call returns
+  `estimated_minutes`, `task_type` and a one-sentence reason as JSON. Only a
+  Task estimated over `planning.approval_threshold_minutes` (default 30, per
+  §2.4) gets a second call that returns the `plan.md` content. Splitting them
+  keeps the estimate quick and spends nothing on plans for short Tasks or
+  declined estimates. Both are new adapter methods, `planning_command` and
+  `parse_planning_output` (§2.9 interface, so core code still names no agent).
+- **The agent writes the plan; Nightshift saves it.** The plan call has no
+  tools (`--tools ""`), so it needs no permission policy and can't touch any
+  file; its JSON answer's `plan_markdown` is written to the Task's `plan.md`.
+  Planning calls run in `<agents_root>/data/planning/` (empty, Nightshift-owned)
+  so no project files or `CLAUDE.md` from the current directory get in.
+- **Planning model.** `agents.claude.planning_model` (default `haiku`; null
+  uses `model`). `planning.agent` (null = `defaults.agent`) picks the agent.
+  `planning.timeout_seconds` (180) bounds each call.
+- **Order of questions in `orch add`.** Estimate call, print estimate and
+  type, then "Create this Task?" (skipped by `--yes`). A no creates nothing.
+  At or under the threshold: the Task is created `queued`, approved, with the
+  "no plan was needed" stub, and never enters `awaiting_approval`. Over it: the
+  Task is created in `awaiting_approval` (stub says the plan is pending), the
+  plan call runs, the plan is printed and "Approve this plan?" asked. A no
+  leaves it in `awaiting_approval`.
+- **`--yes` does not approve plans.** §2.4 calls the confirmation and plan
+  approval separate, and an over-30 Task "needs my approval", so `--yes` only
+  skips the estimate/type question. With no terminal answer (EOF) every y/n
+  counts as no, so a scripted `orch add --yes` of a long Task leaves it
+  awaiting approval rather than hanging.
+- **Failures.** A failed estimate call fails `orch add` and queues nothing. A
+  failed plan call leaves the Task in `awaiting_approval` with the pending
+  stub; `orch approve` can still run it, `orch deny` cancels it.
+- **Unknown proposed types** (not in `task_types`) fall back to
+  `defaults.task_type` and the reason says so. `--type` accepts any type, as
+  before. The schema's `enum` normally prevents this anyway.
+- **Approvals table** (migration 2): one row per decision on a Task awaiting
+  approval: `decision` (`approved`/`denied`), `at`, `via` (`orch add`, `orch
+  approve`, `orch deny`), `estimated_minutes` and the SHA-256 of the
+  `plan.md` that was approved, so a later edit is detectable. The decision,
+  the `approved`/`approved_at` columns and the transition are written in one
+  transaction; `task.yaml` is updated to match. `orch deny` moves the Task to
+  `cancelled` and writes a cancelled `report.md`. `orch approve`/`deny`
+  refuse Tasks that aren't awaiting approval. The free-form y/n confirmation
+  isn't an approval and isn't recorded there.
+- **Planning usage** goes to a new `planning_usage` table (task_id NULL when
+  the estimate was declined), not `usage_events`, whose rows belong to an
+  Attempt. Usage-window/Baseline code must add both tables.
+- **Templates.** `planning.from_template(template)` takes `estimated_minutes`
+  and `task_type` from the template, with no planning call; the result feeds
+  `create_task(..., template=, estimated_minutes=, needs_approval=
+  planning.needs_plan(...))`. The template engine and `orch add --template`
+  come later and should use this; scheduled Occurrences pass
+  `needs_approval=False` (pre-approved, §2.4).
+- **Real-machine check (2026-10-20).** On Claude Code 2.1.306 with haiku:
+  a haiku Task estimated 2 min (queued, no plan); a CLI todo app 40 min and a
+  literature review 210 min got real plans, approved via `orch approve` and
+  the prompt; a no left one awaiting approval; `orch deny` cancelled one. Each
+  call cost about $0.0002-0.0008 reported cost-equivalent. Haiku proposed
+  `comedy` for a haiku; that's what the y/n and `--type` are for.

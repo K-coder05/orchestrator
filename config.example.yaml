@@ -37,6 +37,9 @@ agents:
     binary: claude
     # null uses the CLI's own default model.
     model: null
+    # Model for the quick planning calls of free-form `orch add` (§2.4).
+    # null uses `model`.
+    planning_model: haiku
     extra_args: []
 
 defaults:
@@ -44,6 +47,15 @@ defaults:
   task_type: general
   priority: normal
   max_runtime_minutes: 120
+
+planning:
+  # Free-form `orch add` asks an agent for an estimate and a Task type (§2.4).
+  # null uses defaults.agent.
+  agent: null
+  # Tasks estimated above this many minutes get a plan.md and need approval.
+  approval_threshold_minutes: 30
+  # A planning call that takes longer than this fails `orch add`.
+  timeout_seconds: 180
 
 daemon:
   # launchd LaunchAgent label; the plist is ~/Library/LaunchAgents/<label>.plist.

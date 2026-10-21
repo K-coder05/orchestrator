@@ -90,6 +90,12 @@ def format_show(db: Database, row: sqlite3.Row) -> str:
     else:
         out.append("  none yet")
 
+    approvals = db.approvals(row["id"])
+    if approvals:
+        out += ["", "Approvals:"]
+        for a in approvals:
+            out.append(f"  {_short_time(a['at'])}  {a['decision']} via {a['via']}")
+
     out += ["", "History:"]
     for t in db.transitions(row["id"]):
         frm = t["from_state"] or "(new)"

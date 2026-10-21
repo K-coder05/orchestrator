@@ -62,6 +62,29 @@ The settings file holds the per-Task allow/deny rules and sandbox settings
   `--append-system-prompt` again on resume, so every Attempt carries the
   protocol.
 
+### Planning calls (§2.4)
+
+Free-form `orch add` makes one-shot planning calls (`planning_command`):
+
+```
+claude -p --output-format json [--model <agents.claude.planning_model>] \
+  --tools "" --restricted --strict-mcp-config --permission-prompts none \
+  --no-session-persistence --system-prompt "<planner instructions>" \
+  --json-schema '<schema>'          # prompt on stdin, cwd <agents_root>/data/planning
+```
+
+- `--tools ""` leaves no built-in tools; the answer still arrives through
+  structured output. `--system-prompt` replaces the default prompt.
+  `agents.claude.extra_args` are **not** passed.
+- Output is one JSON `result` object (same fields as the stream-json
+  `result` line) plus **`structured_output`**: the answer, validated against
+  `--json-schema`; `result` holds the same JSON as text. `stop_reason` was
+  `tool_use` and `num_turns` 2 (the structured-output tool call). The parser
+  falls back to parsing `result` if `structured_output` is missing.
+- Errors look like Attempt errors: `is_error: true`, message in `result`,
+  non-zero exit. Usage comes from `modelUsage` as for Attempts.
+- Verified on 2.1.306 with haiku on 2026-10-20.
+
 ### Flags verified in `claude --help`
 
 | Flag | What it does (from `--help`) | Used |
@@ -74,7 +97,7 @@ The settings file holds the per-Task allow/deny rules and sandbox settings
 | `-r, --resume [value]` | Resume a conversation by session ID or name. | resume path |
 | `--session-id <uuid>` | Use a specific session ID (must be a UUID). | no |
 | `--fork-session` | When resuming, create a new session ID. | no |
-| `--no-session-persistence` | Sessions not saved, can't be resumed (only with `--print`). | no (we need resume) |
+| `--no-session-persistence` | Sessions not saved, can't be resumed (only with `--print`). | planning calls only (Attempts need resume) |
 | `--allowedTools, --allowed-tools <tools...>` | Comma or space separated tool names to allow, e.g. `"Bash(git *) Edit"`. | no (allow rules are in `--settings`) |
 | `--disallowedTools, --disallowed-tools <tools...>` | Comma or space separated tool names to deny. | no (deny rules are in `--settings`) |
 | `--tools <tools...>` | Restrict the built-in tool set (`""` disables all). | yes: the only tools in the session |
@@ -86,6 +109,8 @@ The settings file holds the per-Task allow/deny rules and sandbox settings
 | `--restricted` | Removes Bash/code-running tools and WebFetch unless `--tools` names them, ignores user/project/local settings, confines file tools to working dirs, refuses bypassPermissions. | yes |
 | `--strict-mcp-config` | Only MCP servers from `--mcp-config`. | yes (none) |
 | `--append-system-prompt <prompt>` | Append to the default system prompt. | yes: agent protocol |
+| `--system-prompt <prompt>` | System prompt to use for the session (replaces the default). | planning calls only |
+| `--json-schema <schema>` | JSON Schema for structured output validation (only with `--print`). | planning calls only |
 | `--model <model>` | Alias (`fable`, `opus`, `sonnet`, `haiku` worked) or full name. | from config `agents.claude.model` |
 | `--fallback-model <model>` | Fallback when the default model is overloaded. | no |
 | `--max-budget-usd <amount>` | Max dollar spend on API calls (only with `--print`). | no (subscription) |

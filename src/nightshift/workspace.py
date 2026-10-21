@@ -64,6 +64,15 @@ No plan was needed: this Task was estimated at 30 minutes or less, so it
 started without plan approval (§2.4). The agent may write its own plan here.
 """
 
+PLAN_PENDING = """\
+# Plan
+
+This Task was estimated over the plan threshold, so it needs a plan and your
+approval before it runs (§2.4). The plan has not been written yet: the
+planning call failed or hasn't finished. `orch approve <id>` runs it anyway;
+`orch deny <id>` cancels it.
+"""
+
 PROGRESS_STUB = """\
 # Progress
 
@@ -77,14 +86,16 @@ Checkpoint notes. The agent updates this after every meaningful step.
 """
 
 
-def create_task_folder(tasks_dir: Path, spec: TaskSpec, created: datetime) -> Path:
+def create_task_folder(
+    tasks_dir: Path, spec: TaskSpec, created: datetime, *, plan: str = PLAN_STUB
+) -> Path:
     """Create ``<tasks_dir>/YYYY-MM-DD_<slug>_<id>/`` with its standard contents."""
     folder = tasks_dir / folder_name(created, spec.slug, spec.id)
     folder.mkdir(parents=True, exist_ok=False)
     (folder / "output").mkdir()
     (folder / "logs").mkdir()
     write_task_yaml(folder, spec)
-    (folder / "plan.md").write_text(PLAN_STUB)
+    (folder / "plan.md").write_text(plan)
     (folder / "progress.md").write_text(PROGRESS_STUB)
     (folder / "report.md").write_text(report.skeleton(spec.title))
     return folder

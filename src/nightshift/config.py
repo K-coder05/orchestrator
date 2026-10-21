@@ -199,6 +199,13 @@ class Config:
     def default(self, key: str) -> Any:
         return self.data["defaults"][key]
 
+    def planning(self, key: str) -> Any:
+        return (self.data.get("planning") or {}).get(key)
+
+    @property
+    def task_types(self) -> list[str]:
+        return list(self.data.get("task_types") or {})
+
     def internet_default(self, task_type: str) -> str:
         types = self.data.get("task_types") or {}
         entry = types.get(task_type) or {}
@@ -224,6 +231,15 @@ def _validate(data: dict[str, Any]) -> None:
         value = perms.get(key) or []
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ConfigError(f"permissions.{key} must be a list of strings")
+    planning = data.get("planning") or {}
+    if not isinstance(planning, dict):
+        raise ConfigError("config section 'planning' must be a mapping")
+    if planning.get("agent") is not None and planning["agent"] not in data["agents"]:
+        raise ConfigError("planning.agent must name a configured agent (or be null)")
+    for key, default in (("approval_threshold_minutes", 30), ("timeout_seconds", 180)):
+        value = planning.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ConfigError(f"planning.{key} must be a positive number")
     poll = (data.get("daemon") or {}).get("poll_seconds", 5)
     if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("daemon.poll_seconds must be a positive number")

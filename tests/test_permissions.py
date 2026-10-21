@@ -20,6 +20,7 @@ from nightshift.host import FakeHost
 from nightshift.permissions import build_policy
 from nightshift.runner import create_task, run_attempt
 
+from test_planning import planner  # noqa: F401  (pytest fixture)
 from test_runner import env, fake_provider  # noqa: F401  (pytest fixture)
 
 
@@ -104,9 +105,10 @@ def test_internet_flag_overrides_type_default(cfg, db):
     assert create_task(cfg, db, "x", task_type="research", internet="off").spec.internet == "off"
 
 
-def test_cli_internet_flag(config_dir, cfg, db):
+def test_cli_internet_flag(config_dir, cfg, db, planner):  # noqa: F811
     r = CliRunner().invoke(
-        cli.main, ["--config-dir", str(config_dir), "add", "x", "--type", "comedy", "--internet", "on"]
+        cli.main,
+        ["--config-dir", str(config_dir), "add", "x", "--type", "comedy", "--internet", "on", "--yes"],
     )
     assert r.exit_code == 0, r.output
     [row] = db.list_tasks()

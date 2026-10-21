@@ -11,6 +11,7 @@ from nightshift.daemon import DaemonLock, lock_path
 from nightshift.runner import create_task, run_attempt
 from nightshift.states import TaskState
 
+from test_planning import planner  # noqa: F401  (pytest fixture)
 from test_runner import env, fake_provider  # noqa: F401  (pytest fixture)
 
 
@@ -18,9 +19,9 @@ def _orch(config_dir, *args):
     return CliRunner().invoke(cli.main, ["--config-dir", str(config_dir), *args])
 
 
-def test_add_queues_and_returns_immediately(config_dir, cfg, db):
+def test_add_queues_and_returns_immediately(config_dir, cfg, db, planner):  # noqa: F811
     start = time.monotonic()
-    r = _orch(config_dir, "add", "Write a haiku", "--priority", "urgent")
+    r = _orch(config_dir, "add", "Write a haiku", "--priority", "urgent", "--yes")
     assert r.exit_code == 0, r.output
     assert time.monotonic() - start < 5
     [row] = db.list_tasks()
@@ -30,11 +31,11 @@ def test_add_queues_and_returns_immediately(config_dir, cfg, db):
     assert "daemon isn't running" in r.output
 
 
-def test_add_without_note_when_daemon_up(config_dir, cfg):
+def test_add_without_note_when_daemon_up(config_dir, cfg, planner):  # noqa: F811
     lock = DaemonLock(lock_path(cfg))
     assert lock.acquire()
     try:
-        r = _orch(config_dir, "add", "x")
+        r = _orch(config_dir, "add", "x", "--yes")
     finally:
         lock.release()
     assert r.exit_code == 0 and "daemon isn't running" not in r.output
