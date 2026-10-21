@@ -49,6 +49,8 @@ agents:
     model: null
     # Model for planning calls when planning.agent is codex; null uses `model`.
     planning_model: null
+    # `model_reasoning_effort` (low | medium | high | ...); null uses the model's default.
+    reasoning_effort: null
     # Extra flags for `codex exec`. Flags that change the sandbox, approvals
     # or config (-c, --sandbox, --add-dir, --profile, ...) are refused.
     extra_args: []

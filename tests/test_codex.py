@@ -1,8 +1,8 @@
 """The Codex adapter (§2.9) and coding failover (§2.7, §2.8, Acceptance Test 3).
 
-The Codex CLI is not installed on this Mac: the adapter is built from the
-Codex docs and source (docs/adapters.md) and tested against the fake
-`codex exec` in tests/fixtures/fake_codex.py.
+The adapter was verified against codex-cli 0.163.0 (docs/adapters.md); these
+tests run it against the fake `codex exec` in tests/fixtures/fake_codex.py,
+which replays a recorded real stream.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from conftest import FIXTURES
 from test_runner import env, fake_provider as fake_claude_provider  # noqa: F401  (fixture)
 
 LA = ZoneInfo("America/Los_Angeles")
-CODEX_SID = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+CODEX_SID = "01a16084-0da3-70f0-8ade-cab04834c0ac"
 FAKE_CODEX = [sys.executable, str(FIXTURES / "fake_codex.py")]
 
 
@@ -143,7 +143,10 @@ def test_build_command_is_codex_exec_with_the_per_task_policy(cfg, tmp_path):
     assert o["developer_instructions"] == _task(ws).protocol
     assert o["web_search"] == "disabled"
     assert o["permissions.nightshift.network"] == {"enabled": False}
-    assert o["features.hooks"] is False
+    # Default-on features that reach past the shell sandbox are off (0.163.0).
+    for f in ("hooks", "apps", "plugins", "browser_use", "computer_use", "in_app_browser"):
+        assert o[f"features.{f}"] is False
+    assert "model_reasoning_effort" not in o  # the model's default unless configured
     fs = o["permissions.nightshift.filesystem"]
     assert fs[str(ws)] == "write" and fs[":workspace_roots"] == {".": "write"}
     assert fs[str(Path(cfg.data_dir).resolve())] == "deny"
@@ -157,6 +160,13 @@ def test_build_command_is_codex_exec_with_the_per_task_policy(cfg, tmp_path):
     env = o["shell_environment_policy.set"]
     assert env["TMPDIR"] == str(ws / ".tmp") and (ws / ".tmp").is_dir()
     assert o["shell_environment_policy.inherit"] == "core"
+
+
+def test_reasoning_effort_setting(cfg, tmp_path):
+    ws, policy, perms = _perms(cfg, tmp_path)
+    a = CodexAdapter({"model": "gpt-6-luna", "reasoning_effort": "low"})
+    for argv in (a.build_command(_task(ws), ws, perms).argv, a.probe_command().argv):
+        assert _overrides(argv)["model_reasoning_effort"] == "low"
 
 
 def test_internet_on_gets_web_search_only(cfg, tmp_path):
@@ -189,7 +199,8 @@ def test_refuses_unsafe_commands(cfg, tmp_path):
     with pytest.raises(ValueError):
         CodexAdapter({}).build_command(_task(ws), ws, Permissions())
     for bad in (["--yolo"], ["-c", "sandbox_mode=danger-full-access"], ["--sandbox=read-only"],
-                ["--add-dir", "/"], ["-capproval_policy=on-request"], ["--profile", "x"]):
+                ["--add-dir", "/"], ["-capproval_policy=on-request"], ["--profile", "x"],
+                ["--enable", "computer_use"], ["--search"], ["--remote", "ws://x"]):
         with pytest.raises(ValueError):
             CodexAdapter({"extra_args": bad}).build_command(_task(ws), ws, perms)
     CodexAdapter({"extra_args": ["--color", "never"]}).build_command(_task(ws), ws, perms)
@@ -224,15 +235,33 @@ def test_parse_stream_fixture():
     assert kinds[0] == EventKind.SESSION
     calls = [e.data["id"] for e in events if e.kind == EventKind.TOOL_CALL]
     results = [e.data["tool_use_id"] for e in events if e.kind == EventKind.TOOL_RESULT]
-    # Four Steps: two commands, two file changes (one seen only completed).
-    assert calls == ["item_1", "item_2", "item_3", "item_4"] and results == calls
+    # A recorded real stream (codex-cli 0.163.0, AT3): one command, six file
+    # changes; agent_message items are not Steps.
+    assert calls == ["item_1", "item_2", "item_3", "item_5", "item_6", "item_7", "item_8"]
+    assert results == calls
     files = [e.data["path"] for e in events if e.kind == EventKind.FILE_CHANGE]
-    assert files == ["output/fizzbuzz.py", "progress.md", "report.md"]
+    assert files == ["output/test_fizzbuzz.py", "progress.md", "output/README.md", "progress.md",
+                     "logs/decisions.jsonl", "report.md"]
     assert kinds[-1] == EventKind.RESULT and a.result_ok() is True and a.result_error() is None
     [u] = a.usage_from_run()
-    assert (u.input_tokens, u.cache_read_tokens, u.output_tokens) == (315, 24448, 122)
+    assert (u.input_tokens, u.cache_read_tokens, u.output_tokens) == (23542, 96768, 2184)
     assert u.cost_usd is None and u.model == "gpt-5-codex" and u.requests == 1
-    assert u.raw["reasoning_output_tokens"] == 64
+    assert u.raw["reasoning_output_tokens"] == 231
+
+
+def test_resumed_session_counts_only_its_own_tokens():
+    """turn.completed reports the thread's running total (seen on a real
+    resume: 80,730 then 110,414 input tokens), so a resume subtracts the
+    total the session ended at before."""
+    a = CodexAdapter({})
+    a.prior_usage = {"input_tokens": 80730, "cached_input_tokens": 62208,
+                     "cache_write_input_tokens": 0, "output_tokens": 355}
+    a.parse_stream('{"type":"turn.completed","usage":{"input_tokens":110414,'
+                   '"cached_input_tokens":90112,"cache_write_input_tokens":0,'
+                   '"output_tokens":463,"reasoning_output_tokens":0}}')
+    [u] = a.usage_from_run()
+    assert (u.input_tokens, u.cache_read_tokens, u.output_tokens) == (29684 - 27904, 27904, 108)
+    assert u.raw["input_tokens"] == 110414  # the reported total, for the next resume
 
 
 def test_failed_step_and_failed_turn():
@@ -493,10 +522,18 @@ def test_both_out_resumes_on_codex_when_it_resets_first(cfg, db, cenv):
     clock.advance(minutes=30)
     assert qr.run_next() is None
     clock.advance(minutes=31)
+    # Pretend the session had reached this total before (Codex reports the
+    # thread's running total): the resumed Attempt counts only the rest.
+    codex_run = db.attempts(tid)[-1]["id"]
+    db.record_usage(codex_run, tid, "codex", [{"model": "m", "raw": {
+        "input_tokens": 100000, "cached_input_tokens": 90000, "output_tokens": 2000}}])
     assert qr.run_next() == tid
     assert db.task_state(tid) == TaskState.DONE and db.get_task(tid)["agent"] == "codex"
     runs = _codex_runs(new.folder)
     assert len(runs) == 2 and runs[1]["argv"][-3:-1] == ["resume", CODEX_SID]  # same agent: resume
+    last = db.usage_for_task(tid)[-1]
+    assert (last["input_tokens"], last["cache_read_tokens"], last["output_tokens"]) == (
+        (120310 - 100000) - (96768 - 90000), 96768 - 90000, 184)
 
 
 def test_both_out_resumes_on_claude_when_it_resets_first(cfg, db, cenv):

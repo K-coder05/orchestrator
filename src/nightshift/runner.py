@@ -357,6 +357,13 @@ def run_attempt(
         ),
     )
     resume_session = choice.session_id if choice is not None else None
+    if resume_session and hasattr(adapter, "prior_usage"):
+        # Codex reports the session's running total: hand it the total the
+        # earlier Attempts of this session ended at, so only this one's part counts.
+        runs = {a["id"] for a in earlier if a["session_id"] == resume_session}
+        raws = [json.loads(u["raw"]) for u in db.usage_for_task(task_id)
+                if u["run_id"] in runs and u["raw"]]
+        adapter.prior_usage = raws[-1] if raws else None
     if resume_session:
         command = adapter.resume_command(
             resume_session, pauses.RESUME_PROMPT, task=task, permissions=permissions

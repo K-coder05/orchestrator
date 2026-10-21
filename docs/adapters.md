@@ -5,7 +5,7 @@ All agents sit behind `nightshift.adapters.base.AgentAdapter` (§2.9):
 `resume_command`, `usage_from_run`, `write_permissions`, plus
 `planning_command`/`parse_planning_output` and
 `probe_command`/`parse_probe_output`. Registered: `claude` (verified) and
-`codex` (built from docs and source, **not yet verified**). One adapter instance
+`codex` (verified on codex-cli 0.163.0). One adapter instance
 is created per Attempt, so `session_id()` and `usage_from_run()` report what
 that Attempt's stream contained. Adapters are looked up by name in
 `nightshift.adapters.REGISTRY`; core code never names an agent.
@@ -338,13 +338,16 @@ probes), never from interactive use of the same plan (the Claude app,
 
 ## Codex CLI
 
-> **NOT YET VERIFIED AGAINST A LOCAL CODEX INSTALL.** The Codex CLI is not
-> installed on this Mac (and was deliberately not installed while building
-> this). Everything below comes from the Codex docs and the openai/codex
-> source on GitHub (branch `main`, read 2026-10-21), not from `codex --help`
-> or a real run. SPEC.md says to trust the installed tool: when `codex` is
-> installed, run the checks under "Verify once installed" and fix this
-> section and `nightshift/adapters/codex.py` to match.
+> **Verified against codex-cli 0.163.0 on this Mac (2026-10-21)**, signed in
+> with the ChatGPT plan: `codex --help`, `codex exec --help`, `codex exec
+> resume --help`, `codex features list`, `codex debug models`, the
+> permission profile via `codex sandbox` (no model call) and six short real
+> runs on `gpt-6-luna` with `model_reasoning_effort = "low"` (a hello, a
+> sandbox audit, a resume, a probe, two Acceptance Test 3 Attempts). What
+> is still from the docs/source only: the usage-limit message formats (no
+> real hit seen) and planning calls with `--output-schema` (not run).
+
+The section was first written from these sources (before a CLI existed here):
 
 Sources used:
 
@@ -378,7 +381,7 @@ Sources used:
 
 ```
 codex exec --json --skip-git-repo-check --ignore-user-config --ignore-rules --strict-config \
-  [-m <agents.codex.model>] \
+  [-m <agents.codex.model>] [-c model_reasoning_effort="<agents.codex.reasoning_effort>"] \
   -c approval_policy="never" \
   -c default_permissions="nightshift" \
   -c 'permissions.nightshift.filesystem={":root" = "read", ":minimal" = "read",
@@ -387,7 +390,11 @@ codex exec --json --skip-git-repo-check --ignore-user-config --ignore-rules --st
         ":workspace_roots" = {"." = "write"}, "<task folder>" = "write"}' \
   -c 'permissions.nightshift.network={"enabled" = false}' \
   -c web_search="disabled"            # "live" on internet-on Tasks
-  -c features.hooks=false -c check_for_update_on_startup=false \
+  -c features.apps=false -c features.plugins=false -c features.remote_plugin=false \
+  -c features.browser_use=false -c features.browser_use_external=false \
+  -c features.in_app_browser=false -c features.computer_use=false \
+  -c features.image_generation=false -c features.hooks=false \
+  -c check_for_update_on_startup=false \
   -c history.persistence="none" \
   -c shell_environment_policy.inherit="core" \
   -c shell_environment_policy.ignore_default_excludes=false \
@@ -410,6 +417,24 @@ codex exec --json --skip-git-repo-check --ignore-user-config --ignore-rules --st
   string, a quoting bug would be silent; the tests pin the shape.
 - `--strict-config` makes Codex fail on config fields it doesn't know (a
   renamed key fails the Attempt instead of silently dropping a limit).
+  Verified: every key above is accepted by 0.163.0, and an unknown one
+  fails at once with `Error loading config.toml: unknown configuration
+  field `x` in -c/--config override` (exit 1, no model call, nothing on
+  stdout).
+- **Default-on features switched off.** 0.163.0 enables `computer_use`,
+  `browser_use`, `browser_use_external`, `in_app_browser`, `apps`
+  (ChatGPT connectors), `plugins`, `remote_plugin` and `image_generation`
+  by default (`codex features list`). They could reach past the shell
+  sandbox (desktop/browser control, remote connectors), so every run sets
+  them false (`DISABLED_FEATURES`). Real exec runs used only the `exec`
+  (code-mode) tool.
+- **Model.** `codex debug models` lists gpt-6.1-sol, gpt-6-astra,
+  gpt-6-sol, gpt-6-luna ("fast and affordable"), gpt-5.6-sol/terra/luna.
+  `agents.codex.model: null` uses the CLI default; the real checks used
+  `gpt-6-luna` with `agents.codex.reasoning_effort: low`
+  (`-c model_reasoning_effort="low"`), the cheapest combination. A tiny
+  sandbox-audit turn was still ~80k input tokens (mostly cached): Codex's
+  system context is large.
 - The prompt goes on stdin with `-`; the agent protocol goes in
   `developer_instructions` (stored commands show it as `<agent protocol>`).
 - No `--sandbox`: the custom permission profile replaces it (the docs say
@@ -417,10 +442,17 @@ codex exec --json --skip-git-repo-check --ignore-user-config --ignore-rules --st
   `--add-dir`: it adds **writable** dirs; read-only dirs are `read`
   entries in the profile instead. No `--ephemeral` on Attempts (they must
   be resumable); planning calls and probes use it.
-- Session id = the `thread_id` of `thread.started`. Resume:
-  `codex exec ... resume <thread_id> -` (the exec flags are `global`, so
-  they may precede the subcommand). A resume that fails before any Step
-  falls back to a fresh session as for Claude.
+- Session id = the `thread_id` of `thread.started` (a UUIDv7 such as
+  `01a1607f-2f68-70b0-8a15-3d716566f489`). Resume: `codex exec ... resume
+  <thread_id> -` with all exec flags and `-c` overrides **before**
+  `resume` (verified: the resumed turn reported the same `thread_id`,
+  remembered the earlier turn, and its sandbox still refused a write
+  outside the folder). A resume that fails before any Step falls back to a
+  fresh session as for Claude.
+- Sessions are saved under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+  even with `history.persistence = "none"` (that only covers the prompt
+  history file); `--ephemeral` runs save nothing.
+- Shell commands run as `/bin/zsh -lc '<cmd>'` (the `command` field).
 - `agents.codex.extra_args` may not contain `-c/--config`, `--sandbox`,
   `--yolo`, `--dangerously-bypass-*`, `--approve-for-me`, `--full-auto`,
   `--add-dir`, `--profile`, `--cd`, `--worktree`, `--oss`, `-a`.
@@ -447,9 +479,17 @@ each is **one Step**: `tool_call` (id = item id) on the first
 `text` (the last one is the final answer); `reasoning`, `todo_list` ->
 `other`; `error` items are warnings (config/deprecation notices) -> `other`.
 
-Recorded sample: none (no CLI). `tests/fixtures/codex_stream.jsonl` is
-**constructed** from the source types, and `tests/fixtures/fake_codex.py`
-replays it.
+Verified on 0.163.0: exactly these events and fields. `item.started`
+then `item.completed` for `command_execution` and `file_change` (with
+absolute paths in `changes[].path`); `agent_message` only as
+`item.completed`; no `reasoning` items at low effort; a failed command is
+`status: "failed"` with its `exit_code` (e.g. curl's 6). A rejected
+`apply_patch` produced no item at all (only a stderr log line). Item ids
+are `item_0`, `item_1`, ... per turn. stderr is empty on a clean run.
+
+Recorded sample: `tests/fixtures/codex_stream.jsonl` is the real stream of
+Acceptance Test 3's Codex Attempt (Task folder prefix removed, so paths are
+relative); `tests/fixtures/fake_codex.py` replays it.
 
 ### Usage mapping
 
@@ -459,12 +499,20 @@ From the last `turn.completed`: input = `input_tokens - cached_input_tokens`
 `output_tokens` (includes reasoning tokens), requests = turns seen, the raw
 object stored. **Codex reports no cost**, so `cost_usd` is NULL: Codex
 Limit observations get no cost and Baselines (cost-equivalent, §1.5) can't
-form for Codex yet; tokens are recorded. Per the source, `turn.completed`
-carries the *thread* total, so a resumed Codex session may report the
-earlier Attempt's tokens again (unverified). An Attempt stopped before
-`turn.completed` records no usage.
+form for Codex yet; tokens are recorded. `requests` is the number of turns
+(one per Attempt), not model requests.
 
-### Rate limits (from `codex-rs/protocol/src/error.rs`)
+**`turn.completed` carries the thread's running total** (verified: a turn
+reported 80,730 input / 355 output tokens, and the resumed turn after it
+110,414 / 463; the session rollout's `token_count.total_token_usage`
+grows the same way). So on a resume the runner hands the adapter the raw
+total the session's earlier Attempts ended at (`adapter.prior_usage`,
+from `usage_events.raw`) and `usage_from_run` records only the
+difference; `raw` keeps the reported total. An Attempt stopped before
+`turn.completed` records no usage, so its tokens land on the next resumed
+Attempt of that session.
+
+### Rate limits (from `codex-rs/protocol/src/error.rs`; no real hit seen yet)
 
 A usage-limit hit is an `error` event and/or `turn.failed` whose message is
 `UsageLimitReachedError`'s text, e.g.:
@@ -490,38 +538,32 @@ configured Window (`usage.windows.codex`: `five_hour: 5`, `seven_day:
 ```
 codex exec --json --skip-git-repo-check --ignore-user-config --ignore-rules --strict-config \
   --ephemeral [-m <model>] -c approval_policy="never" -c default_permissions=":read-only" \
-  -c features.shell_tool=false -c features.hooks=false -c web_search="disabled" \
+  -c features.shell_tool=false -c features.<each DISABLED_FEATURES>=false -c web_search="disabled" \
   -c check_for_update_on_startup=false -c history.persistence="none" \
   -c developer_instructions="<system>" [--output-schema <tmp schema.json>] -
 ```
 
+The probe ran for real (0.163.0, gpt-6-luna, low): all keys accepted, one
+`agent_message` "OK", `turn.completed` with ~9.5k input tokens, exit 0 ->
+available. Planning with `--output-schema` was not run for real.
 The planning answer is the last `agent_message`, parsed as JSON; the
 schema is made strict (every property required, `additionalProperties:
 false`) for OpenAI structured outputs. The probe asks "OK?" with "Answer
 with the single word OK."; a `turn.completed` -> available, a limit message
 -> still out.
 
-### Verify once installed
+### Verification log (codex-cli 0.163.0, 2026-10-21)
 
-Run these (cheap) on the Mac after `codex login`, and update this section,
-`docs/safety.md` and the adapter with what really happens:
-
-1. `codex --version`, `codex exec --help`, `codex exec resume --help`:
-   every flag above exists (`--json`, `--skip-git-repo-check`,
-   `--ignore-user-config`, `--ignore-rules`, `--strict-config`,
-   `--ephemeral`, `--output-schema`, `-m`, `-c`).
-2. `mkdir -p /tmp/cx && cd /tmp/cx && echo 'Say hi' | codex exec --json --skip-git-repo-check -`:
-   record the JSONL lines as `tests/fixtures/codex_stream.jsonl`
-   (scrub paths) and check the event/field names.
-3. The permission profile: copy the argv from a Task's
-   `logs/nightshift.log` ("Attempt N started on codex") and run it in a
-   scratch Task folder with prompts that try to `cat ~/.ssh/known_hosts`,
-   write outside the folder, `ls ~/Documents`, `curl https://example.com`:
-   each must fail. If `default_permissions`/`permissions.*` is rejected
-   (beta), fall back to `-c sandbox_mode="workspace-write"
-   -c sandbox_workspace_write.network_access=false` and record that reads
-   are then **not** confined (see docs/safety.md).
-4. `codex exec ... resume <thread_id> -` continues the same thread.
-5. A real usage-limit message, when one happens: save the stream and
-   compare with the formats above.
-6. Then run Acceptance Test 3 on the real CLIs (docs/decisions.md, #15).
+1. Flags: every flag Nightshift passes exists in `codex exec --help` and
+   `codex exec resume --help`. New in 0.163.0 and refused in `extra_args`:
+   `--enable`/`--disable` (feature toggles), `--search`, `--remote`,
+   `--remote-auth-token-env`, `--cyber-access-program`, `--local-provider`.
+2. Stream: recorded (see above); the adapter's parser needed no change.
+3. Permission profile: `default_permissions` + `permissions.nightshift.*`
+   are accepted (no fallback to `sandbox_mode` needed). Checked with
+   `codex sandbox <same -c overrides> -P nightshift -C <task> -- sh -c ...`
+   and in real exec runs; results in docs/safety.md.
+4. Resume by thread id: works (see Invocation).
+5. Usage-limit message: **not observed** (the plan wasn't exhausted).
+   When one happens, save the stream and compare with the formats above.
+6. Acceptance Test 3 on the real CLIs: passed (docs/decisions.md, #15).

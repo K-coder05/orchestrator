@@ -1,5 +1,5 @@
 """A stand-in for `codex exec --json`: replays tests/fixtures/codex_stream.jsonl
-(constructed from the openai/codex source, NOT recorded from a real CLI) and
+(recorded from real codex-cli 0.163.0, Acceptance Test 3's Codex Attempt) and
 acts like an agent in the Task folder.
 
 Behaviour is driven by env vars so tests can shape each Attempt:
@@ -18,7 +18,7 @@ from pathlib import Path
 prompt = sys.stdin.read()
 argv = sys.argv[1:]
 LIMIT_TEXT = "You’ve hit your usage limit. Try again at 3:20 PM."
-SID = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+SID = "01a16084-0da3-70f0-8ade-cab04834c0ac"
 
 
 def emit(obj):

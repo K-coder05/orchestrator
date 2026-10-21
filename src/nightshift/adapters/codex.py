@@ -1,10 +1,12 @@
 """Codex CLI adapter (``codex exec``), the coding failover agent (§2.8).
 
-NOT YET VERIFIED AGAINST A LOCAL CODEX INSTALL: the Codex CLI is not
-installed on this Mac. Flags, the ``--json`` event stream and the usage-limit
-messages come from the Codex docs and the openai/codex source (main, read
-2026-10-21); docs/adapters.md lists exactly what came from where and what to
-check once ``codex`` is installed.
+Verified against codex-cli 0.163.0 on this Mac (2026-10-21): the flags, the
+``-c`` keys (under ``--strict-config``), the ``--json`` event stream
+(``tests/fixtures/codex_stream.jsonl`` is a recording), the permission
+profile (writes outside the Task folder, reads of home/no-access dirs and
+shell network all blocked) and resume by thread id. The usage-limit message
+formats still come from the openai/codex source (no real hit observed);
+docs/adapters.md says what was checked how.
 
 Shape of an Attempt::
 
@@ -74,6 +76,28 @@ FORBIDDEN_ARGS = (
     "-C",
     "--worktree",
     "--oss",
+    "--local-provider",
+    "--enable",
+    "--disable",
+    "--search",
+    "--remote",
+    "--remote-auth-token-env",
+    "--cyber-access-program",
+)
+
+#: Default-on features (``codex features list``, 0.163.0) that reach outside
+#: the shell sandbox (desktop/browser control, ChatGPT apps/connectors,
+#: plugins) or that a Task doesn't need: switched off for every run.
+DISABLED_FEATURES = (
+    "apps",
+    "plugins",
+    "remote_plugin",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "computer_use",
+    "image_generation",
+    "hooks",
 )
 
 PROBE_SYSTEM = "Answer with the single word OK."
@@ -140,6 +164,11 @@ class CodexAdapter(AgentAdapter):
         self.binary: str = settings.get("binary") or "codex"
         self.model: str | None = settings.get("model")
         self.planning_model: str | None = settings.get("planning_model") or self.model
+        # `model_reasoning_effort` (low|medium|high|...); None = the model's default.
+        self.reasoning_effort: str | None = settings.get("reasoning_effort")
+        # On a resume: the session total the earlier Attempts ended at (the
+        # runner sets it), since `turn.completed` reports the thread's total.
+        self.prior_usage: dict[str, Any] | None = None
         self.extra_args: list[str] = list(settings.get("extra_args") or [])
         self._session_id: str | None = None
         self._usage: dict[str, Any] | None = None  # the last turn.completed usage
@@ -159,6 +188,12 @@ class CodexAdapter(AgentAdapter):
             argv.append("--ephemeral")
         return argv
 
+    def _model_args(self, model: str | None) -> list[str]:
+        argv = ["-m", model] if model else []
+        if self.reasoning_effort:
+            argv += config_args({"model_reasoning_effort": self.reasoning_effort})
+        return argv
+
     def _task_argv(self, permissions: Permissions, task: TaskContext | None) -> list[str]:
         overrides = permissions.sandbox.get("overrides") if permissions.sandbox else None
         if permissions.settings_file is None or not overrides:
@@ -170,8 +205,7 @@ class CodexAdapter(AgentAdapter):
         if bad:
             raise ValueError(f"agents.codex.extra_args may not contain {bad} (§1.4)")
         argv = self._flags()
-        if self.model:
-            argv += ["-m", self.model]
+        argv += self._model_args(self.model)
         argv += config_args(overrides)
         if task is not None:
             argv += config_args({"developer_instructions": task.protocol})
@@ -203,7 +237,7 @@ class CodexAdapter(AgentAdapter):
             "approval_policy": "never",
             "default_permissions": ":read-only",
             "features.shell_tool": False,
-            "features.hooks": False,
+            **_disabled_features(),
             "web_search": "disabled",
             "check_for_update_on_startup": False,
             "history.persistence": "none",
@@ -216,9 +250,7 @@ class CodexAdapter(AgentAdapter):
         fd, path = tempfile.mkstemp(prefix="nightshift-codex-schema-", suffix=".json")
         with open(fd, "w") as f:
             json.dump(strict_schema(schema), f)
-        argv = self._flags(ephemeral=True)
-        if self.planning_model:
-            argv += ["-m", self.planning_model]
+        argv = self._flags(ephemeral=True) + self._model_args(self.planning_model)
         argv += config_args(self._toolless_overrides(system))
         argv += ["--output-schema", path, "-"]
         return Command(argv=argv, stdin=prompt)
@@ -226,9 +258,7 @@ class CodexAdapter(AgentAdapter):
     def probe_command(self) -> Command:
         """The smallest request: no shell, no session saved, a one-word
         answer. Uses the Task model (``agents.codex.model``)."""
-        argv = self._flags(ephemeral=True)
-        if self.model:
-            argv += ["-m", self.model]
+        argv = self._flags(ephemeral=True) + self._model_args(self.model)
         argv += config_args(self._toolless_overrides(PROBE_SYSTEM)) + ["-"]
         return Command(argv=argv, stdin=PROBE_PROMPT)
 
@@ -263,7 +293,7 @@ class CodexAdapter(AgentAdapter):
             # Shell commands get no network on any Task (§1.4).
             f"permissions.{PROFILE}.network": {"enabled": False},
             "web_search": "live" if policy.internet else "disabled",
-            "features.hooks": False,
+            **_disabled_features(),
             "check_for_update_on_startup": False,
             "history.persistence": "none",
             "shell_environment_policy.inherit": "core",
@@ -393,17 +423,26 @@ class CodexAdapter(AgentAdapter):
         cached ones, so input = input - cached; cache read = cached; cache
         write = ``cache_write_input_tokens``; output includes reasoning
         tokens. Codex reports no cost (``cost_usd`` None). An Attempt stopped
-        before ``turn.completed`` has no usage line at all."""
+        before ``turn.completed`` has no usage line at all.
+
+        ``turn.completed`` carries the **thread's** running total (verified on
+        a real resume), so a resumed Attempt subtracts ``prior_usage`` (the
+        total its session ended at before). ``raw`` keeps the total as reported."""
         if not self._usage:
             return []
         u = self._usage
-        inp = int(u.get("input_tokens") or 0)
-        cached = int(u.get("cached_input_tokens") or 0)
+        prior = self.prior_usage or {}
+
+        def part(key: str) -> int:
+            return max(int(u.get(key) or 0) - int(prior.get(key) or 0), 0)
+
+        inp = part("input_tokens")
+        cached = part("cached_input_tokens")
         return [Usage(
             model=self.model,
             input_tokens=max(inp - cached, 0),
-            output_tokens=u.get("output_tokens"),
-            cache_creation_tokens=u.get("cache_write_input_tokens"),
+            output_tokens=part("output_tokens"),
+            cache_creation_tokens=part("cache_write_input_tokens"),
             cache_read_tokens=cached,
             requests=self._turns or None,
             cost_usd=None,
@@ -459,6 +498,10 @@ class CodexAdapter(AgentAdapter):
             return ProbeReply(available=True, usage=usage)
         err = run.result_error() or f"no result from codex (exit code {exit_code})"
         return ProbeReply(available=False, error=err, usage=usage)
+
+
+def _disabled_features() -> dict[str, bool]:
+    return {f"features.{f}": False for f in DISABLED_FEATURES}
 
 
 def _step_input(item: dict[str, Any]) -> dict[str, Any]:

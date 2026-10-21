@@ -996,8 +996,8 @@ lasting consequences go in `docs/adr/` instead.
 
 ## Phase 1, issue #15: Codex adapter, coding failover and Acceptance Test 3
 
-- **Codex adapter built without Codex.** The CLI isn't installed on this
-  Mac and was not installed for this issue. `nightshift.adapters.codex`
+- **Codex adapter built without Codex** (later verified, see "Verified on
+  real Codex" below). The CLI wasn't installed on this Mac at first. `nightshift.adapters.codex`
   implements the whole interface (`build_command`, `resume_command`,
   `parse_stream`, `detect_rate_limit`, `usage_from_run`,
   `write_permissions`, `planning_command`/`parse_planning_output`,
@@ -1080,7 +1080,7 @@ lasting consequences go in `docs/adr/` instead.
   the takeover note; it saw Claude's `progress.md`, kept Claude's file and
   ended `done`. Report section 8 lists both agents. Three such runs, about
   10s and well under $0.01 each; no processes left. The Codex side was
-  the fake: **AT3 on real Codex is not done.**
+  the fake at that point (real Codex: see below).
 - **To finish AT3 on the real CLIs** (after installing Codex and `codex
   login`; first the "Verify once installed" list in docs/adapters.md):
   1. Use a scratch config, e.g. `paths.agents_root: /tmp/at3/agents`,
@@ -1101,3 +1101,37 @@ lasting consequences go in `docs/adr/` instead.
      section 8 lists both agents.
   6. If Codex fails to start or rejects a setting, `logs/attempt-2.codex.
      stderr.log` says why; fix the adapter per docs/adapters.md.
+- **Verified on real Codex (codex-cli 0.163.0, 2026-10-21).** Flags, `-c`
+  keys under `--strict-config`, the `--json` stream, the permission profile
+  and resume by thread id all behaved as documented (details and evidence
+  in docs/adapters.md "Verification log" and docs/safety.md). Changes:
+  - **Default-on features off.** 0.163.0 enables computer use, browser
+    use, the in-app browser, ChatGPT apps, plugins and image generation by
+    default; every Codex run now sets them false, and `extra_args` refuses
+    the new `--enable`/`--disable`/`--search`/`--remote`/... flags.
+  - **Cumulative usage.** `turn.completed` reports the thread's running
+    total (seen on a real resume), so a resumed Attempt subtracts the total
+    its session had reached (`adapter.prior_usage`, set by the runner from
+    the earlier Attempts' `usage_events.raw`).
+  - **`agents.codex.reasoning_effort`** (null = model default) ->
+    `-c model_reasoning_effort=...`. The checks used `gpt-6-luna` + `low`.
+  - `tests/fixtures/codex_stream.jsonl` is now a real recording (AT3's
+    Codex Attempt, folder prefix stripped).
+  Not verified: a real Codex usage-limit message (none happened) and a
+  planning call with `--output-schema` on Codex.
+- **Acceptance Test 3 passed on the real CLIs (2026-10-21).** Scratch config
+  (`scratchpad/realcx/at3/config`: haiku, `gpt-6-luna`, effort low), the
+  steps above. Task `xpub` (`--simulate-rate-limit-after 3`): Attempt 1
+  claude `paused` after 3 Steps (exit 143), Failovers `claude -> codex
+  (simulated)`, Attempt 2 codex `completed` (exit 0, no `resume` in its
+  argv, "fresh session from plan.md + progress.md (failover from
+  claude)"), Task `done`, all three files in `output/`, report section 8
+  lists claude (7s) and codex (27s, 13k input + 158k cached, 2k output
+  tokens). Claude's 3 Steps there were Read, Read, Write, so it never wrote
+  progress.md and Codex redid Part 1. A second run, `ivac` with
+  `--simulate-rate-limit-after 5`, shows the real hand-off: Claude wrote
+  `fizzbuzz.py` and its progress.md entry ("progress.md was updated during
+  this Attempt") and then the test file; Codex `cat plan.md progress.md`,
+  kept Claude's `fizzbuzz.py`, wrote the test and README, recorded both in
+  progress.md and ended `done`. Each run was about 35s; both agents are
+  on subscriptions (no dollars spent); no processes left.
