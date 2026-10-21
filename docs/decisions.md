@@ -129,3 +129,59 @@ lasting consequences go in `docs/adr/` instead.
   correctly reports a chip mismatch against the M3 placeholder; Codex CLI,
   Gemini CLI and a PDF page-count tool are missing; `python3` on PATH is
   3.11.5 (warning). The user should set `machine.chip` in their config.
+
+## Phase 1, issue #3: background daemon and queue runner
+
+- **`orch add` only queues.** It creates the Task in `queued` and returns; it
+  prints a note when no daemon holds the lock, so a Task never silently
+  waits. The foreground run from issue #1 is gone from the CLI; `orch daemon
+  run --exit-when-idle` runs the queue in a terminal instead.
+- **One Task at a time, twice over.** The queue runner (`daemon.QueueRunner`)
+  is one serial loop, and only the process holding an exclusive `flock` on
+  `<agents_root>/data/daemon.lock` may run Tasks. A second `orch daemon run`
+  exits 1. The kernel drops the lock when a process dies, so it is never
+  stale; `orch add` and `orch daemon status` probe it to tell whether a
+  daemon is up. The runner writes `data/daemon.json` (pid, current Task,
+  whether awake is held) for `orch daemon status`.
+- **Queue order for now:** assigned Priority (urgent, normal, background),
+  then oldest. Effective priority, deadlines, `--at` and long-task windows
+  are issue #11. The idle daemon polls every `daemon.poll_seconds` (new key,
+  default 5).
+- **Wakefulness through the host seam.** `Host.hold_awake()` /
+  `release_awake()` / `awake_held()`. `MacHost` runs `caffeinate -i -s -w
+  <daemon pid>` (no idle sleep, no system sleep on AC; `-w` makes caffeinate
+  exit if the daemon dies, so a crash never leaves the Mac held awake). The
+  runner holds it right before an Attempt and releases it in `finally`, so it
+  is released between Tasks and whenever nothing runs. `FakeHost` records
+  `awake_log` for tests. Lid-closed sleep on battery can't be prevented by
+  `caffeinate`; that's what the §1.9 `pmset` wake is for.
+- **launchd plist.** `orch daemon install` writes
+  `~/Library/LaunchAgents/<daemon.label>.plist` and loads it with `launchctl
+  bootstrap gui/<uid>` (booting out a loaded copy first); `uninstall` boots it
+  out and deletes the plist. Keys: `KeepAlive`, `RunAtLoad`, `ExitTimeOut 30`,
+  stdout/stderr to `<agents_root>/data/daemon.log`. It runs `<venv
+  python> -m nightshift --config-dir <dir> daemon run` (new
+  `nightshift/__main__.py`) with `PYTHONPATH=<repo>/src`, so the daemon starts
+  even when macOS hides the editable-install `.pth`, and with the `PATH` from
+  install time, because launchd's default PATH wouldn't find `claude` in
+  `~/.local/bin`. Re-run `orch daemon install` after moving the repo or venv.
+  Verified with `plutil -lint` on a generated plist; the real
+  bootstrap/bootout has not been run on this Mac (tests use `FakeHost`).
+- **Stopping mid-Attempt requeues.** SIGTERM (launchd stop/bootout) or SIGINT
+  makes the daemon terminate the agent through `runner.AttemptControl`; the
+  Attempt ends with outcome `interrupted` and the Task goes `running ->
+  queued` (new allowed transition), then the daemon exits. The next Attempt
+  starts fresh; resuming the session is issue #13. Verified for real: a
+  SIGTERM'd daemon left the Task queued with no agent or caffeinate running,
+  and a restarted daemon finished it as Attempt 2.
+- **Crash recovery.** On startup the lock holder fails any Task still
+  `running` (a daemon that died without cleanup), finishing its open Attempt
+  as `failed` and writing the report. A Python exception from one Attempt
+  fails that Task (`queued -> failed` is now allowed for Tasks that couldn't
+  even start) and the daemon carries on. Retries are issue #12.
+- **SQLite WAL + busy timeout** so CLI reads don't block on the daemon.
+- **`orch logs`** prints `logs/nightshift.log` lines as `[nightshift] …` and
+  each Attempt's stream rendered through its adapter (`[step]`, `[agent]`,
+  `[file]`, `[error]`, `[result]`); `--raw` prints the JSON lines. `-f`
+  follows new lines and new Attempts until the Task is no longer queued or
+  running. `orch list --status` is repeatable.

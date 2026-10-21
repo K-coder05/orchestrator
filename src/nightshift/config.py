@@ -217,6 +217,9 @@ def _validate(data: dict[str, Any]) -> None:
     for name, entry in (data.get("task_types") or {}).items():
         if (entry or {}).get("internet", "off") not in ("on", "off"):
             raise ConfigError(f"task_types.{name}.internet must be 'on' or 'off'")
+    poll = (data.get("daemon") or {}).get("poll_seconds", 5)
+    if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
+        raise ConfigError("daemon.poll_seconds must be a positive number")
     wake = data.get("wake") or {}
     days = str(wake.get("days", "MTWRFSU"))
     if not days or any(c not in "MTWRFSU" for c in days):

@@ -5,6 +5,7 @@ Behaviour is driven by env vars so tests can shape each Attempt.
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 prompt = sys.stdin.read()
@@ -12,6 +13,9 @@ Path("logs/fake_invocation.json").write_text(json.dumps({"argv": sys.argv[1:], "
 
 for line in Path(os.environ["FAKE_STREAM"]).read_text().splitlines():
     print(line, flush=True)
+
+if os.environ.get("FAKE_SLEEP"):
+    time.sleep(float(os.environ["FAKE_SLEEP"]))
 
 leak = os.environ.get("FAKE_LEAK")
 if leak:

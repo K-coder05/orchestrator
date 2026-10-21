@@ -3,8 +3,10 @@
 Every OS-specific call goes through a ``Host``. ``MacHost`` is the only real
 implementation; ``FakeHost`` keeps core logic testable on any OS.
 
-All probes are read-only. Nothing here changes system settings: ``pmset`` in
-particular is never run (§1.9); ``orch doctor`` only prints the command.
+Probes are read-only. The only state-changing calls are the daemon's own:
+installing/removing its LaunchAgent (``orch daemon install|uninstall``) and
+holding ``caffeinate`` while a Task runs. System settings are never changed:
+``pmset`` in particular is never run (§1.9); ``orch doctor`` only prints it.
 """
 
 from __future__ import annotations
@@ -78,6 +80,31 @@ class Host(Protocol):
         """Whether a per-user LaunchAgent is installed and loaded."""
         ...
 
+    def launch_agents_dir(self) -> Path:
+        """Where per-user LaunchAgent plists live (``~/Library/LaunchAgents``)."""
+        ...
+
+    def launchd_install(self, label: str, plist: bytes) -> str | None:
+        """Write ``<label>.plist`` and load it (replacing a loaded copy).
+        Returns None on success, else an error message."""
+        ...
+
+    def launchd_uninstall(self, label: str) -> str | None:
+        """Unload the agent if loaded and delete its plist. None on success."""
+        ...
+
+    def hold_awake(self) -> None:
+        """Start holding the machine awake (idempotent)."""
+        ...
+
+    def release_awake(self) -> None:
+        """Stop holding the machine awake (idempotent)."""
+        ...
+
+    def awake_held(self) -> bool:
+        """Whether this process is currently holding the machine awake."""
+        ...
+
 
 def _run(argv: list[str], timeout: float = 10) -> subprocess.CompletedProcess[str] | None:
     try:
@@ -97,7 +124,12 @@ def _existing_ancestor(path: Path) -> Path:
 
 class MacHost:
     """Real macOS host. Read-only probes via ``security``, ``sysctl``,
-    ``system_profiler``, ``sw_vers`` and ``launchctl print``."""
+    ``system_profiler``, ``sw_vers`` and ``launchctl print``; the daemon's
+    LaunchAgent via ``launchctl bootstrap|bootout``; wakefulness via
+    ``caffeinate``."""
+
+    def __init__(self) -> None:
+        self._caffeinate: subprocess.Popen[bytes] | None = None
 
     def keychain_get(self, service: str, account: str) -> str | None:
         proc = _run(["security", "find-generic-password", "-s", service, "-a", account, "-w"])
@@ -166,8 +198,62 @@ class MacHost:
         except importlib.metadata.PackageNotFoundError:
             return None
 
+    def launch_agents_dir(self) -> Path:
+        return Path("~/Library/LaunchAgents").expanduser()
+
+    def _domain(self) -> str:
+        return f"gui/{os.getuid()}"
+
+    def launchd_install(self, label: str, plist: bytes) -> str | None:
+        path = self.launch_agents_dir() / f"{label}.plist"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if self.launchd_status(label).loaded:
+            _run(["launchctl", "bootout", f"{self._domain()}/{label}"], timeout=30)
+        path.write_bytes(plist)
+        proc = _run(["launchctl", "bootstrap", self._domain(), str(path)], timeout=30)
+        if proc is None or proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip() if proc else "launchctl did not run"
+            return f"launchctl bootstrap failed: {detail}"
+        return None
+
+    def launchd_uninstall(self, label: str) -> str | None:
+        path = self.launch_agents_dir() / f"{label}.plist"
+        if self.launchd_status(label).loaded:
+            proc = _run(["launchctl", "bootout", f"{self._domain()}/{label}"], timeout=30)
+            if proc is None or proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout).strip() if proc else "launchctl did not run"
+                return f"launchctl bootout failed: {detail}"
+        path.unlink(missing_ok=True)
+        return None
+
+    def hold_awake(self) -> None:
+        if self._caffeinate is not None and self._caffeinate.poll() is None:
+            return
+        # -i: no idle sleep; -s: no system sleep on AC power; -w: exit with
+        # this process, so a crashed daemon never leaves the Mac held awake.
+        self._caffeinate = subprocess.Popen(
+            ["caffeinate", "-i", "-s", "-w", str(os.getpid())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def release_awake(self) -> None:
+        proc, self._caffeinate = self._caffeinate, None
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    def awake_held(self) -> bool:
+        return self._caffeinate is not None and self._caffeinate.poll() is None
+
     def launchd_status(self, label: str) -> LaunchdStatus:
-        plist = Path("~/Library/LaunchAgents").expanduser() / f"{label}.plist"
+        plist = self.launch_agents_dir() / f"{label}.plist"
         proc = _run(["launchctl", "print", f"gui/{os.getuid()}/{label}"])
         loaded = proc is not None and proc.returncode == 0
         pid = None
@@ -198,6 +284,13 @@ class FakeHost:
     launchd: dict[str, tuple[bool, bool, int | None]] = field(default_factory=dict)
     keychain_reads: list[tuple[str, str]] = field(default_factory=list)
     commands_run: list[list[str]] = field(default_factory=list)
+    #: Installed plists by label (``launchd_install`` writes here).
+    plists: dict[str, bytes] = field(default_factory=dict)
+    #: Error message the next launchd install/uninstall returns, if any.
+    launchd_error: str | None = None
+    awake: bool = False
+    #: ``"hold"``/``"release"`` in call order (only state changes are recorded).
+    awake_log: list[str] = field(default_factory=list)
 
     def keychain_get(self, service: str, account: str) -> str | None:
         self.keychain_reads.append((service, account))
@@ -227,4 +320,34 @@ class FakeHost:
 
     def launchd_status(self, label: str) -> LaunchdStatus:
         exists, loaded, pid = self.launchd.get(label, (False, False, None))
-        return LaunchdStatus(label, Path(f"/fake/LaunchAgents/{label}.plist"), exists, loaded, pid)
+        return LaunchdStatus(label, self.launch_agents_dir() / f"{label}.plist", exists, loaded, pid)
+
+    def launch_agents_dir(self) -> Path:
+        return Path("/fake/LaunchAgents")
+
+    def launchd_install(self, label: str, plist: bytes) -> str | None:
+        if self.launchd_error:
+            return self.launchd_error
+        self.plists[label] = plist
+        self.launchd[label] = (True, True, 4242)
+        return None
+
+    def launchd_uninstall(self, label: str) -> str | None:
+        if self.launchd_error:
+            return self.launchd_error
+        self.plists.pop(label, None)
+        self.launchd.pop(label, None)
+        return None
+
+    def hold_awake(self) -> None:
+        if not self.awake:
+            self.awake = True
+            self.awake_log.append("hold")
+
+    def release_awake(self) -> None:
+        if self.awake:
+            self.awake = False
+            self.awake_log.append("release")
+
+    def awake_held(self) -> bool:
+        return self.awake

@@ -109,6 +109,11 @@ class Database:
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        if str(path) != ":memory:":
+            # The daemon and CLI commands share the DB; WAL lets readers
+            # (`orch list`) proceed while the daemon writes.
+            self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA busy_timeout = 10000")
         self.migrate()
 
     def close(self) -> None:
@@ -185,6 +190,32 @@ class Database:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (task_id, str(current), str(to_state), at, reason, run_id),
             )
+
+    def list_tasks(self, states: list[TaskState] | None = None) -> list[sqlite3.Row]:
+        """Tasks, newest first, optionally only those in ``states``."""
+        if states:
+            marks = ", ".join("?" for _ in states)
+            return self.conn.execute(
+                f"SELECT * FROM tasks WHERE state IN ({marks}) ORDER BY created_at DESC, rowid DESC",
+                [str(s) for s in states],
+            ).fetchall()
+        return self.conn.execute("SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC").fetchall()
+
+    def tasks_in_state(self, state: TaskState) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM tasks WHERE state = ? ORDER BY created_at, rowid", (str(state),)
+        ).fetchall()
+
+    def next_queued_task(self) -> sqlite3.Row | None:
+        """The queued Task to run next: by assigned Priority, then oldest.
+
+        Effective priority (deadlines) and time windows arrive with issue #11.
+        """
+        return self.conn.execute(
+            "SELECT * FROM tasks WHERE state = 'queued' ORDER BY "
+            "CASE priority WHEN 'urgent' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, "
+            "created_at, rowid LIMIT 1"
+        ).fetchone()
 
     def transitions(self, task_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(

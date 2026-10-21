@@ -30,9 +30,12 @@ INITIAL: frozenset[TaskState] = frozenset({S.SCHEDULED, S.AWAITING_APPROVAL, S.Q
 ALLOWED: dict[TaskState, frozenset[TaskState]] = {
     S.SCHEDULED: frozenset({S.QUEUED, S.AWAITING_APPROVAL, S.CANCELLED}),
     S.AWAITING_APPROVAL: frozenset({S.QUEUED, S.SCHEDULED, S.CANCELLED}),
-    S.QUEUED: frozenset({S.RUNNING, S.AWAITING_APPROVAL, S.SCHEDULED, S.CANCELLED}),
+    # queued -> failed: the daemon could not even start an Attempt (e.g. bad agent config).
+    S.QUEUED: frozenset({S.RUNNING, S.AWAITING_APPROVAL, S.SCHEDULED, S.FAILED, S.CANCELLED}),
+    # running -> queued: the daemon was stopped mid-Attempt; the Task goes back in line.
     S.RUNNING: frozenset(
         {
+            S.QUEUED,
             S.DONE,
             S.PARTIAL,
             S.FAILED,

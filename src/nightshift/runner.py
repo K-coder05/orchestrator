@@ -1,4 +1,4 @@
-"""Creating Tasks and running Attempts in the foreground."""
+"""Creating Tasks and running Attempts (one Attempt per call)."""
 
 from __future__ import annotations
 
@@ -71,6 +71,25 @@ def create_task(
     return NewTask(spec=spec, folder=folder)
 
 
+class AttemptControl:
+    """Lets another thread or a signal handler stop a running Attempt.
+
+    ``request_stop()`` terminates the agent process; ``run_attempt`` then ends
+    the Attempt as interrupted and puts the Task back in ``queued`` instead
+    of judging it failed. The daemon uses this on SIGTERM (launchd stop).
+    """
+
+    def __init__(self) -> None:
+        self.stop_requested = False
+        self.proc: subprocess.Popen | None = None
+
+    def request_stop(self) -> None:
+        self.stop_requested = True
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+
+
 @dataclass
 class AttemptResult:
     run_id: int
@@ -91,8 +110,13 @@ def run_attempt(
     *,
     adapter_provider: AdapterProvider = get_adapter,
     on_event: Callable | None = None,
+    control: AttemptControl | None = None,
 ) -> AttemptResult:
-    """Run one Attempt of a queued Task in the foreground, then finalize its report."""
+    """Run one Attempt of a queued Task, then finalize its report.
+
+    Blocks until the agent exits. If ``control`` requests a stop, the Attempt
+    ends as interrupted and the Task goes back to ``queued``.
+    """
     row = db.get_task(task_id)
     if row is None:
         raise KeyError(task_id)
@@ -139,6 +163,11 @@ def run_attempt(
     except OSError as exc:
         proc = None
         errors.append(f"could not start {command.argv[0]}: {exc}")
+
+    if proc is not None and control is not None:
+        control.proc = proc
+        if control.stop_requested:
+            proc.terminate()
 
     if proc is not None:
         stderr_chunks: list[str] = []
@@ -187,6 +216,19 @@ def run_attempt(
     report_text = (folder / "report.md").read_text() if (folder / "report.md").exists() else ""
     ok = adapter.result_ok()
     detail: str | None = None
+    if control is not None:
+        control.proc = None
+    if control is not None and control.stop_requested and proc is not None:
+        end_reason = redact(f"daemon stopped during Attempt {attempt_no}; Task requeued")
+        db.finish_attempt(
+            run_id, exit_code=exit_code, outcome="interrupted", end_reason=end_reason,
+            session_id=adapter.session_id(),
+        )
+        _log(folder, f"{iso(now(cfg.timezone))} Attempt {attempt_no} ended: {end_reason}", redact)
+        db.transition(task_id, TaskState.QUEUED, end_reason, run_id=run_id)
+        return AttemptResult(
+            run_id=run_id, state=TaskState.QUEUED, session_id=adapter.session_id(), exit_code=exit_code
+        )
     if interrupted:
         state, outcome = TaskState.CANCELLED, "cancelled"
         end_reason = "interrupted from the terminal (Ctrl-C)"
@@ -221,3 +263,56 @@ def run_attempt(
     )
     db.transition(task_id, state, end_reason, run_id=run_id)
     return AttemptResult(run_id=run_id, state=state, session_id=adapter.session_id(), exit_code=exit_code)
+
+
+def _finalize(cfg: Config, db: Database, row, state: TaskState, reason: str) -> None:
+    folder = Path(row["folder"])
+    if folder.exists():
+        report.finalize(
+            folder,
+            title=row["title"],
+            result=str(state),
+            result_detail=reason,
+            attempts=db.attempts(row["id"]),
+            usage_rows=db.usage_for_task(row["id"]),
+            redact=cfg.secrets.redact,
+        )
+        _log(folder, f"{iso(now(cfg.timezone))} {reason}", cfg.secrets.redact)
+
+
+def fail_orphaned(cfg: Config, db: Database) -> list[str]:
+    """Fail Tasks left ``running`` by a daemon that died mid-Attempt.
+
+    Only the daemon (holding the daemon lock) may call this: then nothing
+    else can be running a Task. The cut-off Attempt is a Failed Attempt (a
+    crash, per CONTEXT.md). Returns the ids it failed.
+    """
+    failed: list[str] = []
+    for row in db.tasks_in_state(TaskState.RUNNING):
+        reason = "the daemon stopped unexpectedly while an Attempt was running"
+        last = None
+        for a in db.attempts(row["id"]):
+            if a["ended_at"] is None:
+                db.finish_attempt(
+                    a["id"], exit_code=None, outcome="failed", end_reason=reason, session_id=None
+                )
+                last = a["id"]
+        _finalize(cfg, db, row, TaskState.FAILED, reason)
+        db.transition(row["id"], TaskState.FAILED, reason, run_id=last)
+        failed.append(row["id"])
+    return failed
+
+
+def fail_unstartable(cfg: Config, db: Database, task_id: str, error: str) -> None:
+    """Fail a Task whose Attempt raised before or while running."""
+    row = db.get_task(task_id)
+    if row is None:
+        return
+    state = TaskState(row["state"])
+    reason = cfg.secrets.redact(f"Nightshift error: {error}")[:500]
+    for a in db.attempts(task_id):
+        if a["ended_at"] is None:
+            db.finish_attempt(a["id"], exit_code=None, outcome="failed", end_reason=reason, session_id=None)
+    if state in (TaskState.QUEUED, TaskState.RUNNING):
+        _finalize(cfg, db, row, TaskState.FAILED, reason)
+        db.transition(task_id, TaskState.FAILED, reason)

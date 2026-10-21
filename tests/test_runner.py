@@ -34,7 +34,7 @@ def fake_provider(name, settings):
 @pytest.fixture
 def env(monkeypatch):
     monkeypatch.setenv("FAKE_STREAM", str(FIXTURES / "claude_stream.jsonl"))
-    for k in ("FAKE_LEAK", "FAKE_RESULT", "FAKE_EXIT", "FAKE_NEEDS_YOU"):
+    for k in ("FAKE_LEAK", "FAKE_RESULT", "FAKE_EXIT", "FAKE_NEEDS_YOU", "FAKE_SLEEP"):
         monkeypatch.delenv(k, raising=False)
     return monkeypatch
 
