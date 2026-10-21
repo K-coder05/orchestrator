@@ -2,8 +2,10 @@
 
 ``launchd`` keeps the daemon alive (KeepAlive). Inside it the queue runner
 takes queued Tasks one at a time, holding the machine awake through the host
-seam only while a Task is ``running`` (§1.1). The scheduler joins it in a
-later issue.
+seam only while a Task is ``running`` (§1.1). Before every pick the
+scheduler applies each Schedule's Catch-up and Overlap rules
+(``nightshift.schedules``); it also does so right at start and right after
+the machine wakes from sleep (§2.5).
 
 Exactly one Task at a time is guaranteed twice over: the runner is a single
 serial loop, and only the process holding the daemon lock (an exclusive
@@ -25,7 +27,7 @@ from typing import IO, Any
 
 import nightshift
 
-from . import failures, pauses, usage
+from . import failures, pauses, schedules, usage
 from .adapters import get_adapter
 from .config import Config
 from .db import Database
@@ -38,6 +40,10 @@ from .timeutil import iso, now
 LOCK_FILENAME = "daemon.lock"
 STATE_FILENAME = "daemon.json"
 LOG_FILENAME = "daemon.log"
+
+#: Wall time running this far ahead of awake time between two checks means
+#: the machine slept (and has just woken).
+WAKE_GAP_SECONDS = 60.0
 
 
 def lock_path(cfg: Config) -> Path:
@@ -200,6 +206,7 @@ class QueueRunner:
             self.cfg, self.db, agent, adapter_provider=self.adapter_provider, clock=self.clock))
         self.current: str | None = None
         self.control: AttemptControl | None = None
+        self._wake_mark: tuple[datetime, float] | None = None
         self.started_at = iso(now(cfg.timezone))
         self._stop = threading.Event()
 
@@ -263,10 +270,37 @@ class QueueRunner:
             self.log(f"Task {tid} usage pause over; queued to resume")
         return done
 
+    def apply_schedules(self, trigger: str = schedules.TRIGGER_POLL) -> list[schedules.Decision]:
+        """Apply every Schedule's Catch-up and Overlap rules now (§2.5)."""
+        try:
+            done = schedules.apply_catch_up(self.cfg, self.db, self.clock(), trigger=trigger)
+        except Exception as exc:  # a broken Schedule must not stop the queue
+            self.log(f"scheduler error ({trigger}): {type(exc).__name__}: {exc}")
+            return []
+        for d in done:
+            self.log(("on daemon start: " if trigger == schedules.TRIGGER_START else
+                      "after wake: " if trigger == schedules.TRIGGER_WAKE else "") + d.describe())
+        return done
+
+    def check_wake(self) -> bool:
+        """Whether the machine slept since the last check (wall time ran
+        ahead of awake time); if so, apply the Catch-up rules now."""
+        mark = (self.clock(), self.host.awake_seconds())
+        last, self._wake_mark = self._wake_mark, mark
+        if last is None:
+            return False
+        asleep = (mark[0] - last[0]).total_seconds() - (mark[1] - last[1])
+        if asleep < WAKE_GAP_SECONDS:
+            return False
+        self.log(f"woke from sleep (asleep about {asleep / 60:.0f} min); applying catch-up")
+        self.apply_schedules(schedules.TRIGGER_WAKE)
+        return True
+
     def run_next(self) -> str | None:
         """Run one Attempt of the next queued Task; None if the queue is empty."""
         if self.stopping:
             return None
+        self.apply_schedules()
         self.promote_retries()
         self.promote_paused()
         # Effective priority and time windows are re-evaluated on every pick;
@@ -323,7 +357,10 @@ class QueueRunner:
         self.write_state()
         self.log(f"daemon started (pid {os.getpid()}), polling every {poll:g}s")
         try:
+            self.apply_schedules(schedules.TRIGGER_START)
+            self.check_wake()
             while not self.stopping:
+                self.check_wake()
                 self.drain()
                 if exit_when_idle or self.stopping:
                     break

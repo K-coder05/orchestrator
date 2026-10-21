@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from . import failures, pauses, report, templates, usage
@@ -24,7 +24,7 @@ from .permissions import build_policy
 from .protocol import agent_protocol
 from .states import TaskState
 from .timeutil import iso, now
-from .workspace import PLAN_PENDING, PLAN_STUB, TaskSpec, create_task_folder
+from .workspace import PLAN_PENDING, PLAN_STUB, TaskSpec, create_task_folder, occurrence_folder
 
 AdapterProvider = Callable[[str, dict], AgentAdapter]
 
@@ -55,6 +55,8 @@ def create_task(
     reason: str = "created by orch add",
     title: str | None = None,
     agent_override: bool | None = None,
+    schedule_name: str | None = None,
+    occurrence_date: date | None = None,
 ) -> NewTask:
     """Create a Task: DB row, Task folder, ``task.yaml``.
 
@@ -73,7 +75,9 @@ def create_task(
     first Attempt that reaches that many Steps hit a simulated rate limit.
     ``title`` (default: the prompt) names the Task and its folder, for
     template Tasks whose prompt is the rendered template. ``agent_override``
-    defaults to whether ``agent`` was given.
+    defaults to whether ``agent`` was given. ``schedule_name`` makes the
+    Task an Occurrence of that Schedule: its folder is
+    ``recurring/<schedule-name>/<occurrence_date>/`` (§1.3).
     """
     created = now(cfg.timezone)
     ttype = task_type or cfg.default("task_type")
@@ -88,6 +92,10 @@ def create_task(
     task_id = new_task_id(
         lambda i: db.task_id_exists(i) or any(cfg.tasks_dir.glob(f"*_{i}"))
     )
+    folder = None
+    if schedule_name is not None:
+        folder = occurrence_folder(cfg.recurring_dir, schedule_name,
+                                   occurrence_date or created.date(), task_id)
     spec = TaskSpec(
         id=task_id,
         title=title_from_prompt(title or prompt),
@@ -106,10 +114,12 @@ def create_task(
         max_runtime_minutes=_runtime_cap(cfg, ttype, max_runtime_minutes),
         approved=not needs_approval,
         approved_at=None if needs_approval else iso(created),
+        schedule_name=schedule_name,
         created_at=iso(created),
     )
     folder = create_task_folder(
-        cfg.tasks_dir, spec, created, plan=PLAN_PENDING if needs_approval else PLAN_STUB
+        cfg.tasks_dir, spec, created, plan=PLAN_PENDING if needs_approval else PLAN_STUB,
+        folder=folder,
     )
     fields = spec.to_dict() | {
         "folder": str(folder), "simulate_rate_limit_after": simulate_rate_limit_after,

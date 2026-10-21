@@ -756,3 +756,98 @@ lasting consequences go in `docs/adr/` instead.
   after the 5-minute simulated reset, `done`; the same 7 output files, all
   post-hook checks passed (2 changed lines traced, 1 page), $0.020 over 2
   Attempts.
+
+## Phase 1, issue #12: Schedules with catch-up and overlap rules
+
+- **Two modules, both pure.** `nightshift.cron` parses the timing rule and
+  answers `next_after(t)` / `fires_between(after, until)`;
+  `nightshift.schedules` holds the §2.5 rules (`apply_catch_up`, `fire`,
+  `run_now`, `add`/`remove`/`set_enabled`). Every time comes from the
+  caller, so Catch-up and Overlap are unit tested with a fake clock
+  (`tests/test_schedules.py`), including through `QueueRunner`.
+- **Own cron parser, no dependency.** Standard five fields (`*`, numbers,
+  ranges, `/step`, lists, `jan`/`mon` names, `7` = Sunday) plus `@daily`
+  etc.; Vixie-cron day rule (two restricted day fields match either; a field
+  starting with `*`, even `*/2`, restricts together with the other). Rules
+  are wall-clock times in the configured timezone (LA), so 6:30am stays
+  6:30am across DST; a gap time (2:30 on spring-forward day) fires just after
+  the gap (3:30 PDT), a repeated time (fall back) fires once. A rule that
+  never fires (`0 0 31 2 *`) is rejected. `croniter` was not used: small
+  enough to own, and its DST behavior would still need testing here.
+- **Scheduler state in SQLite** (migration 6, the `schedules` and
+  `schedule_runs` tables the spec names). Schedules are made only with
+  `orch schedule add` (not config), so the DB is the one source.
+  `schedules.last_fire_at` means "every fire up to here is handled"; it
+  starts at the moment the Schedule was added, so fires before that never
+  count as missed. `schedule_runs` has one row per decision (`created`,
+  `replaced`, `skipped_overlap`, `skipped_catch_up`, `error`) with the
+  trigger (`start`, `wake`, `poll`, `run_now`), the fire time and how many
+  fires it collapsed. It has no foreign key, so history survives
+  `orch schedule remove`; `orch schedule list` only shows rows newer than
+  the current Schedule of that name.
+- **One decision per look, about the latest fire.** All fires in
+  `(last_fire_at, now]` collapse into one decision (§2.5: never stack
+  duplicates). The Catch-up rule judges the *latest* of them: `within N
+  hours` creates one Occurrence if it is at most N hours old, else skips it
+  (logged); `next wake` always creates one. So after three days asleep,
+  waking at 8am runs today's 6:30 fire once; waking at 7pm skips it and the
+  next morning fires normally. An on-time fire is just a fire 0 hours late.
+- **Exactly once.** The fires are claimed (conditional `UPDATE ...
+  WHERE last_fire_at = <old>`) *before* the Occurrence is created. A crash
+  between the two loses that one decision; it can never create a second
+  Occurrence for the same fires, and two lookers can't both act.
+- **When the daemon looks.** On start (after crash recovery), right after a
+  detected wake, and before every queue pick (each poll). Wake detection
+  goes through the host seam: `Host.awake_seconds()` (`MacHost`:
+  `CLOCK_UPTIME_RAW`, which stops while the Mac sleeps) compared with wall
+  time; a gap of 60s or more (`daemon.WAKE_GAP_SECONDS`) is a sleep. Phase 1
+  runs one Task at a time in one loop, so a fire during a long Attempt is
+  looked at when the Attempt ends; its Catch-up rule still judges it by its
+  own fire time (with the posting-scan's 12h and runtime caps of at most
+  6h, it still runs).
+- **Overlap.** "Unfinished" = any Occurrence of the Schedule not in a
+  terminal state (`done`, `partial`, `failed`, `cancelled`), so one paused,
+  in `needs_you` or waiting to retry also blocks. `skip`: nothing is created,
+  the skip is recorded and written to the unfinished Occurrence's
+  `logs/nightshift.log`. `replace`: each unfinished Occurrence is cancelled
+  through `failures.cancel` (reason "replaced by a new Occurrence of
+  Schedule <name> (Overlap rule: replace)"; a running one under a live
+  daemon gets a cancel request, as `orch cancel` does) and a fresh one is
+  created. `failures.cancel` gained `why=` for that reason text.
+- **Occurrences** are `create_task(..., schedule_name=, occurrence_date=)`:
+  pre-approved whatever the template's estimate (§2.4), template settings
+  as in `orch add --template` (`templates.load` + `instantiate` +
+  `install_inputs`), title `<name> YYYY-MM-DD`, `schedule_name` in the DB
+  and `task.yaml`, folder `<agents_root>/recurring/<name>/YYYY-MM-DD/` (the
+  fire's date in LA; `Config.recurring_dir`). A second Occurrence on the
+  same date (run-now, replace, an hourly rule) gets `YYYY-MM-DD_<id>/`, so
+  no two share a folder. Schedule names are `[a-z0-9-]`, up to 40 chars,
+  because they name a folder.
+- **Validated at add, not at 2am.** `orch schedule add` parses the cron and
+  Catch-up rules and loads and fills in the template with the request
+  (missing input files, a URL the template needs, a denied domain and an
+  unknown agent fail there). If the template breaks later, the fire is
+  recorded as `error` (claimed, so no retry storm on every poll) and the
+  daemon log says why.
+- **CLI.** `orch schedule add NAME --template T --cron RULE --catch-up RULE
+  [--overlap skip|replace] [--request TEXT] [--priority P] [--agent A]
+  [--disabled]`; `--catch-up` is required (the spec gives no default) and
+  accepts `within 12h`, `within:12`, `12h`, `next-wake`. `list` shows each
+  Schedule's rules, next fire, last decision (with the Occurrence's state)
+  and unfinished Occurrences. `enable` counts fires from that moment: fires
+  while a Schedule was disabled are not "missed while the machine slept", so
+  they don't catch up. `run-now` fires once now through the Overlap rule
+  (a skip is an error exit naming the unfinished Occurrence) and doesn't
+  move the cron state. `remove` deletes the Schedule but leaves its
+  Occurrences and their folders (it names unfinished ones).
+- **Real-machine check (2026-10-21, 04:14-04:21 PDT).** Scratch config,
+  haiku, a tiny template estimated at 45 min: `orch schedule add ping
+  --cron "14 * * * *" --catch-up "within 12h"` at 04:13, daemon not running
+  at 04:14 (the missed fire). `orch daemon run --exit-when-idle` at 04:21
+  logged "on daemon start: Schedule ping: fire at 04:14: created Occurrence
+  dpx8", which ran on real claude and ended `done` in
+  `recurring/ping/2026-10-21/`, pre-approved (`approved: true`,
+  `schedule_name: ping` in `task.yaml`). A second daemon start created
+  nothing. A real lid-close sleep/wake was not run (it needs the user;
+  Nightshift never runs `pmset`); wake detection is covered with
+  `FakeHost(awake_clock=...)` and a fake clock.

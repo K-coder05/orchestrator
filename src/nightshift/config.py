@@ -175,6 +175,11 @@ class Config:
         return self.agents_root / "tasks"
 
     @property
+    def recurring_dir(self) -> Path:
+        """Occurrence folders: ``recurring/<schedule-name>/YYYY-MM-DD/`` (§1.3)."""
+        return self.agents_root / "recurring"
+
+    @property
     def data_dir(self) -> Path:
         return self.agents_root / "data"
 

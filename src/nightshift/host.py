@@ -18,6 +18,7 @@ import os
 import platform
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -113,6 +114,11 @@ class Host(Protocol):
 
     def awake_held(self) -> bool:
         """Whether this process is currently holding the machine awake."""
+        ...
+
+    def awake_seconds(self) -> float:
+        """A clock that does not advance while the machine sleeps; compared
+        with wall time it tells the daemon the machine just woke up."""
         ...
 
     def run_confined(
@@ -279,6 +285,11 @@ class MacHost:
     def awake_held(self) -> bool:
         return self._caffeinate is not None and self._caffeinate.poll() is None
 
+    def awake_seconds(self) -> float:
+        # CLOCK_UPTIME_RAW (mach_absolute_time) stops while the Mac sleeps,
+        # unlike wall time; Python doesn't promise that for time.monotonic().
+        return time.clock_gettime(time.CLOCK_UPTIME_RAW)
+
     def run_confined(self, argv, *, cwd, writable, readable, private_roots, env=None,
                      timeout=120) -> ConfinedRun:
         # macOS Seatbelt through sandbox-exec (deprecated but still shipped,
@@ -327,6 +338,9 @@ class FakeHost:
     awake: bool = False
     #: ``"hold"``/``"release"`` in call order (only state changes are recorded).
     awake_log: list[str] = field(default_factory=list)
+    #: What ``awake_seconds`` returns (None: real monotonic time). Tests
+    #: simulate sleep by moving their fake clock without moving this.
+    awake_clock: float | None = None
     #: ``run_confined`` calls (kwargs plus argv); FakeHost runs them unconfined.
     confined_runs: list[dict] = field(default_factory=list)
 
@@ -389,6 +403,9 @@ class FakeHost:
 
     def awake_held(self) -> bool:
         return self.awake
+
+    def awake_seconds(self) -> float:
+        return time.monotonic() if self.awake_clock is None else self.awake_clock
 
     def run_confined(self, argv, *, cwd, writable, readable, private_roots, env=None,
                      timeout=120) -> ConfinedRun:

@@ -336,3 +336,45 @@ def format_usage(cfg: Config, db: Database, now: datetime) -> str:
         out.append("")
     out.append(USAGE_NOTE)
     return "\n".join(out)
+
+
+def format_schedules(cfg: Config, db: Database, now: datetime) -> str:
+    """`orch schedule list`: each Schedule, its rules, next fire and last decision."""
+    from . import schedules  # late: schedules imports the runner
+
+    items = schedules.all_schedules(db)
+    if not items:
+        return "No Schedules. Add one with `orch schedule add`."
+    blocks = []
+    for s in items:
+        nxt = schedules.next_fire(cfg, s, now) if s.enabled else None
+        last = schedules.last_run(db, s)
+        lines = [
+            f"{s.name}  {'enabled' if s.enabled else 'disabled'}",
+            f"  rule       {s.cron.expr}  ({cfg.timezone})",
+            f"  template   {s.template}" + (f"  request: {s.request}" if s.request else ""),
+            f"  catch-up   {s.catch_up}",
+            f"  overlap    {s.overlap}",
+        ]
+        if s.priority or s.agent:
+            lines.append("  settings   " + ", ".join(
+                x for x in (s.priority and f"priority {s.priority}", s.agent and f"agent {s.agent}")
+                if x))
+        lines.append(f"  next fire  {_local(iso(nxt), cfg.timezone) if nxt else '-'}")
+        if last is not None:
+            state = ""
+            if last["task_id"]:
+                row = db.get_task(last["task_id"])
+                state = f" ({row['state']})" if row is not None else ""
+            what = schedules.Decision(
+                schedule=s.name, trigger=last["trigger"], fire_at=last["fire_at"],
+                fires=last["fires"], outcome=last["outcome"], task_id=last["task_id"],
+            ).describe().split(": ", 1)[1]
+            lines.append(f"  last       {_local(last['decided_at'], cfg.timezone)}  {what}{state}")
+        else:
+            lines.append("  last       never fired")
+        open_ = schedules.unfinished_occurrences(db, s.name)
+        lines.append("  open       " + (", ".join(f"{r['id']} ({r['state']})" for r in open_)
+                                        if open_ else "none"))
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)

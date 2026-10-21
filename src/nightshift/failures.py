@@ -216,13 +216,15 @@ class CancelResult:
 
 
 def cancel(cfg: Config, db: Database, task_id: str, *, at: datetime, daemon_up: bool,
-           via: str = "orch cancel") -> CancelResult:
+           via: str = "orch cancel", why: str | None = None) -> CancelResult:
     """Cancel a Task in any non-terminal state.
 
     A ``running`` Task under a live daemon only gets a cancel request: the
     daemon's Attempt watchdog sees it within a second or so, stops the agent
     and ends the Task ``cancelled`` itself. A ``running`` Task with no daemon
     alive is an orphan; it is cancelled here, its open Attempt closed.
+    ``why`` replaces "cancelled by hand (via)" in the reason (e.g. a
+    Schedule's Overlap rule replacing an Occurrence).
     """
     for _ in range(3):  # the daemon may move the Task while we look
         row = db.get_task(task_id)
@@ -234,7 +236,7 @@ def cancel(cfg: Config, db: Database, task_id: str, *, at: datetime, daemon_up: 
         if state == TaskState.RUNNING and daemon_up:
             db.request_cancel(task_id)
             return CancelResult("requested", state)
-        reason = f"cancelled by hand ({via}) while {state}"
+        reason = f"{why or f'cancelled by hand ({via})'} while {state}"
         try:
             db.transition(task_id, TaskState.CANCELLED, reason, expect=state,
                           set_fields={"retry_at": None})

@@ -203,6 +203,48 @@ MIGRATIONS: list[str] = [
         detail     TEXT
     );
     """,
+    # 6: Schedules and their fires (§2.5).
+    """
+    -- A named recurring rule that creates pre-approved Occurrences from a
+    -- template. last_fire_at: every fire up to and including this time has
+    -- been handled (created, skipped or collapsed); the daemon compares it
+    -- with the time now on every start, wake and poll.
+    CREATE TABLE schedules (
+        name            TEXT PRIMARY KEY,
+        template        TEXT NOT NULL,
+        request         TEXT NOT NULL DEFAULT '',
+        cron            TEXT NOT NULL,
+        catch_up        TEXT NOT NULL CHECK (catch_up IN ('within', 'next_wake')),
+        catch_up_hours  REAL,
+        overlap         TEXT NOT NULL DEFAULT 'skip' CHECK (overlap IN ('skip', 'replace')),
+        priority        TEXT,
+        agent           TEXT,
+        enabled         INTEGER NOT NULL DEFAULT 1,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL,
+        last_fire_at    TEXT NOT NULL,
+        last_checked_at TEXT
+    );
+
+    -- One row per decision about a Schedule's fire(s): an Occurrence was
+    -- created (or replaced an unfinished one), or the fire was skipped by the
+    -- Catch-up rule or the Overlap rule. `fires` > 1: several missed fires
+    -- collapsed into this one decision. No foreign key to schedules, so the
+    -- history outlives `orch schedule remove`.
+    CREATE TABLE schedule_runs (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        schedule_name  TEXT NOT NULL,
+        trigger        TEXT NOT NULL CHECK (trigger IN ('start', 'wake', 'poll', 'run_now')),
+        fire_at        TEXT NOT NULL,
+        fires          INTEGER NOT NULL DEFAULT 1,
+        decided_at     TEXT NOT NULL,
+        outcome        TEXT NOT NULL CHECK (outcome IN
+                         ('created', 'replaced', 'skipped_overlap', 'skipped_catch_up', 'error')),
+        task_id        TEXT REFERENCES tasks(id),
+        detail         TEXT
+    );
+    CREATE INDEX schedule_runs_name ON schedule_runs(schedule_name, id);
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -601,3 +643,74 @@ class Database:
             return self.conn.execute("SELECT * FROM probes ORDER BY id").fetchall()
         return self.conn.execute("SELECT * FROM probes WHERE agent = ? ORDER BY id",
                                  (agent,)).fetchall()
+
+    # -- Schedules (§2.5) -------------------------------------------------------
+    SCHEDULE_COLUMNS = ("name template request cron catch_up catch_up_hours overlap priority "
+                        "agent enabled created_at updated_at last_fire_at").split()
+
+    def insert_schedule(self, fields: dict[str, Any]) -> None:
+        row = {k: fields.get(k) for k in self.SCHEDULE_COLUMNS}
+        row["enabled"] = int(bool(row["enabled"]))
+        cols = ", ".join(row)
+        marks = ", ".join("?" for _ in row)
+        with self.tx() as c:
+            c.execute(f"INSERT INTO schedules ({cols}) VALUES ({marks})", list(row.values()))
+
+    def get_schedule(self, name: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM schedules WHERE name = ?", (name,)).fetchone()
+
+    def schedules(self, *, enabled_only: bool = False) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM schedules" + (" WHERE enabled = 1" if enabled_only else "")
+        return self.conn.execute(sql + " ORDER BY name").fetchall()
+
+    def delete_schedule(self, name: str) -> bool:
+        with self.tx() as c:
+            return c.execute("DELETE FROM schedules WHERE name = ?", (name,)).rowcount == 1
+
+    def set_schedule_enabled(self, name: str, enabled: bool, *, at: str,
+                             last_fire_at: str | None = None) -> None:
+        with self.tx() as c:
+            cur = c.execute(
+                "UPDATE schedules SET enabled = ?, updated_at = ?, "
+                "last_fire_at = COALESCE(?, last_fire_at) WHERE name = ?",
+                (int(enabled), at, last_fire_at, name))
+            if cur.rowcount != 1:
+                raise KeyError(name)
+
+    def claim_schedule_fires(self, name: str, *, expect_last: str, through: str,
+                             checked_at: str) -> bool:
+        """Mark every fire up to ``through`` handled, if no one else did
+        meanwhile (``last_fire_at`` still ``expect_last``). Done *before* the
+        Occurrence is created, so a crash can lose a fire but never repeat it."""
+        with self.tx() as c:
+            return c.execute(
+                "UPDATE schedules SET last_fire_at = ?, last_checked_at = ? "
+                "WHERE name = ? AND last_fire_at = ?",
+                (through, checked_at, name, expect_last)).rowcount == 1
+
+    def touch_schedule(self, name: str, checked_at: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE schedules SET last_checked_at = ? WHERE name = ?",
+                      (checked_at, name))
+
+    def record_schedule_run(self, *, schedule_name: str, trigger: str, fire_at: str, fires: int,
+                            decided_at: str, outcome: str, task_id: str | None,
+                            detail: str | None) -> int:
+        with self.tx() as c:
+            cur = c.execute(
+                "INSERT INTO schedule_runs (schedule_name, trigger, fire_at, fires, decided_at, "
+                "outcome, task_id, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (schedule_name, trigger, fire_at, fires, decided_at, outcome, task_id, detail))
+            return int(cur.lastrowid)
+
+    def schedule_runs(self, name: str | None = None) -> list[sqlite3.Row]:
+        if name is None:
+            return self.conn.execute("SELECT * FROM schedule_runs ORDER BY id").fetchall()
+        return self.conn.execute(
+            "SELECT * FROM schedule_runs WHERE schedule_name = ? ORDER BY id", (name,)).fetchall()
+
+    def occurrences(self, schedule_name: str) -> list[sqlite3.Row]:
+        """Tasks a Schedule created, oldest first."""
+        return self.conn.execute(
+            "SELECT * FROM tasks WHERE schedule_name = ? ORDER BY created_at, rowid",
+            (schedule_name,)).fetchall()

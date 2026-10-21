@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from . import daemon, failures, pauses, planning, templates, views
+from . import daemon, failures, pauses, planning, schedules, templates, views
 from . import usage as usage_mod
 from . import priority as prio
 from .adapters import get_adapter
@@ -65,10 +65,10 @@ def _ask(question: str) -> bool:
         return False
 
 
-def _daemon_note(cfg) -> None:
+def _daemon_note(cfg, what: str = "nothing will pick this Task up yet") -> None:
     if not daemon.daemon_running(cfg):
         click.echo(
-            "Note: the daemon isn't running, so nothing will pick this Task up yet. "
+            f"Note: the daemon isn't running, so {what}. "
             "Start it with `orch daemon install` (or `orch daemon run` in a terminal).",
             err=True,
         )
@@ -551,6 +551,159 @@ def usage_cmd(ctx, probe_agents):
         if probe_agents:
             click.echo()
         click.echo(views.format_usage(cfg, db, _clock(cfg)))
+    finally:
+        db.close()
+
+
+# --------------------------------------------------------------------------
+# Schedules (§2.5)
+# --------------------------------------------------------------------------
+
+
+@main.group("schedule")
+def schedule_group():
+    """Manage Schedules: named cron-style rules that create pre-approved
+    Occurrences from a template (in recurring/<name>/YYYY-MM-DD/)."""
+
+
+def _schedule_error(exc: Exception):
+    return click.ClickException(str(exc))
+
+
+@schedule_group.command("add")
+@click.argument("name")
+@click.option("--template", "template_name", required=True, metavar="T",
+              help="Template each Occurrence is made from (templates/T.yaml).")
+@click.option("--cron", "cron_rule", required=True, metavar="RULE",
+              help="Cron-style rule in local time: 'minute hour day-of-month month "
+              "day-of-week', e.g. '30 6 * * *' (6:30am daily), or @daily, @hourly...")
+@click.option("--catch-up", "catch_up", required=True, metavar="RULE",
+              help="For fires missed while the Mac slept: 'within <N>h' (run if the latest "
+              "missed fire is at most N hours old, else skip) or 'next-wake' (always run). "
+              "Several missed fires always become one Occurrence.")
+@click.option("--overlap", type=click.Choice(list(schedules.OVERLAPS)), default="skip",
+              show_default=True,
+              help="When it fires while its previous Occurrence is unfinished: skip the new "
+              "fire, or replace (cancel) the old Occurrence.")
+@click.option("--request", default="", help="The request text the template gets ({{request}}).")
+@click.option("--priority", type=click.Choice(["urgent", "normal", "background"]), default=None)
+@click.option("--agent", default=None, help="Agent override for every Occurrence.")
+@click.option("--disabled", is_flag=True, help="Add it disabled (`orch schedule enable` later).")
+@click.pass_context
+def schedule_add(ctx, name, template_name, cron_rule, catch_up, overlap, request, priority, agent,
+                 disabled):
+    """Add Schedule NAME. Fires before now never count as missed."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        try:
+            s = schedules.add(cfg, db, name, template=template_name, cron_rule=cron_rule,
+                              catch_up=catch_up, overlap=overlap, request=request,
+                              priority=priority, agent=agent, enabled=not disabled,
+                              at=_clock(cfg))
+        except schedules.ScheduleError as exc:
+            raise _schedule_error(exc) from None
+        nxt = schedules.next_fire(cfg, s, _clock(cfg))
+        click.echo(f"Schedule {s.name} added ({'disabled' if disabled else 'enabled'}): "
+                   f"{s.cron.expr} ({cfg.timezone}), template {s.template}, "
+                   f"catch-up {s.catch_up}, overlap {s.overlap}")
+        if not disabled and nxt is not None:
+            click.echo(f"Next fire: {iso(nxt)}")
+            _daemon_note(cfg, "fires are only caught up (by the Catch-up rule) once it starts")
+    finally:
+        db.close()
+
+
+@schedule_group.command("list")
+@click.pass_context
+def schedule_list(ctx):
+    """List Schedules with their rules, next fire and last decision."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        click.echo(views.format_schedules(cfg, db, _clock(cfg)))
+    finally:
+        db.close()
+
+
+def _set_enabled(ctx, name: str, enabled: bool) -> None:
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        try:
+            changed = schedules.set_enabled(db, name, enabled, at=_clock(cfg))
+        except schedules.ScheduleError as exc:
+            raise _schedule_error(exc) from None
+        word = "enabled" if enabled else "disabled"
+        if not changed:
+            click.echo(f"Schedule {name} is already {word}.")
+            return
+        click.echo(f"Schedule {name} {word}." + (
+            " Fires from now on count; fires while it was disabled don't catch up."
+            if enabled else ""))
+        if enabled:
+            nxt = schedules.next_fire(cfg, schedules.get(db, name), _clock(cfg))
+            if nxt is not None:
+                click.echo(f"Next fire: {iso(nxt)}")
+    finally:
+        db.close()
+
+
+@schedule_group.command("enable")
+@click.argument("name")
+@click.pass_context
+def schedule_enable(ctx, name):
+    """Enable Schedule NAME (counting fires from now)."""
+    _set_enabled(ctx, name, True)
+
+
+@schedule_group.command("disable")
+@click.argument("name")
+@click.pass_context
+def schedule_disable(ctx, name):
+    """Disable Schedule NAME; its Occurrences already made are untouched."""
+    _set_enabled(ctx, name, False)
+
+
+@schedule_group.command("run-now")
+@click.argument("name")
+@click.pass_context
+def schedule_run_now(ctx, name):
+    """Create an Occurrence of NAME now (Overlap rule applies; the cron
+    timing is unchanged)."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        try:
+            d = schedules.run_now(cfg, db, name, now=_clock(cfg),
+                                  daemon_up=daemon.daemon_running(cfg))
+        except schedules.ScheduleError as exc:
+            raise _schedule_error(exc) from None
+        if d.outcome in (schedules.CREATED, schedules.REPLACED):
+            click.echo(f"Occurrence {d.task_id} queued: {d.folder}"
+                       + (f" ({d.detail})" if d.detail else ""))
+            _daemon_note(cfg)
+        elif d.outcome == schedules.SKIPPED_OVERLAP:
+            raise click.ClickException(
+                f"not run: {d.detail} (Overlap rule: skip). Cancel it with `orch cancel <id>` "
+                "first, or wait for it to finish.")
+        else:
+            raise click.ClickException(f"could not create an Occurrence: {d.detail}")
+    finally:
+        db.close()
+
+
+@schedule_group.command("remove")
+@click.argument("name")
+@click.pass_context
+def schedule_remove(ctx, name):
+    """Remove Schedule NAME. Its Occurrences (and their folders) stay."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        try:
+            left = schedules.remove(db, name)
+        except schedules.ScheduleError as exc:
+            raise _schedule_error(exc) from None
+        click.echo(f"Schedule {name} removed.")
+        if left:
+            click.echo(f"Its unfinished Occurrence{'s' if len(left) > 1 else ''} "
+                       f"{', '.join(left)} will still run; `orch cancel <id>` stops one.")
     finally:
         db.close()
 

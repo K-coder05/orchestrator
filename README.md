@@ -26,6 +26,8 @@ orch cancel <id>             # any unfinished Task; stops a running agent
 orch list --status running
 orch logs <id> -f
 orch report <id>
+orch schedule add posting-scan --template posting-scan --cron "30 6 * * *" --catch-up "within 12h"
+orch schedule list           # also enable | disable | run-now | remove <name>
 ```
 
 `orch add` first makes a quick planning call that estimates the minutes and
@@ -66,3 +68,13 @@ a post-hook is a Failed Attempt: the Task waits in `retry_wait` 10 minutes,
 then 30, and is retried on the same agent; after 2 retries it is `failed`.
 `orch retry <id>` requeues a failed Task with a fresh budget (or ends a
 `retry_wait` early), and `orch cancel <id>` cancels any unfinished Task.
+
+A Schedule creates pre-approved Occurrences of a template on a cron-style
+rule (local time), each an ordinary Task in
+`~/agents/recurring/<name>/YYYY-MM-DD/`. Fires missed while the Mac slept (or
+the daemon was down) catch up when the daemon starts or the Mac wakes, always
+as one Occurrence however many were missed: `--catch-up "within <N>h"` runs it
+only if the latest missed fire is at most N hours old, `--catch-up next-wake`
+always runs it. `--overlap skip` (default) skips a fire while the previous
+Occurrence is unfinished; `--overlap replace` cancels that one and starts
+fresh. `orch schedule run-now <name>` fires once by hand.

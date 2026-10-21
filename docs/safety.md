@@ -67,6 +67,14 @@ one-line system prompt and the fixed prompt "OK?" (no Task content), in
 `<agents_root>/data/probe/`. Its answer is never used, only whether it went
 through.
 
+## Scheduled Occurrences
+
+An Occurrence (a Task a Schedule created) is pre-approved (§2.4), but it is
+otherwise an ordinary Task: its folder under `recurring/<name>/YYYY-MM-DD/`
+is its only writable place, and it gets the same per-Task permission policy,
+template post-hooks and caps as any other Task. Pre-approval skips only the
+plan approval; nothing in §1.6 that needs approval is ever done unasked.
+
 ## Template post-hooks (Nightshift-side tools)
 
 Some templates run tools on what the agent wrote, after the Attempt and

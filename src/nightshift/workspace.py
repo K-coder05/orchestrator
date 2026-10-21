@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -86,11 +86,22 @@ Checkpoint notes. The agent updates this after every meaningful step.
 """
 
 
+def occurrence_folder(recurring_dir: Path, schedule_name: str, day: date, task_id: str) -> Path:
+    """``<recurring>/<schedule-name>/YYYY-MM-DD/`` (§1.3). A second Occurrence
+    on the same date (run-now, a replace, an hourly rule) gets
+    ``YYYY-MM-DD_<id>/`` so no Occurrence ever shares a folder."""
+    base = recurring_dir / schedule_name
+    first = base / f"{day:%Y-%m-%d}"
+    return first if not first.exists() else base / f"{day:%Y-%m-%d}_{task_id}"
+
+
 def create_task_folder(
-    tasks_dir: Path, spec: TaskSpec, created: datetime, *, plan: str = PLAN_STUB
+    tasks_dir: Path, spec: TaskSpec, created: datetime, *, plan: str = PLAN_STUB,
+    folder: Path | None = None,
 ) -> Path:
-    """Create ``<tasks_dir>/YYYY-MM-DD_<slug>_<id>/`` with its standard contents."""
-    folder = tasks_dir / folder_name(created, spec.slug, spec.id)
+    """Create ``<tasks_dir>/YYYY-MM-DD_<slug>_<id>/`` (or ``folder``, for an
+    Occurrence) with its standard contents."""
+    folder = folder or tasks_dir / folder_name(created, spec.slug, spec.id)
     folder.mkdir(parents=True, exist_ok=False)
     (folder / "output").mkdir()
     (folder / "logs").mkdir()
