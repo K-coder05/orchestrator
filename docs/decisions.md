@@ -292,3 +292,58 @@ lasting consequences go in `docs/adr/` instead.
   the prompt; a no left one awaiting approval; `orch deny` cancelled one. Each
   call cost about $0.0002-0.0008 reported cost-equivalent. Haiku proposed
   `comedy` for a haiku; that's what the y/n and `--type` are for.
+
+## Phase 1, issue #6: priority, deadlines and time windows
+
+- **One pure module.** `nightshift.priority` computes the Effective priority,
+  the start gates and the queue order from Task rows and a `now` passed in,
+  so every rule is unit tested with a fake clock. `QueueRunner` takes a
+  `clock` (default: real time) and calls `pick_next` over all queued Tasks on
+  every pick, so the Effective priority is recalculated each time the queue is
+  evaluated and is never stored: `tasks.priority` and `task.yaml` keep only the
+  assigned Priority. `Database.next_queued_task` (the placeholder) is gone.
+- **Order.** Effective priority (urgent, normal, background); within urgent,
+  nearest deadline first (none last), then oldest; within normal and
+  background, oldest first ("runs in order"). A deadline exactly 24h away, or
+  already passed, counts as urgent. A passed deadline is not cancelled here;
+  expiry belongs to pause/resume (§2.6).
+- **"Background runs only when nothing else waits"** means nothing else that
+  may start now. A Task held back by `--at` or the long-task window isn't
+  waiting to run, so it doesn't block the queue (otherwise one daytime coding
+  Task would stall all background work until midnight). Since one Task runs
+  at a time, a background Task that starts at 23:50 can delay a long Task past
+  midnight; accepted.
+- **Gates.** A Task with `run_at` in the future never starts, whatever its
+  priority. A long Task starts only inside `queue.long_window_start` to
+  `long_window_end` (default 00:00 to 07:00, end exclusive; a window may wrap
+  midnight) unless its Effective priority is urgent, so a near deadline also
+  lifts the gate. The gate only governs starting; a running long Task isn't
+  stopped at 7am.
+- **Which Tasks are long.** A template's `long` (later, via
+  `create_task(long=...)`) wins; otherwise the Task type's new
+  `task_types.<type>.long` (default false). `coding` and `research` are long
+  by default, per §2.3's examples; re-scrapes will be marked by their
+  template. `orch add` has no `--long` flag (not in §3.1); `--type` and
+  `orch priority <id> urgent` are the overrides.
+- **Times.** All rules use the configured `timezone` (America/Los_Angeles by
+  default; an unknown IANA name is now a config error) whatever zone `now` is
+  in, and deadlines compare absolute time. `--deadline`: `YYYY-MM-DD` (end of
+  that day, 23:59:59), `YYYY-MM-DD HH:MM` or ISO 8601. `--at`: `HH:MM` (next
+  occurrence, today or tomorrow), `YYYY-MM-DD HH:MM` or ISO 8601. Naive values
+  are LA time; stored values are ISO 8601 with the LA offset (DST-correct). A
+  deadline or explicit `--at` already passed is rejected. Both are parsed
+  before the planning call, so a typo costs nothing.
+- **`orch priority <id> <P>`** changes the assigned Priority in the DB and
+  `task.yaml` and logs it to the Task's `nightshift.log`; it isn't a state
+  transition. Refused for terminal Tasks. It prints the Effective priority
+  when a deadline overrides the new value. `orch list` shows a raised Priority
+  as `normal>urgent`; `orch show` adds `effective_priority` and, for a held
+  Task, a `Waiting:` line.
+- **New config section `queue:`** (`deadline_urgent_hours: 24`,
+  `long_window_start`, `long_window_end`); defaults.yaml ==
+  config.example.yaml still.
+- **Real-machine check (2026-10-21, 00:05 PDT).** With a scratch config, a
+  real haiku-model `orch add --type coding --deadline 2026-10-30 --at 23:00
+  --yes` stored the LA-offset times, `orch priority` changed `task.yaml`, and
+  `orch daemon run --exit-when-idle` left it queued (held by `--at`) without
+  starting an agent.

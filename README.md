@@ -17,6 +17,8 @@ python3.12 -m venv .venv            # see docs/decisions.md if 3.12 isn't instal
 cp config.example.yaml ~/.config/nightshift/config.yaml   # optional; all keys have defaults
 orch daemon install          # launchd agent (KeepAlive) that runs queued Tasks
 orch add "Write a haiku about the night shift to output/haiku.txt"   # asks y/n
+orch add "Tailor my resume" --priority urgent --deadline 2026-11-01 --at 02:00
+orch priority <id> background   # urgent | normal | background
 orch approve <id>            # or `orch deny <id>`, for Tasks awaiting approval
 orch list --status running
 orch logs <id> -f
@@ -35,3 +37,11 @@ folder. `orch daemon status` shows whether it is up; `orch daemon run` runs it
 in a terminal instead of under launchd. `orch show <id>` lists a Task's
 Attempts and state history. Set `NIGHTSHIFT_CONFIG_DIR` to use a different
 config directory.
+
+The queue runs by Effective priority: urgent first (nearest deadline first),
+then normal in order, then background only when nothing else can start. A
+Task counts as urgent within 24 hours of its `--deadline`. `--at` holds a Task
+until that time, and long Tasks (Task types `coding` and `research` by
+default) start only between midnight and 7am unless urgent. All times are
+America/Los_Angeles. `orch show <id>` prints the Effective priority and why a
+queued Task is waiting.

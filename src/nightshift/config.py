@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -212,6 +213,11 @@ class Config:
         # Unknown Task types are conservative: internet off.
         return str(entry.get("internet", "off"))
 
+    def long_default(self, task_type: str) -> bool:
+        """Whether Tasks of this type are long Tasks (§2.3); unknown: no."""
+        entry = (self.data.get("task_types") or {}).get(task_type) or {}
+        return bool(entry.get("long", False))
+
 
 def _validate(data: dict[str, Any]) -> None:
     for section in ("paths", "agents", "defaults"):
@@ -224,6 +230,21 @@ def _validate(data: dict[str, Any]) -> None:
     for name, entry in (data.get("task_types") or {}).items():
         if (entry or {}).get("internet", "off") not in ("on", "off"):
             raise ConfigError(f"task_types.{name}.internet must be 'on' or 'off'")
+        if not isinstance((entry or {}).get("long", False), bool):
+            raise ConfigError(f"task_types.{name}.long must be true or false")
+    queue = data.get("queue") or {}
+    if not isinstance(queue, dict):
+        raise ConfigError("config section 'queue' must be a mapping")
+    for key, default in (("long_window_start", "00:00"), ("long_window_end", "07:00")):
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(queue.get(key, default))):
+            raise ConfigError(f"queue.{key} must be HH:MM (24-hour), e.g. 07:00")
+    hours = queue.get("deadline_urgent_hours", 24)
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)) or hours < 0:
+        raise ConfigError("queue.deadline_urgent_hours must be a number >= 0")
+    try:
+        ZoneInfo(str(data.get("timezone")))
+    except (ValueError, ZoneInfoNotFoundError):
+        raise ConfigError(f"timezone {data.get('timezone')!r} is not a known IANA zone") from None
     perms = data.get("permissions") or {}
     if not isinstance(perms, dict):
         raise ConfigError("config section 'permissions' must be a mapping")

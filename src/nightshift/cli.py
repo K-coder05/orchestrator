@@ -9,13 +9,16 @@ from pathlib import Path
 import click
 
 from . import daemon, planning, views
+from . import priority as prio
 from .adapters import get_adapter
 from .config import ConfigError, load_config
 from .db import Database
 from .doctor import format_report, run_doctor
 from .host import MacHost
 from .runner import create_task
-from .states import TaskState
+from .states import TERMINAL, TaskState
+from .timeutil import iso, now
+from .workspace import read_task_yaml, write_task_yaml
 
 
 def _open(config_dir: str | None):
@@ -41,6 +44,13 @@ def main(ctx: click.Context, config_dir: str | None) -> None:
 
 # Tests replace this to run planning calls against a fake agent.
 planning_provider = get_adapter
+
+# Tests replace this with a fake clock (a callable returning an aware datetime).
+clock = None
+
+
+def _clock(cfg):
+    return clock() if clock is not None else now(cfg.timezone)
 
 
 def _ask(question: str) -> bool:
@@ -68,10 +78,23 @@ def _daemon_note(cfg) -> None:
 @click.option(
     "--priority", type=click.Choice(["urgent", "normal", "background"]), default=None
 )
+@click.option(
+    "--deadline",
+    default=None,
+    help="YYYY-MM-DD (end of day), 'YYYY-MM-DD HH:MM' or ISO 8601; local time. "
+    "Within 24h of it the Task counts as urgent.",
+)
+@click.option(
+    "--at",
+    "at",
+    default=None,
+    help="Don't start before this time: HH:MM (next occurrence), 'YYYY-MM-DD HH:MM' "
+    "or ISO 8601; local time.",
+)
 @click.option("--internet", type=click.Choice(["on", "off"]), default=None)
 @click.option("--yes", "-y", is_flag=True, help="Skip the estimate/type confirmation.")
 @click.pass_context
-def add(ctx, prompt, task_type, agent, priority, internet, yes):
+def add(ctx, prompt, task_type, agent, priority, deadline, at, internet, yes):
     """Plan and queue a free-form Task; the daemon runs it.
 
     A quick planning call estimates the minutes and proposes a Task type,
@@ -82,6 +105,10 @@ def add(ctx, prompt, task_type, agent, priority, internet, yes):
     try:
         try:
             cfg.agent(agent or cfg.default("agent"))
+            # Parse times before spending a planning call on a typo.
+            current = _clock(cfg)
+            deadline_at = prio.parse_deadline(deadline, current, cfg.timezone) if deadline else None
+            run_at = prio.parse_at(at, current, cfg.timezone) if at else None
             click.echo("Planning: asking for an estimate and a Task type...", err=True)
             proposal = planning.estimate(cfg, prompt, adapter_provider=planning_provider)
         except (ConfigError, planning.PlanningError) as exc:
@@ -107,7 +134,7 @@ def add(ctx, prompt, task_type, agent, priority, internet, yes):
         try:
             new = create_task(
                 cfg, db, prompt, task_type=ttype, agent=agent, priority=priority,
-                internet=internet, estimated_minutes=proposal.estimated_minutes,
+                deadline=deadline_at, run_at=run_at, internet=internet, estimated_minutes=proposal.estimated_minutes,
                 needs_approval=long_task,
                 reason=f"created by orch add (estimated {proposal.estimated_minutes} min"
                 + (", needs plan approval)" if long_task else ", no plan needed)"),
@@ -116,6 +143,7 @@ def add(ctx, prompt, task_type, agent, priority, internet, yes):
             raise click.ClickException(str(exc)) from None
         tid = new.spec.id
         planning.record_usage(db, tid, "estimate", proposal)
+        _timing_notes(cfg, new.spec)
         if not long_task:
             click.echo(f"Task {tid} queued: {new.folder}")
             _daemon_note(cfg)
@@ -141,6 +169,47 @@ def add(ctx, prompt, task_type, agent, priority, internet, yes):
                 f"Task {tid} stays awaiting approval. "
                 f"`orch approve {tid}` queues it; `orch deny {tid}` cancels it."
             )
+    finally:
+        db.close()
+
+
+def _timing_notes(cfg, spec) -> None:
+    """Say when a new Task can start, so a held-back Task is never a surprise."""
+    if spec.deadline:
+        click.echo(f"Deadline:  {spec.deadline} (urgent from "
+                   f"{prio.deadline_urgent_hours(cfg):g}h before)")
+    if spec.run_at:
+        click.echo(f"Starts:    no earlier than {spec.run_at}")
+    if spec.long:
+        start, end = prio.long_window(cfg)
+        click.echo(f"Long Task: starts only between {start:%H:%M} and {end:%H:%M} "
+                   f"({cfg.timezone}) unless urgent")
+
+
+@main.command("priority")
+@click.argument("task_id")
+@click.argument("level", type=click.Choice(list(prio.PRIORITIES)))
+@click.pass_context
+def set_priority(ctx, task_id, level):
+    """Change a Task's assigned Priority (urgent, normal or background)."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        row = _task_row(db, task_id)
+        if TaskState(row["state"]) in TERMINAL:
+            raise click.ClickException(f"Task {task_id} is {row['state']}; its priority is final")
+        old = row["priority"]
+        db.set_priority(task_id, level)
+        folder = Path(row["folder"])
+        if (folder / "task.yaml").exists():
+            spec = read_task_yaml(folder)
+            spec.priority = level  # the assigned Priority only, never the effective one
+            write_task_yaml(folder, spec)
+        (folder / "logs").mkdir(parents=True, exist_ok=True)
+        with open(folder / "logs" / "nightshift.log", "a") as f:
+            f.write(f"{iso(_clock(cfg))} priority {old} -> {level} via orch priority\n")
+        eff = prio.evaluate(cfg, db.get_task(task_id), _clock(cfg)).effective
+        note = "" if eff == level else f" (effective {eff}: deadline {row['deadline']})"
+        click.echo(f"Task {task_id} priority {old} -> {level}{note}")
     finally:
         db.close()
 
@@ -196,9 +265,10 @@ def _task_row(db: Database, task_id: str):
 @click.pass_context
 def list_tasks(ctx, statuses):
     """List Tasks, newest first."""
-    _cfg, db = _open(ctx.obj["config_dir"])
+    cfg, db = _open(ctx.obj["config_dir"])
     try:
-        click.echo(views.format_list(db.list_tasks([TaskState(s) for s in statuses])))
+        rows = db.list_tasks([TaskState(s) for s in statuses])
+        click.echo(views.format_list(rows, cfg=cfg, now=_clock(cfg)))
     finally:
         db.close()
 
@@ -208,9 +278,9 @@ def list_tasks(ctx, statuses):
 @click.pass_context
 def show(ctx, task_id):
     """Show a Task's settings, Attempts and state history."""
-    _cfg, db = _open(ctx.obj["config_dir"])
+    cfg, db = _open(ctx.obj["config_dir"])
     try:
-        click.echo(views.format_show(db, _task_row(db, task_id)))
+        click.echo(views.format_show(db, _task_row(db, task_id), cfg=cfg, now=_clock(cfg)))
     finally:
         db.close()
 

@@ -239,16 +239,13 @@ class Database:
             "SELECT * FROM tasks WHERE state = ? ORDER BY created_at, rowid", (str(state),)
         ).fetchall()
 
-    def next_queued_task(self) -> sqlite3.Row | None:
-        """The queued Task to run next: by assigned Priority, then oldest.
-
-        Effective priority (deadlines) and time windows arrive with issue #11.
-        """
-        return self.conn.execute(
-            "SELECT * FROM tasks WHERE state = 'queued' ORDER BY "
-            "CASE priority WHEN 'urgent' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, "
-            "created_at, rowid LIMIT 1"
-        ).fetchone()
+    def set_priority(self, task_id: str, priority: str) -> None:
+        """Change a Task's assigned Priority (not a state change)."""
+        if priority not in ("urgent", "normal", "background"):
+            raise ValueError(f"unknown priority {priority!r}")
+        with self.tx() as c:
+            if c.execute("UPDATE tasks SET priority = ? WHERE id = ?", (priority, task_id)).rowcount != 1:
+                raise KeyError(task_id)
 
     def transitions(self, task_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(

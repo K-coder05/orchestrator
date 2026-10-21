@@ -57,6 +57,15 @@ planning:
   # A planning call that takes longer than this fails `orch add`.
   timeout_seconds: 180
 
+queue:
+  # Priority, deadlines and time windows (§2.3). All times are in `timezone`.
+  # A Task whose deadline is this close (or passed) counts as urgent.
+  deadline_urgent_hours: 24
+  # Long Tasks start only inside this window (HH:MM, end exclusive), unless
+  # urgent. A Task is long when its template or Task type says so.
+  long_window_start: "00:00"
+  long_window_end: "07:00"
+
 daemon:
   # launchd LaunchAgent label; the plist is ~/Library/LaunchAgents/<label>.plist.
   label: com.nightshift.daemon
@@ -75,10 +84,12 @@ doctor:
 
 task_types:
   # internet: default for --internet when the Task doesn't set it (§1.4).
+  # long: Tasks of this type are long Tasks, gated to the overnight window
+  # (§2.3). Omitted means false.
   general: {internet: "off"}
-  coding: {internet: "off"}
+  coding: {internet: "off", long: true}
   comedy: {internet: "off"}
-  research: {internet: "on"}
+  research: {internet: "on", long: true}
   scraping: {internet: "on"}
   job: {internet: "on"}
   resume: {internet: "on"}

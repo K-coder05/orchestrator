@@ -19,6 +19,7 @@ import plistlib
 import sys
 import threading
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
 
@@ -28,7 +29,9 @@ from .adapters import get_adapter
 from .config import Config
 from .db import Database
 from .host import Host
+from .priority import evaluate, pick_next
 from .runner import AttemptControl, fail_orphaned, fail_unstartable, run_attempt
+from .states import TaskState
 from .timeutil import iso, now
 
 LOCK_FILENAME = "daemon.lock"
@@ -176,6 +179,7 @@ class QueueRunner:
         run_attempt_fn: Callable[..., Any] = run_attempt,
         adapter_provider: Callable = get_adapter,
         log: Callable[[str], None] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.cfg = cfg
         self.db = db
@@ -183,6 +187,8 @@ class QueueRunner:
         self.run_attempt_fn = run_attempt_fn
         self.adapter_provider = adapter_provider
         self._log = log or (lambda msg: None)
+        # The queue's notion of "now"; tests pass a fake clock.
+        self.clock = clock or (lambda: now(cfg.timezone))
         self.current: str | None = None
         self.control: AttemptControl | None = None
         self.started_at = iso(now(cfg.timezone))
@@ -229,7 +235,8 @@ class QueueRunner:
         """Run one Attempt of the next queued Task; None if the queue is empty."""
         if self.stopping:
             return None
-        row = self.db.next_queued_task()
+        # Effective priority and time windows are re-evaluated on every pick.
+        row = pick_next(self.cfg, self.db.tasks_in_state(TaskState.QUEUED), self.clock())
         if row is None:
             return None
         task_id = row["id"]
@@ -238,7 +245,9 @@ class QueueRunner:
         # Held only while this Task runs; released in `finally` whatever happens.
         self.host.hold_awake()
         self.write_state()
-        self.log(f"Task {task_id} starting ({row['priority']}, {row['agent']}): {row['title']}")
+        eff = evaluate(self.cfg, row, self.clock()).effective
+        prio = row["priority"] if eff == row["priority"] else f"{row['priority']}, effective {eff}"
+        self.log(f"Task {task_id} starting ({prio}, {row['agent']}): {row['title']}")
         try:
             result = self.run_attempt_fn(
                 self.cfg,

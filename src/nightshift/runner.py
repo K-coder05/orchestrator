@@ -39,6 +39,9 @@ def create_task(
     task_type: str | None = None,
     agent: str | None = None,
     priority: str | None = None,
+    deadline: str | None = None,
+    run_at: str | None = None,
+    long: bool | None = None,
     internet: str | None = None,
     estimated_minutes: int | None = None,
     template: str | None = None,
@@ -51,6 +54,11 @@ def create_task(
     when ``needs_approval`` is set because its estimate is over the plan
     threshold (§2.4; see ``nightshift.planning``). Planning happens before
     this is called.
+
+    ``deadline`` and ``run_at`` are ISO 8601 timestamps (see
+    ``nightshift.priority.parse_deadline``/``parse_at``). ``long`` defaults to
+    the Task type's ``long`` setting. Only the assigned ``priority`` is
+    stored; the Effective priority is computed by the queue (§2.3).
     """
     created = now(cfg.timezone)
     ttype = task_type or cfg.default("task_type")
@@ -68,6 +76,9 @@ def create_task(
         agent=agent_name,
         agent_override=agent is not None,
         priority=priority or cfg.default("priority"),
+        deadline=deadline,
+        run_at=run_at,
+        long=cfg.long_default(ttype) if long is None else bool(long),
         internet=internet or cfg.internet_default(ttype),
         template=template,
         estimated_minutes=estimated_minutes,

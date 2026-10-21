@@ -5,13 +5,15 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
+from datetime import datetime
 from pathlib import Path
 
+from . import priority
 from .adapters import get_adapter
 from .adapters.base import Event, EventKind
 from .config import Config
 from .db import Database
-from .states import TaskState
+from .states import TERMINAL, TaskState
 
 
 def _short_time(value: str | None) -> str:
@@ -29,7 +31,17 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def format_list(rows: list[sqlite3.Row]) -> str:
+def _priority_cell(r: sqlite3.Row, cfg: Config | None, now: datetime | None) -> str:
+    """The assigned Priority, plus the Effective one when a deadline raised it."""
+    if cfg is None or now is None or TaskState(r["state"]) in TERMINAL:
+        return r["priority"]
+    eff = priority.evaluate(cfg, r, now).effective
+    return r["priority"] if eff == r["priority"] else f"{r['priority']}>{eff}"
+
+
+def format_list(
+    rows: list[sqlite3.Row], *, cfg: Config | None = None, now: datetime | None = None
+) -> str:
     if not rows:
         return "No Tasks."
     return _table(
@@ -38,7 +50,7 @@ def format_list(rows: list[sqlite3.Row]) -> str:
             [
                 r["id"],
                 r["state"],
-                r["priority"],
+                _priority_cell(r, cfg, now),
                 r["task_type"],
                 r["agent"],
                 _short_time(r["created_at"]),
@@ -56,9 +68,14 @@ SHOW_FIELDS = (
 ).split()
 
 
-def format_show(db: Database, row: sqlite3.Row) -> str:
+def format_show(
+    db: Database, row: sqlite3.Row, *, cfg: Config | None = None, now: datetime | None = None
+) -> str:
     out = [f"Task {row['id']}"]
-    width = max(len(f) for f in SHOW_FIELDS)
+    width = max(len(f) for f in [*SHOW_FIELDS, "effective_priority"])
+    ev = None
+    if cfg is not None and now is not None and TaskState(row["state"]) not in TERMINAL:
+        ev = priority.evaluate(cfg, row, now)
     for f in SHOW_FIELDS:
         value = row[f]
         if f in ("agent_override", "long", "approved"):
@@ -66,6 +83,10 @@ def format_show(db: Database, row: sqlite3.Row) -> str:
         if value is None:
             continue
         out.append(f"  {f.ljust(width)}  {value}")
+        if f == "priority" and ev is not None:
+            out.append(f"  {'effective_priority'.ljust(width)}  {ev.effective}")
+    if ev is not None and ev.blocked and row["state"] == str(TaskState.QUEUED):
+        out += ["", f"Waiting: {ev.blocked}"]
     out += ["", "Prompt:", *(f"  {line}" for line in row["prompt"].splitlines() or [""])]
 
     attempts = db.attempts(row["id"])
