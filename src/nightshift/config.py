@@ -237,6 +237,13 @@ class Config:
         entry = (self.data.get("task_types") or {}).get(task_type) or {}
         return int(entry.get("max_runtime_minutes") or self.default("max_runtime_minutes"))
 
+    def failover(self, task_type: str) -> tuple[list[str], str]:
+        """``task_types.<type>.failover``: the agents Tasks of this type may
+        run on, in order of preference, and when they fail over (``always``
+        or ``deadline``). No entry: ``([], "always")`` (never fails over)."""
+        entry = ((self.data.get("task_types") or {}).get(task_type) or {}).get("failover") or {}
+        return [str(a) for a in entry.get("agents") or []], str(entry.get("when", "always"))
+
     @property
     def max_retries(self) -> int:
         return int((self.data.get("retries") or {}).get("max_retries", 2))
@@ -295,6 +302,17 @@ def _validate(data: dict[str, Any]) -> None:
             raise ConfigError(f"task_types.{name}.internet must be 'on' or 'off'")
         if not isinstance((entry or {}).get("long", False), bool):
             raise ConfigError(f"task_types.{name}.long must be true or false")
+        fo = (entry or {}).get("failover")
+        if fo is not None:
+            if (not isinstance(fo, dict) or not isinstance(fo.get("agents"), list)
+                    or not all(isinstance(a, str) for a in fo["agents"])):
+                raise ConfigError(f"task_types.{name}.failover must be "
+                                  "{agents: [agent, ...], when: always|deadline}")
+            unknown = [a for a in fo["agents"] if a not in data["agents"]]
+            if unknown:
+                raise ConfigError(f"task_types.{name}.failover names unconfigured agents {unknown}")
+            if fo.get("when", "always") not in ("always", "deadline"):
+                raise ConfigError(f"task_types.{name}.failover.when must be always or deadline")
         cap = (entry or {}).get("max_runtime_minutes")
         if cap is not None and not _positive_int(cap):
             raise ConfigError(f"task_types.{name}.max_runtime_minutes must be a positive integer")

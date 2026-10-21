@@ -266,13 +266,33 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX tracker_merges_task ON tracker_merges(task_id, id);
     """,
+    # 8: Failovers (§2.7, §2.8): a Task moved from one agent to another.
+    """
+    -- One row per agent switch of a Task. trigger: usage_limit (the agent
+    -- hit a real limit), simulated (--simulate-rate-limit-after), reset (a
+    -- Task waiting for every agent resumed on the one that reset first),
+    -- retry (the second retry of a Failed Attempt). deadline_driven: only
+    -- allowed because the deadline is near (flagged in the report).
+    CREATE TABLE failovers (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id          TEXT NOT NULL REFERENCES tasks(id),
+        run_id           INTEGER REFERENCES runs(id),
+        at               TEXT NOT NULL,
+        from_agent       TEXT NOT NULL,
+        to_agent         TEXT NOT NULL,
+        trigger          TEXT NOT NULL,
+        deadline_driven  INTEGER NOT NULL DEFAULT 0,
+        reason           TEXT NOT NULL
+    );
+    CREATE INDEX failovers_task ON failovers(task_id, id);
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
 TRANSITION_FIELDS = frozenset({
     "retries_used", "retry_at", "cancel_requested_at", "approved", "approved_at",
     "simulated_limit_at", "pause_kind", "pause_limit_type", "pause_reset_at", "resume_at",
-    "resume_pending", "pause_requested_at",
+    "resume_pending", "pause_requested_at", "agent",
 })
 
 TASK_COLUMNS = (
@@ -751,4 +771,25 @@ class Database:
     def tracker_merges(self, task_id: str) -> list[sqlite3.Row]:
         """A Task's Tracker merges, oldest first."""
         return self.conn.execute("SELECT * FROM tracker_merges WHERE task_id = ? ORDER BY id",
+                                 (task_id,)).fetchall()
+
+    # -- Failovers (§2.7, §2.8) -------------------------------------------------
+    def record_failover(self, task_id: str, *, run_id: int | None, at: str, from_agent: str,
+                        to_agent: str, trigger: str, deadline_driven: bool, reason: str) -> int:
+        with self.tx() as c:
+            cur = c.execute(
+                "INSERT INTO failovers (task_id, run_id, at, from_agent, to_agent, trigger, "
+                "deadline_driven, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, run_id, at, from_agent, to_agent, trigger, int(deadline_driven), reason))
+            return int(cur.lastrowid)
+
+    def set_agent(self, task_id: str, agent: str, *, expect: TaskState) -> bool:
+        """Move a Task that stays in ``expect`` (e.g. queued) to another agent."""
+        with self.tx() as c:
+            return c.execute("UPDATE tasks SET agent = ? WHERE id = ? AND state = ?",
+                             (agent, task_id, str(expect))).rowcount == 1
+
+    def failovers(self, task_id: str) -> list[sqlite3.Row]:
+        """A Task's agent switches, oldest first."""
+        return self.conn.execute("SELECT * FROM failovers WHERE task_id = ? ORDER BY id",
                                  (task_id,)).fetchall()

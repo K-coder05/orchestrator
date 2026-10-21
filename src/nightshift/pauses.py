@@ -132,6 +132,15 @@ def held_agents(cfg: Config, db: Database, now: datetime) -> dict[str, str]:
         if parse_iso(row["resume_at"]) > now:
             until = min(row["resume_at"], held.get(row["agent"], "~"))
             held[row["agent"]] = f"{row['agent']} is out of usage until about {until}"
+    # A Task that failed over left no paused Task behind; the agent's
+    # Window status still says it is out (``usage.agent_out_until``).
+    from . import usage  # usage is imported lazily to keep start-up light
+
+    for agent in cfg.data.get("agents") or {}:
+        if agent not in held:
+            until = usage.agent_out_until(cfg, db, agent, now)
+            if until is not None:
+                held[agent] = f"{agent} is out of usage until about {iso(until)}"
     return held
 
 
@@ -190,6 +199,14 @@ def promote_due(cfg: Config, db: Database, now: datetime,
                 _log(cfg, row, now, reason)
                 out.reapproval.append(tid)
             elif row["resume_at"] and parse_iso(row["resume_at"]) <= now:
+                from . import failover  # failover imports this module
+
+                # Every agent was out: resume on whichever has reset (§2.8).
+                other = failover.agent_on_resume(cfg, db, row, now)
+                if other is not None:
+                    failover.resume_on(cfg, db, row, other[0], other[1], now, dict(_CLEAR_PAUSE))
+                    out.resumed.append(tid)
+                    continue
                 what = ("reset time" if row["pause_reset_at"] else "retry time")
                 reason = f"usage pause over ({what} {row['resume_at']}); queued to resume"
                 if (prober is not None and row["pause_kind"] == KIND_LIMIT
@@ -201,6 +218,12 @@ def promote_due(cfg: Config, db: Database, now: datetime,
                     if found.available:
                         reason = f"probe: {agent} answered, its usage Window has reset; queued to resume"
                     elif found.limit is not None:
+                        other = failover.agent_on_resume(cfg, db, row, now, still_out=True)
+                        if other is not None:
+                            failover.resume_on(cfg, db, row, other[0], other[1], now,
+                                               dict(_CLEAR_PAUSE))
+                            out.resumed.append(tid)
+                            continue
                         _still_out(cfg, db, row, found.limit, now)
                         out.still_out.append(tid)
                         continue

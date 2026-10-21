@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from . import failures, pauses, report, templates, usage
+from . import failover, failures, pauses, report, templates, usage
 from .adapters import get_adapter
 from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
 from .config import Config
@@ -338,9 +338,17 @@ def run_attempt(
     if resuming and not continue_fresh:
         choice = pauses.session_to_resume(cfg, db, row, clock())
     continuing = continue_fresh or resuming
+    earlier = db.attempts(task_id)
+    # The Task moved here from another agent (failover, §2.8): a fresh session
+    # that picks up the other agent's work from plan.md + progress.md.
+    switched_from = earlier[-1]["agent"] if earlier and earlier[-1]["agent"] != agent_name else None
+    if switched_from:
+        prompt = failover.failover_prompt(row["prompt"], switched_from, agent_name)
+    else:
+        prompt = pauses.fresh_prompt(row["prompt"]) if continuing else row["prompt"]
     task = TaskContext(
         id=task_id,
-        prompt=pauses.fresh_prompt(row["prompt"]) if continuing else row["prompt"],
+        prompt=prompt,
         task_type=row["task_type"],
         internet=row["internet"],
         protocol=agent_protocol(
@@ -357,7 +365,9 @@ def run_attempt(
     else:
         command = adapter.build_command(task, folder, permissions)
         how = None
-        if continuing:
+        if switched_from:
+            how = f"fresh session from plan.md + progress.md (failover from {switched_from})"
+        elif continuing:
             how = "fresh session from plan.md + progress.md" + (
                 f" ({choice.why})" if choice is not None else " (the resume failed)")
 
@@ -365,7 +375,7 @@ def run_attempt(
     stream_log = folder / "logs" / f"attempt-{attempt_no}.{agent_name}.jsonl"
     stderr_log = folder / "logs" / f"attempt-{attempt_no}.{agent_name}.stderr.log"
     # The protocol is long and identical every time; keep the stored command readable.
-    stored_argv = [redact(a) if a != task.protocol else "<agent protocol>" for a in command.argv]
+    stored_argv = [_stored_arg(a, task.protocol, redact) for a in command.argv]
     progress_before = _mtime(folder / "progress.md")
     run_id = db.start_attempt(task_id, agent_name, stored_argv, str(stream_log))
     started = f"Attempt {attempt_no} started on {agent_name}" + (f", {how}" if how else "")
@@ -522,9 +532,11 @@ def run_attempt(
                                          task_id=task_id, run_id=run_id)
             if obs is not None:
                 _log(folder, f"{iso(now(cfg.timezone))} recorded Limit observation {obs}", redact)
-        pauses.pause_after_attempt(cfg, db, task_id, kind=kind, limit=limit,
-                                   reason=end_reason, at=clock(), run_id=run_id)
-        return AttemptResult(run_id=run_id, state=TaskState.PAUSED_USAGE,
+        # Fail over to another agent of the Task type if one isn't out, else
+        # pause (§2.6, §2.8).
+        state = failover.after_usage_limit(cfg, db, task_id, kind=kind, limit=limit,
+                                           reason=end_reason, at=clock(), run_id=run_id)
+        return AttemptResult(run_id=run_id, state=state,
                              session_id=adapter.session_id(), exit_code=exit_code)
     db.clear_pause_request(task_id)
     if stop == STOP_DAEMON:
@@ -611,9 +623,22 @@ def run_attempt(
         usage_rows=db.usage_for_task(task_id),
         redact=redact,
         appendix=templates.report_appendix(cfg, row) if row["template"] else None,
+        needs_you=failover.needs_you_lines(db, task_id),
     )
     db.transition(task_id, state, end_reason, run_id=run_id)
     return AttemptResult(run_id=run_id, state=state, session_id=adapter.session_id(), exit_code=exit_code)
+
+
+def _stored_arg(arg: str, protocol: str, redact: Callable[[str], str]) -> str:
+    """One argv entry as stored: the long, identical-every-time protocol is
+    shown as ``<agent protocol>`` (also inside a ``key=<quoted protocol>``
+    config override)."""
+    if arg == protocol:
+        return "<agent protocol>"
+    quoted = json.dumps(protocol)
+    if quoted in arg:
+        arg = arg.replace(quoted, '"<agent protocol>"')
+    return redact(arg)
 
 
 def _mtime(path: Path) -> int | None:

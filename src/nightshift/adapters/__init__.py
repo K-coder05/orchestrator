@@ -8,11 +8,13 @@ from typing import Any
 
 from .base import AgentAdapter
 from .claude import ClaudeAdapter
+from .codex import CodexAdapter
 
 AdapterFactory = Callable[[dict[str, Any]], AgentAdapter]
 
 REGISTRY: dict[str, AdapterFactory] = {
     "claude": ClaudeAdapter,
+    "codex": CodexAdapter,
 }
 
 

@@ -190,8 +190,12 @@ def finalize(
     usage_rows: list,
     redact=lambda s: s,
     appendix: str | None = None,
+    needs_you: list[str] | None = None,
 ) -> str:
-    """Rewrite ``report.md`` from the agent's draft plus Nightshift's data."""
+    """Rewrite ``report.md`` from the agent's draft plus Nightshift's data.
+
+    ``needs_you`` are entries Nightshift itself adds to section 2 (e.g. a
+    deadline-driven failover); they lead the section."""
     path = folder / "report.md"
     draft = path.read_text() if path.exists() else ""
     head, sections = parse_sections(draft)
@@ -208,7 +212,11 @@ def finalize(
         verdict += f" {result_detail}"
     body[1] = verdict + (f"\n\nAgent: {agent_line}" if agent_line else "")
 
-    needs = _needs_you_text(folder)
+    needs = "\n".join([*(needs_you or []), *filter(None, [_needs_you_text(folder)])]) or None
+    if needs and not _is_empty(body[2]):
+        # A re-finalize must not add Nightshift's own entries twice.
+        kept = [ln for ln in body[2].splitlines() if ln not in (needs_you or []) and ln != "Nothing."]
+        body[2] = "\n".join(kept).strip()
     if needs:
         body[2] = needs if _is_empty(body[2]) else f"{needs}\n{body[2]}"
     elif _is_empty(body[2]):

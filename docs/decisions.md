@@ -993,3 +993,111 @@ lasting consequences go in `docs/adr/` instead.
   Not run for real: a lid-close sleep and wake (needs the user; covered by
   `tests/test_gate2.py` with `FakeHost(awake_clock=...)`), and the real
   6:30am time (the cron parser and DST handling are tested in #12).
+
+## Phase 1, issue #15: Codex adapter, coding failover and Acceptance Test 3
+
+- **Codex adapter built without Codex.** The CLI isn't installed on this
+  Mac and was not installed for this issue. `nightshift.adapters.codex`
+  implements the whole interface (`build_command`, `resume_command`,
+  `parse_stream`, `detect_rate_limit`, `usage_from_run`,
+  `write_permissions`, `planning_command`/`parse_planning_output`,
+  `probe_command`/`parse_probe_output`) from the Codex docs and the
+  openai/codex source (cited in docs/adapters.md, marked unverified, with
+  a "Verify once installed" checklist). Tests run it against
+  `tests/fixtures/fake_codex.py`, which replays a stream **constructed**
+  from the source's event types.
+- **All settings as `-c` overrides, user config ignored.** Pointing
+  `CODEX_HOME` at a per-Task dir would lose the ChatGPT sign-in, and
+  `--profile` only reads from `CODEX_HOME`; `--ignore-user-config` keeps
+  auth but drops the user's config, so the policy is passed entirely as
+  `-c key=<inline TOML>`. An audit copy goes to
+  `data/permissions/<id>/codex-config.toml` (Codex doesn't read it).
+- **A permission profile, not `--sandbox`.** `workspace-write` confines
+  writes but leaves the whole disk readable; the (beta) permission
+  profiles can `deny` paths, so the PermissionPolicy maps one to one:
+  `:root` read, home and `agents_root` deny, workspace write, read-only and
+  tool dirs read, no-access dirs deny, network off. `--strict-config`
+  makes a renamed key fail the Attempt instead of dropping a limit. No
+  `--add-dir` (in Codex it means *writable*). The Bash deny-list has no
+  per-run Codex equivalent (execpolicy rules are files) and is a
+  documented gap; the network block is what matters.
+- **Codex reports no cost.** Usage rows get tokens, cost NULL, so Codex
+  Baselines can't form yet (thresholds are Phase 2 anyway). Codex's limit
+  messages don't name a Window: a hit counts as its shortest configured
+  Window (`usage.windows.codex`, assumed 5h + weekly like Claude).
+- **Failover is per Task type, in config.** `task_types.<type>.failover:
+  {agents: [...], when: always|deadline}` lists the agents a type may run
+  on, in order of preference; only `coding: [claude, codex], always` is
+  set (Phase 1 does only coding failover). The core names no agent. A Task
+  created with `--agent` never moves (an explicit choice). Every switch
+  is a `failovers` row (migration 8: from/to agent, trigger, deadline-
+  driven, reason), a transition reason, a `nightshift.log` line, the
+  Task's `agent` column and `task.yaml` `agent` field; `orch show` lists
+  them. `agent` joined `TRANSITION_FIELDS`.
+- **When an agent is out** (`usage.agent_out_until`): its Window status
+  is `rejected` (set by every real limit hit, Attempt or probe) with a
+  reset still ahead; a hit with no reset holds it for one probe interval;
+  a probe that goes through clears it. Simulated limits never mark an
+  agent out. `pauses.held_agents` now also holds agents that are out this
+  way (a Task that failed over leaves no paused Task to hold Claude), and
+  the daemon moves queued failover-capable Tasks off a held agent before
+  each pick (`failover.reassign_held`), so they don't wait for a reset.
+- **Limit hit -> failover.** `run_attempt` now ends a limit Attempt
+  through `failover.after_usage_limit`: with an agent of the type free, the
+  Task goes `running -> queued` on it at once (`resume_pending` set, no
+  retry budget charged; a simulated limit counts, which is what Acceptance
+  Test 3 uses). The next Attempt sees the last Attempt ran on another
+  agent and starts a **fresh session** with the prompt plus a takeover note
+  ("read `plan.md` and `progress.md` first"). `orch pause` never fails over.
+- **Both out.** The Task pauses on its own agent (`paused_usage`), but
+  `resume_at` becomes the earliest known reset of any of its agents.
+  `pauses.promote_due` then asks `failover.agent_on_resume`: if the Task's
+  own agent is still out and another has reset, it is requeued on that one
+  (trigger `reset`); otherwise the normal path (resume the same session).
+  A probe that finds the Task's agent still out also checks the others.
+- **Retry with switch.** In `failures.after_failed_attempt`, retry 2 (the
+  second retry) moves the Task to the next agent of its type that isn't
+  out; retry 1 never switches, nor do types without `failover`.
+- **Deadline-driven failovers.** With `when: deadline` a type fails over
+  only while its deadline is within `queue.deadline_urgent_hours` (24).
+  Such failovers are flagged: `report.finalize(needs_you=...)` puts
+  "Deadline-driven failover: ... moved from X to Y because its deadline was
+  near. Review the result more carefully." first in section 2 (not
+  duplicated on re-finalize). No Phase 1 type uses `deadline` (the
+  resume-tailoring row of §2.8 needs Phase 2's Gemini/other targets);
+  tests configure it on `resume` to exercise the flag. A coding failover
+  (`always`) is not deadline-driven, even for a Task with a deadline.
+- **Acceptance Test 3, Claude side for real (2026-10-21).** Scratch config
+  (`scratchpad/real15/config`, haiku, `agents.codex.binary` = a wrapper
+  around the fake Codex). `orch add "Coding task in three parts ..."
+  --type coding --priority urgent --yes --simulate-rate-limit-after 3`
+  (urgent so the long-Task window doesn't hold it at 10am), then `orch
+  daemon run --exit-when-idle`: real Claude wrote `output/fizzbuzz.py`,
+  checkpointed it in `progress.md` ("progress.md was updated during this
+  Attempt"), was stopped after its 3rd Step (exit 143), the Task went
+  `running -> queued` on codex ("failing over from claude to codex"), and
+  the Codex Attempt started at once with a fresh session whose prompt had
+  the takeover note; it saw Claude's `progress.md`, kept Claude's file and
+  ended `done`. Report section 8 lists both agents. Three such runs, about
+  10s and well under $0.01 each; no processes left. The Codex side was
+  the fake: **AT3 on real Codex is not done.**
+- **To finish AT3 on the real CLIs** (after installing Codex and `codex
+  login`; first the "Verify once installed" list in docs/adapters.md):
+  1. Use a scratch config, e.g. `paths.agents_root: /tmp/at3/agents`,
+     `agents.claude.model: haiku`, and leave `agents.codex.binary: codex`.
+  2. `export NIGHTSHIFT_CONFIG_DIR=<that dir> PYTHONPATH=<repo>/src`
+  3. `orch add "Coding task in three parts. Part 1: write
+     output/fizzbuzz.py (FizzBuzz 1..30) with Write, then immediately record
+     it in progress.md with Edit. Part 2: write output/test_fizzbuzz.py with
+     asserts, then record it in progress.md. Part 3: write output/README.md,
+     then record it in progress.md. Don't run any commands." --type coding
+     --priority urgent --yes --simulate-rate-limit-after 3`
+  4. `orch daemon run --exit-when-idle`
+  5. `orch show <id>`: passes if Attempt 1 is claude `paused` after 3
+     Steps, Failovers shows `claude -> codex (simulated)`, Attempt 2 is
+     codex `completed` with no `resume` in its command (`orch logs <id>`),
+     the Task is `done`, all three files exist in `output/`, `progress.md`
+     has Claude's Part 1 entry and Codex's later ones, and `report.md`
+     section 8 lists both agents.
+  6. If Codex fails to start or rejects a setting, `logs/attempt-2.codex.
+     stderr.log` says why; fix the adapter per docs/adapters.md.

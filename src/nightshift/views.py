@@ -140,6 +140,14 @@ def format_show(
         for a in approvals:
             out.append(f"  {_short_time(a['at'])}  {a['decision']} via {a['via']}")
 
+    switches = db.failovers(row["id"])
+    if switches:
+        out += ["", "Failovers:"]
+        for f in switches:
+            out.append(f"  {_short_time(f['at'])}  {f['from_agent']} -> {f['to_agent']} "
+                       f"({f['trigger']}" + (", deadline-driven" if f["deadline_driven"] else "")
+                       + ")")
+
     out += ["", "History:"]
     for t in db.transitions(row["id"]):
         frm = t["from_state"] or "(new)"

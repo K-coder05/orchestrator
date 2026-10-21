@@ -41,6 +41,17 @@ agents:
     # null uses `model`.
     planning_model: haiku
     extra_args: []
+  # Codex CLI (`codex exec`): takes over coding Tasks when Claude is out of
+  # usage (§2.8). Signed in with the ChatGPT plan (`codex login`).
+  codex:
+    binary: codex
+    # null uses the CLI's own default model.
+    model: null
+    # Model for planning calls when planning.agent is codex; null uses `model`.
+    planning_model: null
+    # Extra flags for `codex exec`. Flags that change the sandbox, approvals
+    # or config (-c, --sandbox, --add-dir, --profile, ...) are refused.
+    extra_args: []
 
 defaults:
   agent: claude
@@ -82,6 +93,9 @@ usage:
   # Claude: a rolling 5-hour Window plus a weekly cap.
   windows:
     claude: {five_hour: 5, seven_day: 168}
+    # Codex (ChatGPT plan): a 5-hour Window plus a weekly cap. Its limit
+    # messages don't name the Window, so a hit counts as the shortest one.
+    codex: {five_hour: 5, seven_day: 168}
 
 planning:
   # Free-form `orch add` asks an agent for an estimate and a Task type (§2.4).
@@ -158,8 +172,19 @@ task_types:
   # (§2.3). Omitted means false.
   # max_runtime_minutes: this type's runtime cap; omitted means
   # defaults.max_runtime_minutes. Coding runs overnight, so it gets 6 hours.
+  # failover: the agents this type may run on, in order of preference
+  # (§2.8). When the Task's agent is out of usage the Task moves to the first
+  # other one that isn't; if all are out it waits and resumes on whichever
+  # resets first. The second retry of a Failed Attempt may also switch
+  # (§2.7). `when: deadline` fails over only when the deadline is within
+  # queue.deadline_urgent_hours, and flags it in the report's Needs you.
+  # Phase 1 fails over coding Tasks only. A Task with --agent never moves.
   general: {internet: "off"}
-  coding: {internet: "off", long: true, max_runtime_minutes: 360}
+  coding:
+    internet: "off"
+    long: true
+    max_runtime_minutes: 360
+    failover: {agents: [claude, codex], when: always}
   comedy: {internet: "off"}
   research: {internet: "on", long: true}
   scraping: {internet: "on"}

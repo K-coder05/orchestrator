@@ -56,8 +56,17 @@ def finalize(cfg: Config, db: Database, row: Mapping[str, Any], state: TaskState
             usage_rows=db.usage_for_task(row["id"]),
             redact=cfg.secrets.redact,
             appendix=_appendix(cfg, row),
+            needs_you=needs_you_extra(db, row["id"]),
         )
         log_line(folder, f"{iso(at)} {reason}", cfg.secrets.redact)
+
+
+def needs_you_extra(db: Database, task_id: str) -> list[str]:
+    """Needs you entries Nightshift adds to the report itself (deadline-driven
+    failovers, §2.8)."""
+    from . import failover  # failover imports this module
+
+    return failover.needs_you_lines(db, task_id)
 
 
 def _appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
@@ -140,11 +149,22 @@ def after_failed_attempt(
         n = used + 1
         wait = retry_wait(cfg, n)
         retry_at = iso(at + wait)
-        why = (f"{reason}; retry {n} of {budget} on {row['agent']} "
+        from . import failover  # failover imports this module
+
+        # The second retry may switch to another agent of the Task type (§2.7).
+        switch = failover.retry_agent(cfg, db, row, n, at)
+        agent = switch[0] if switch else row["agent"]
+        why = (f"{reason}; retry {n} of {budget} on {agent} "
                f"after {wait.total_seconds() / 60:g} min, at {retry_at}")
-        db.transition(task_id, TaskState.RETRY_WAIT, why, run_id=run_id,
-                      set_fields={"retries_used": n, "retry_at": retry_at})
-        log_line(Path(row["folder"]), f"{iso(at)} {why}", cfg.secrets.redact)
+        fields = {"retries_used": n, "retry_at": retry_at}
+        if switch:
+            why += (f"; switching from {row['agent']} to {agent} for this retry "
+                    "(fresh session from plan.md + progress.md)")
+            failover.record_retry_switch(cfg, db, row, agent, switch[1], at=at, run_id=run_id,
+                                         reason=why, set_fields=fields)
+        else:
+            db.transition(task_id, TaskState.RETRY_WAIT, why, run_id=run_id, set_fields=fields)
+            log_line(Path(row["folder"]), f"{iso(at)} {why}", cfg.secrets.redact)
         return FailureOutcome(TaskState.RETRY_WAIT, why, n, retry_at)
     why = (f"{reason}; no retries left ({used} of {budget} used)" if budget
            else f"{reason}; retries are off")

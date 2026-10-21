@@ -2,7 +2,10 @@
 
 All agents sit behind `nightshift.adapters.base.AgentAdapter` (§2.9):
 `build_command`, `parse_stream`, `detect_rate_limit`, `session_id`,
-`resume_command`, `usage_from_run`, `write_permissions`. One adapter instance
+`resume_command`, `usage_from_run`, `write_permissions`, plus
+`planning_command`/`parse_planning_output` and
+`probe_command`/`parse_probe_output`. Registered: `claude` (verified) and
+`codex` (built from docs and source, **not yet verified**). One adapter instance
 is created per Attempt, so `session_id()` and `usage_from_run()` report what
 that Attempt's stream contained. Adapters are looked up by name in
 `nightshift.adapters.REGISTRY`; core code never names an agent.
@@ -332,3 +335,193 @@ probes), never from interactive use of the same plan (the Claude app,
 - the plan-wide `utilization` in `rate_limit_event` does include
   interactive use; `orch usage` shows it next to Nightshift's own numbers,
   but Baselines don't use it (yet).
+
+## Codex CLI
+
+> **NOT YET VERIFIED AGAINST A LOCAL CODEX INSTALL.** The Codex CLI is not
+> installed on this Mac (and was deliberately not installed while building
+> this). Everything below comes from the Codex docs and the openai/codex
+> source on GitHub (branch `main`, read 2026-10-21), not from `codex --help`
+> or a real run. SPEC.md says to trust the installed tool: when `codex` is
+> installed, run the checks under "Verify once installed" and fix this
+> section and `nightshift/adapters/codex.py` to match.
+
+Sources used:
+
+- Non-interactive mode docs: <https://learn.chatgpt.com/docs/non-interactive-mode>
+  (was developers.openai.com/codex/noninteractive): `codex exec`, `--json`,
+  `-` for a stdin prompt, `--ephemeral`, `--skip-git-repo-check`,
+  `--output-schema`, `-o`, `codex exec resume <SESSION_ID>`, the default
+  read-only sandbox, `--full-auto` no longer supported, the event list and
+  sample lines.
+- Config reference: <https://learn.chatgpt.com/docs/config-file/config-reference.md>
+  (`approval_policy`, `sandbox_mode`, `default_permissions`,
+  `permissions.<name>.filesystem|network`, `web_search`, `features.*`,
+  `shell_environment_policy.*`, `developer_instructions`,
+  `history.persistence`, `check_for_update_on_startup`).
+- Permission profiles (beta): <https://learn.chatgpt.com/docs/permissions.md>
+  (`read`/`write`/`deny`, `deny` wins on the same path, more specific
+  paths win, tokens `:root`, `:minimal`, `:workspace_roots`, `:tmpdir`,
+  `:slash_tmp`; `[permissions.<name>.network] enabled`; domain rules only
+  through the network proxy).
+- Source: `codex-rs/exec/src/cli.rs` (exec flags, `resume` args),
+  `codex-rs/utils/cli/src/shared_options.rs` (`-m`, `-s/--sandbox`,
+  `--add-dir` = extra **writable** dirs, `--yolo`, `--approve-for-me`,
+  `-C`, `-p/--profile`), `codex-rs/utils/cli/src/config_override.rs`
+  (`-c key=value`, value parsed as TOML, **falls back to a raw string if
+  it doesn't parse**), `codex-rs/exec/src/exec_events.rs` and
+  `event_processor_with_jsonl_output.rs` (the `--json` events),
+  `codex-rs/exec/src/lib.rs` (exec defaults to `approval_policy = never`),
+  `codex-rs/protocol/src/error.rs` (usage-limit messages).
+
+### Invocation Nightshift uses
+
+```
+codex exec --json --skip-git-repo-check --ignore-user-config --ignore-rules --strict-config \
+  [-m <agents.codex.model>] \
+  -c approval_policy="never" \
+  -c default_permissions="nightshift" \
+  -c 'permissions.nightshift.filesystem={":root" = "read", ":minimal" = "read",
+        "<home>" = "deny", "<agents_root>" = "deny", "<tool dirs>" = "read",
+        "<read-only dirs>" = "read", "<no-access dirs>" = "deny",
+        ":workspace_roots" = {"." = "write"}, "<task folder>" = "write"}' \
+  -c 'permissions.nightshift.network={"enabled" = false}' \
+  -c web_search="disabled"            # "live" on internet-on Tasks
+  -c features.hooks=false -c check_for_update_on_startup=false \
+  -c history.persistence="none" \
+  -c shell_environment_policy.inherit="core" \
+  -c shell_environment_policy.ignore_default_excludes=false \
+  -c 'shell_environment_policy.set={"TMPDIR" = "<task folder>/.tmp"}' \
+  -c developer_instructions="<agent protocol §2.10>" \
+  -                                    # prompt on stdin, cwd = Task folder
+# resume: the same flags, then: resume <thread_id> -
+```
+
+- Every setting goes in as a `-c` override; `--ignore-user-config` keeps
+  `~/.codex/config.toml` (its MCP servers, sandbox and approval settings,
+  hooks) out, while auth still comes from `CODEX_HOME` (`codex login` with
+  the ChatGPT plan). `--ignore-rules` keeps user/project execpolicy
+  `.rules` files out (an `allow` rule there could run a command outside
+  the sandbox). `write_permissions` also writes the same settings to
+  `<agents_root>/data/permissions/<task-id>/codex-config.toml` as an audit
+  copy; Codex never reads that file.
+- `-c` values are serialized as inline TOML (`toml_value`; tested to parse
+  back with `tomllib`). Because Codex treats an unparseable value as a raw
+  string, a quoting bug would be silent; the tests pin the shape.
+- `--strict-config` makes Codex fail on config fields it doesn't know (a
+  renamed key fails the Attempt instead of silently dropping a limit).
+- The prompt goes on stdin with `-`; the agent protocol goes in
+  `developer_instructions` (stored commands show it as `<agent protocol>`).
+- No `--sandbox`: the custom permission profile replaces it (the docs say
+  `sandbox_mode` and `default_permissions` must not be combined). No
+  `--add-dir`: it adds **writable** dirs; read-only dirs are `read`
+  entries in the profile instead. No `--ephemeral` on Attempts (they must
+  be resumable); planning calls and probes use it.
+- Session id = the `thread_id` of `thread.started`. Resume:
+  `codex exec ... resume <thread_id> -` (the exec flags are `global`, so
+  they may precede the subcommand). A resume that fails before any Step
+  falls back to a fresh session as for Claude.
+- `agents.codex.extra_args` may not contain `-c/--config`, `--sandbox`,
+  `--yolo`, `--dangerously-bypass-*`, `--approve-for-me`, `--full-auto`,
+  `--add-dir`, `--profile`, `--cd`, `--worktree`, `--oss`, `-a`.
+
+### `--json` events (from `exec_events.rs`)
+
+| Event | Fields | Normalized to |
+|---|---|---|
+| `thread.started` | `thread_id` | `session` |
+| `turn.started` | - | `other` |
+| `item.started` / `item.updated` / `item.completed` | `item: {id, type, ...}` | see items |
+| `turn.completed` | `usage: {input_tokens, cached_input_tokens, cache_write_input_tokens (default 0), output_tokens, reasoning_output_tokens}` | `usage`, `result` |
+| `turn.failed` | `error: {message}` | `error`, `result` (is_error) |
+| `error` | `message` | `error` (not if it starts with "Reconnecting"/"Retrying": `other`) |
+
+Items (`type`, snake_case): `command_execution` (`command`,
+`aggregated_output`, `exit_code`, `status` in_progress/completed/failed/declined),
+`file_change` (`changes: [{path, kind add|delete|update}]`, `status`),
+`mcp_tool_call`, `collab_tool_call`, `web_search` (`query`, `action`) -
+each is **one Step**: `tool_call` (id = item id) on the first
+`item.started`/`item.completed` seen, `tool_result` (`tool_use_id`,
+`is_error` for failed/declined) on `item.completed`; a completed
+`file_change` adds a `file_change` event per path. `agent_message` ->
+`text` (the last one is the final answer); `reasoning`, `todo_list` ->
+`other`; `error` items are warnings (config/deprecation notices) -> `other`.
+
+Recorded sample: none (no CLI). `tests/fixtures/codex_stream.jsonl` is
+**constructed** from the source types, and `tests/fixtures/fake_codex.py`
+replays it.
+
+### Usage mapping
+
+From the last `turn.completed`: input = `input_tokens - cached_input_tokens`
+(OpenAI counts cached tokens inside input), cache read =
+`cached_input_tokens`, cache write = `cache_write_input_tokens`, output =
+`output_tokens` (includes reasoning tokens), requests = turns seen, the raw
+object stored. **Codex reports no cost**, so `cost_usd` is NULL: Codex
+Limit observations get no cost and Baselines (cost-equivalent, §1.5) can't
+form for Codex yet; tokens are recorded. Per the source, `turn.completed`
+carries the *thread* total, so a resumed Codex session may report the
+earlier Attempt's tokens again (unverified). An Attempt stopped before
+`turn.completed` records no usage.
+
+### Rate limits (from `codex-rs/protocol/src/error.rs`)
+
+A usage-limit hit is an `error` event and/or `turn.failed` whose message is
+`UsageLimitReachedError`'s text, e.g.:
+
+- `You’ve hit your usage limit. Try again at 3:20 PM.` (reset today, Mac local time)
+- `You’ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Apr 30th, 2026 11:21 AM.` (another day)
+- `... To get more access now, send a request to your admin or try again at ...` (Team/Business plans)
+- `... Try again later.` / `... or try again later.` (no reset known)
+- older CLIs (forum reports): `Try again in 1 day 23 hours 37 minutes.`
+
+plus `Quota exceeded. Check your plan and billing details.`, workspace
+"out of credits" / "spend cap" messages and `exceeded retry limit, last
+status: 429 Too Many Requests`. `detect_rate_limit` treats an agent error
+(never a tool's output) matching usage limit / quota exceeded / rate limit
+exceeded / 429 / too many requests / out of credits / spend cap as a hit
+and reads the reset from "try again at|in ..." (note the curly `’`). The
+message never names the Window, so the hit counts as Codex's shortest
+configured Window (`usage.windows.codex`: `five_hour: 5`, `seven_day:
+168`, assumed like Claude's). No reset -> Nightshift probes.
+
+### Planning calls and probes
+
+```
+codex exec --json --skip-git-repo-check --ignore-user-config --ignore-rules --strict-config \
+  --ephemeral [-m <model>] -c approval_policy="never" -c default_permissions=":read-only" \
+  -c features.shell_tool=false -c features.hooks=false -c web_search="disabled" \
+  -c check_for_update_on_startup=false -c history.persistence="none" \
+  -c developer_instructions="<system>" [--output-schema <tmp schema.json>] -
+```
+
+The planning answer is the last `agent_message`, parsed as JSON; the
+schema is made strict (every property required, `additionalProperties:
+false`) for OpenAI structured outputs. The probe asks "OK?" with "Answer
+with the single word OK."; a `turn.completed` -> available, a limit message
+-> still out.
+
+### Verify once installed
+
+Run these (cheap) on the Mac after `codex login`, and update this section,
+`docs/safety.md` and the adapter with what really happens:
+
+1. `codex --version`, `codex exec --help`, `codex exec resume --help`:
+   every flag above exists (`--json`, `--skip-git-repo-check`,
+   `--ignore-user-config`, `--ignore-rules`, `--strict-config`,
+   `--ephemeral`, `--output-schema`, `-m`, `-c`).
+2. `mkdir -p /tmp/cx && cd /tmp/cx && echo 'Say hi' | codex exec --json --skip-git-repo-check -`:
+   record the JSONL lines as `tests/fixtures/codex_stream.jsonl`
+   (scrub paths) and check the event/field names.
+3. The permission profile: copy the argv from a Task's
+   `logs/nightshift.log` ("Attempt N started on codex") and run it in a
+   scratch Task folder with prompts that try to `cat ~/.ssh/known_hosts`,
+   write outside the folder, `ls ~/Documents`, `curl https://example.com`:
+   each must fail. If `default_permissions`/`permissions.*` is rejected
+   (beta), fall back to `-c sandbox_mode="workspace-write"
+   -c sandbox_workspace_write.network_access=false` and record that reads
+   are then **not** confined (see docs/safety.md).
+4. `codex exec ... resume <thread_id> -` continues the same thread.
+5. A real usage-limit message, when one happens: save the stream and
+   compare with the formats above.
+6. Then run Acceptance Test 3 on the real CLIs (docs/decisions.md, #15).

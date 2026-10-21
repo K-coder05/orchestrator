@@ -27,7 +27,7 @@ from typing import IO, Any
 
 import nightshift
 
-from . import failures, pauses, schedules, usage
+from . import failover, failures, pauses, schedules, usage
 from .adapters import get_adapter
 from .config import Config
 from .db import Database
@@ -306,6 +306,10 @@ class QueueRunner:
         # Effective priority and time windows are re-evaluated on every pick;
         # an agent out of usage starts nothing until its reset.
         held = pauses.held_agents(self.cfg, self.db, self.clock())
+        if held:
+            # Tasks waiting on an agent that is out move to one that isn't (§2.8).
+            for tid, src, dst in failover.reassign_held(self.cfg, self.db, held, self.clock()):
+                self.log(f"Task {tid}: {src} is out of usage; failed over to {dst}")
         row = pick_next(self.cfg, self.db.tasks_in_state(TaskState.QUEUED), self.clock(),
                         held_agents=held)
         if row is None:

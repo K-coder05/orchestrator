@@ -119,6 +119,28 @@ def record_windows(db: Database, agent: str, infos: Iterable[WindowInfo], at: da
                              status=w.status, seen_at=iso(at))
 
 
+def agent_out_until(cfg: Config, db: Database, agent: str, at: datetime) -> datetime | None:
+    """Until when ``agent`` is known to be out of usage at ``at``, or None.
+
+    From the Window status its last limit hit (Attempt or probe) left: a
+    ``rejected`` Window with a reset still ahead is out until that reset; one
+    whose hit gave no reset time is out until the next probe interval after
+    the hit (a probe that went through since clears it). Simulated limits
+    leave no Window status, so they never make an agent out."""
+    out: datetime | None = None
+    probe_gap = timedelta(minutes=cfg.usage("probe_interval_minutes"))
+    for st in db.window_status(agent).values():
+        if st["status"] != "rejected":
+            continue
+        seen = parse_iso(st["seen_at"])
+        reset = parse_iso(st["resets_at"]) if st["resets_at"] else None
+        if reset is None or reset <= seen:  # no (or only a stale) reset time
+            reset = seen + probe_gap
+        if reset > at and (out is None or reset > out):
+            out = reset
+    return out
+
+
 # --------------------------------------------------------------------------
 # Limit observations and Baselines
 # --------------------------------------------------------------------------
@@ -249,6 +271,11 @@ def probe(
     record_windows(db, agent, reply.windows, at)
     if reply.available:
         outcome, detail = "available", None
+        # The request went through: no Window of the agent is out any more.
+        for name, st in db.window_status(agent).items():
+            if st["status"] == "rejected":
+                db.set_window_status(agent, name, resets_at=None, utilization=None,
+                                     status="available", seen_at=iso(at))
     elif reply.limit is not None:
         outcome, detail = "limited", reply.limit.limit_type
         record_limit_hit(cfg, db, agent, reply.limit, at=at, source="probe")

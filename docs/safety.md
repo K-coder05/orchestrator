@@ -46,6 +46,40 @@ Nightshift runs `claude -p` in the Task folder with:
   widen it (`--dangerously-skip-permissions`, `bypassPermissions`,
   `--settings`, `--add-dir`, `--tools`, `--permission-mode`, ...).
 
+## How Codex Tasks are confined (coding failover)
+
+> **Not yet verified against a local Codex install** (the CLI isn't
+> installed on this Mac). Every "enforced" below is what the Codex docs
+> and source say the setting does; none has been tried for real. Run the
+> checks in docs/adapters.md "Verify once installed" before trusting it.
+
+Codex runs a coding Task only after a failover from Claude (§2.8). It gets
+the same `PermissionPolicy`, mapped by `CodexAdapter.write_permissions` to
+`codex exec` `-c` overrides (exact argv in docs/adapters.md):
+
+| Limit | Status | How |
+|---|---|---|
+| No blanket skip-permissions | **Enforced by Nightshift** | Never `--yolo` / `--dangerously-bypass-approvals-and-sandbox` / `danger-full-access`; the adapter refuses to build a command without a policy, and refuses `agents.codex.extra_args` with `-c`, `--sandbox`, `--add-dir`, `--profile`, `--approve-for-me`, ... |
+| Approvals | **Technically enforced** (unverified) | `approval_policy = "never"`: nothing can ask; a command the sandbox blocks fails and the model is told so. |
+| Your Codex config, rules and hooks don't apply | **Technically enforced** (unverified) | `--ignore-user-config` (no `~/.codex/config.toml`: no MCP servers, no sandbox/approval overrides), `--ignore-rules` (no execpolicy allow rules), `features.hooks = false`. |
+| Writes only in the Task folder | **Technically enforced** (unverified) | Permission profile `nightshift`: the Task folder (and its workspace root) `write`, nothing else writable; `TMPDIR` points into the Task folder (`.tmp/`). |
+| Read-only folders readable, never written | **Technically enforced** (unverified) | `read` entries in the profile. |
+| `~/agents/data/`, `~/.ssh`, `~/.config/nightshift`, Keychains, browser profiles inaccessible | **Technically enforced** (unverified) | `deny` entries (deny wins over read/write on the same path). |
+| Everything else in your home folder and `~/agents/` unreadable | **Technically enforced** (unverified) | Home and `agents_root` `deny`; the Task folder, read-only folders and `permissions.tool_dirs` are more specific `read`/`write` entries, which win. |
+| Files outside home (`/usr`, `/opt/homebrew`, `/Volumes`) | **Readable** (gap, same as Claude) | `":root" = "read"`; denying `/` would break every tool. |
+| No network from shell commands | **Technically enforced** (unverified) | `permissions.nightshift.network.enabled = false`. |
+| Internet-off Tasks have no web access | **Technically enforced** (unverified) | `web_search = "disabled"`; Codex has no page-fetch tool. |
+| Web search on internet-on Tasks avoids LinkedIn | **Gap** | `web_search = "live"`; Codex's search can't deny domains (only allow-list them), so the LinkedIn rule is instruction-only there. Coding Tasks are internet-off by default. |
+| Bash network-command deny-list (`curl`, `wget`, ...) | **Not mapped** (gap) | Codex's equivalent is execpolicy `.rules` files, which can't be passed per run without trusting a file the agent could edit; `--ignore-rules` is used instead. The network block above is what stops traffic. |
+| Secrets in the environment | **Best effort** (unverified) | `shell_environment_policy.inherit = "core"` with the default `KEY`/`SECRET`/`TOKEN` excludes on. |
+| A config file the agent writes in the Task folder (`.codex/config.toml`, `AGENTS.md`) | **Gap** (unverified) | Codex reads project config only for trusted projects (trust lives in the ignored user config), but `AGENTS.md` in the folder is read as instructions. It can't widen the `-c` policy, which wins over project files. |
+| Settings typos | **Mitigated** | `--strict-config` fails on unknown fields; a `-c` value that isn't valid TOML becomes a plain string silently, so the generated values are pinned by tests. |
+| Permission profiles are beta | **Gap (future)** | If Codex drops or renames `default_permissions`/`permissions.*`, `--strict-config` should fail the Attempt rather than run unconfined; the fallback is `sandbox_mode = "workspace-write"` with network off, which does **not** confine reads. |
+
+Planning calls and probes on Codex use `--ephemeral`, the built-in
+`:read-only` profile, `features.shell_tool = false` (no shell tool),
+`web_search = "disabled"` and no hooks.
+
 ## Planning calls
 
 Free-form `orch add` makes up to two quick planning calls (estimate, plan)
@@ -179,5 +213,6 @@ dedupes and appends them (`nightshift.tracker`).
   widen permissions, but it does add instructions.
 - **Bash can read outside your home folder** (see the table). Nothing private
   should live there; external volumes under `/Volumes` would be readable.
-- **Only Claude is covered.** Each new adapter (Codex, Gemini) must map the
-  same `PermissionPolicy` and update this file with its own verified status.
+- **Codex is mapped but unverified.** The Codex rows above come from its
+  docs and source; re-check them on a real install. Each new adapter
+  (Gemini) must map the same `PermissionPolicy` and add its own rows.
