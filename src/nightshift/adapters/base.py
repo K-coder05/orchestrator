@@ -17,6 +17,7 @@ from typing import Any
 class EventKind(StrEnum):
     TEXT = "text"
     TOOL_CALL = "tool_call"  # one Step
+    TOOL_RESULT = "tool_result"  # a Step finished (data: tool_use_id, is_error)
     FILE_CHANGE = "file_change"
     USAGE = "usage"
     ERROR = "error"

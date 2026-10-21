@@ -134,15 +134,38 @@ MIGRATIONS: list[str] = [
     -- Set by `orch cancel` for a running Task; the daemon stops the Attempt.
     ALTER TABLE tasks ADD COLUMN cancel_requested_at TEXT;
     """,
+    # 4: usage pauses, resume and fault injection (§2.6, §3.1 item 15).
+    """
+    -- orch add --simulate-rate-limit-after N: a limit is simulated once, after
+    -- N Steps of an Attempt; simulated_limit_at records that it fired.
+    ALTER TABLE tasks ADD COLUMN simulate_rate_limit_after INTEGER;
+    ALTER TABLE tasks ADD COLUMN simulated_limit_at TEXT;
+    -- Why a paused_usage Task is paused: usage_limit, simulated or by_hand.
+    ALTER TABLE tasks ADD COLUMN pause_kind TEXT;
+    -- The agent's limit type (e.g. five_hour) and reported reset time, if any.
+    ALTER TABLE tasks ADD COLUMN pause_limit_type TEXT;
+    ALTER TABLE tasks ADD COLUMN pause_reset_at TEXT;
+    -- When the daemon puts a paused Task back in the queue (NULL: only by hand).
+    ALTER TABLE tasks ADD COLUMN resume_at TEXT;
+    -- The next Attempt continues paused work: same session if it can.
+    ALTER TABLE tasks ADD COLUMN resume_pending INTEGER NOT NULL DEFAULT 0;
+    -- Set by `orch pause` for a running Task; the daemon pauses it after the
+    -- current Step.
+    ALTER TABLE tasks ADD COLUMN pause_requested_at TEXT;
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
-TRANSITION_FIELDS = frozenset({"retries_used", "retry_at", "cancel_requested_at"})
+TRANSITION_FIELDS = frozenset({
+    "retries_used", "retry_at", "cancel_requested_at", "approved", "approved_at",
+    "simulated_limit_at", "pause_kind", "pause_limit_type", "pause_reset_at", "resume_at",
+    "resume_pending", "pause_requested_at",
+})
 
 TASK_COLUMNS = (
     "id title slug prompt template task_type agent agent_override priority deadline run_at "
     "internet long estimated_minutes max_runtime_minutes approved approved_at schedule_name "
-    "created_at folder"
+    "created_at folder simulate_rate_limit_after"
 ).split()
 
 
@@ -291,6 +314,19 @@ class Database:
                 "WHERE id = ?",
                 (self._now(), task_id),
             )
+
+    def request_pause(self, task_id: str) -> None:
+        """Ask the daemon to pause a running Task after its current Step."""
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET pause_requested_at = COALESCE(pause_requested_at, ?) "
+                "WHERE id = ?",
+                (self._now(), task_id),
+            )
+
+    def clear_pause_request(self, task_id: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE tasks SET pause_requested_at = NULL WHERE id = ?", (task_id,))
 
     def cancel_requested(self, task_id: str) -> bool:
         row = self.conn.execute(

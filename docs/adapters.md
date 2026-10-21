@@ -7,7 +7,8 @@ is created per Attempt, so `session_id()` and `usage_from_run()` report what
 that Attempt's stream contained. Adapters are looked up by name in
 `nightshift.adapters.REGISTRY`; core code never names an agent.
 
-Normalized events (`EventKind`): `text`, `tool_call` (one Step), `file_change`,
+Normalized events (`EventKind`): `text`, `tool_call` (one Step), `tool_result`
+(that Step finished; `tool_use_id`, `is_error`), `file_change`,
 `usage`, `error`, `session`, `rate_limit_info`, `result`, `other`.
 
 ## Claude Code
@@ -157,10 +158,34 @@ stored too, so no reported field is lost.
 
 - Seen so far: only `rate_limit_event` with `status: "allowed"`. It arrives
   during a normal run and includes window utilization and reset times.
-- **Not yet observed: an actual limit hit.** `detect_rate_limit` currently
-  treats a `rate_limit_event` whose `status` isn't `allowed` as a hit and
-  converts `resetsAt` to ISO 8601. This is a best guess; issue #9 must record
-  the real hit format here when one happens.
+- **Not yet observed: an actual limit hit.** `detect_rate_limit` treats as a
+  hit (best guess; real formats still to be recorded here when one happens):
+  a `rate_limit_event` whose `status` doesn't start with `allowed` (so
+  `allowed_warning` is not a hit, `rejected` is), with `rateLimitType` and
+  `resetsAt` (Unix seconds -> ISO 8601) as limit type and reset time; or a
+  non-tool error (assistant `error` string or an `is_error` result) with
+  `api_error_status` 429 or a message matching usage limit / rate limit /
+  "hit your limit" / "limit reached" / "too many requests" (no reset time).
+  Tool output that mentions a rate limit is never a hit. The exit code alone
+  is not used (1 is every error).
+
+### Pause and resume (§2.6)
+
+- On a limit hit, or `orch pause`, Nightshift waits until no Step is in
+  flight (every `tool_use` id has its `tool_result`), at most
+  `usage.step_grace_seconds` (120), then SIGTERMs `claude` (exit 143). With
+  a real limit the CLI usually ends the session itself first.
+- **A session ended by SIGTERM resumes fine.** Verified 2026-10-21 on
+  2.1.306 with haiku: an Attempt stopped right after its 2nd Step (a Write)
+  was resumed with `--resume <same id>` 30s later; the resumed session kept
+  the same `session_id`, knew what it had done (it checked `output/a.txt`),
+  and finished the remaining files.
+- **Resume of an unknown session** (verified): stderr `No conversation found
+  with session ID: <id>`, then one `result` line with `subtype:
+  "error_during_execution"`, `is_error: true`, `num_turns: 0`, no `result`
+  text and the message in an **`errors`** list; exit 1. `result_error()`
+  reads `errors` when `result` is empty. Nightshift treats a resume that
+  fails before any Step as "resume failed" and starts a fresh session.
 
 ### Behaviour notes
 

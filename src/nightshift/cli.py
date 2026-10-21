@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from . import daemon, failures, planning, views
+from . import daemon, failures, pauses, planning, views
 from . import priority as prio
 from .adapters import get_adapter
 from .config import ConfigError, load_config
@@ -95,8 +95,17 @@ def _daemon_note(cfg) -> None:
 )
 @click.option("--internet", type=click.Choice(["on", "off"]), default=None)
 @click.option("--yes", "-y", is_flag=True, help="Skip the estimate/type confirmation.")
+@click.option(
+    "--simulate-rate-limit-after",
+    "simulate_after",
+    type=click.IntRange(min=1),
+    default=None,
+    metavar="N",
+    help="Fault injection: hit a simulated rate limit after N Steps (tool calls) of an "
+    "Attempt, through the real pause/resume path. Fires once per Task.",
+)
 @click.pass_context
-def add(ctx, prompt, task_type, agent, priority, deadline, at, internet, yes):
+def add(ctx, prompt, task_type, agent, priority, deadline, at, internet, yes, simulate_after):
     """Plan and queue a free-form Task; the daemon runs it.
 
     A quick planning call estimates the minutes and proposes a Task type,
@@ -137,7 +146,7 @@ def add(ctx, prompt, task_type, agent, priority, deadline, at, internet, yes):
             new = create_task(
                 cfg, db, prompt, task_type=ttype, agent=agent, priority=priority,
                 deadline=deadline_at, run_at=run_at, internet=internet, estimated_minutes=proposal.estimated_minutes,
-                needs_approval=long_task,
+                needs_approval=long_task, simulate_rate_limit_after=simulate_after,
                 reason=f"created by orch add (estimated {proposal.estimated_minutes} min"
                 + (", needs plan approval)" if long_task else ", no plan needed)"),
             )
@@ -146,6 +155,9 @@ def add(ctx, prompt, task_type, agent, priority, deadline, at, internet, yes):
         tid = new.spec.id
         planning.record_usage(db, tid, "estimate", proposal)
         _timing_notes(cfg, new.spec)
+        if simulate_after:
+            click.echo(f"Fault injection: a simulated rate limit after {simulate_after} "
+                       f"Step{'s' if simulate_after != 1 else ''}")
         if not long_task:
             click.echo(f"Task {tid} queued: {new.folder}")
             _daemon_note(cfg)
@@ -264,6 +276,71 @@ def retry(ctx, task_id):
             raise click.ClickException(str(exc)) from None
         click.echo(f"Task {task_id} queued: {reason}")
         _daemon_note(cfg)
+    finally:
+        db.close()
+
+
+# How long `orch pause` waits for the daemon to pause a running Attempt.
+PAUSE_WAIT_SECONDS = 30.0
+
+
+@main.command()
+@click.argument("task_id")
+@click.option("--no-wait", is_flag=True, help="Don't wait for the daemon to pause a running Task.")
+@click.pass_context
+def pause(ctx, task_id, no_wait):
+    """Pause a Task until `orch resume`. A running Task finishes its current
+    Step, then stops; resuming continues the same agent session if it can."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        _task_row(db, task_id)
+        try:
+            res = pauses.pause_by_hand(
+                cfg, db, task_id, at=_clock(cfg), daemon_up=daemon.daemon_running(cfg)
+            )
+        except pauses.NotAllowed as exc:
+            raise click.ClickException(str(exc)) from None
+        if res.status == "paused":
+            click.echo(f"Task {task_id} paused (was {res.from_state}). "
+                       f"`orch resume {task_id}` queues it again.")
+            return
+        click.echo(f"Task {task_id} is running; asked the daemon to pause it after the "
+                   "current Step.", err=True)
+        if no_wait:
+            click.echo(f"Pause requested for Task {task_id}.")
+            return
+        # A Step may run for a while; wait for it within reason.
+        limit = time.monotonic() + max(PAUSE_WAIT_SECONDS, cfg.usage("step_grace_seconds") + 5)
+        while time.monotonic() < limit and db.task_state(task_id) == TaskState.RUNNING:
+            time.sleep(0.2)
+        state = db.task_state(task_id)
+        if state == TaskState.PAUSED_USAGE:
+            click.echo(f"Task {task_id} paused (was running). "
+                       f"`orch resume {task_id}` continues it.")
+        elif state == TaskState.RUNNING:
+            click.echo(f"Pause requested for Task {task_id}; the current Step hasn't finished yet.")
+        else:
+            click.echo(f"Task {task_id} ended {state} before it could be paused.")
+    finally:
+        db.close()
+
+
+@main.command()
+@click.argument("task_id")
+@click.pass_context
+def resume(ctx, task_id):
+    """Queue a paused Task now, whatever its reset time (or withdraw a pending
+    `orch pause`). Its next Attempt resumes the same session if it can."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        _task_row(db, task_id)
+        try:
+            reason = pauses.resume_by_hand(cfg, db, task_id, at=_clock(cfg))
+        except (pauses.NotAllowed, db_mod.StateChanged) as exc:
+            raise click.ClickException(str(exc)) from None
+        click.echo(f"Task {task_id}: {reason}")
+        if db.task_state(task_id) == TaskState.QUEUED:
+            _daemon_note(cfg)
     finally:
         db.close()
 
@@ -469,7 +546,8 @@ def daemon_status(ctx):
     finally:
         db.close()
     click.echo(f"queue     {counts.get('queued', 0)} queued, {counts.get('running', 0)} running, "
-               f"{counts.get('retry_wait', 0)} waiting to retry")
+               f"{counts.get('retry_wait', 0)} waiting to retry, "
+               f"{counts.get('paused_usage', 0)} paused")
 
 
 @daemon_group.command("run")

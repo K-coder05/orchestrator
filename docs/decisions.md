@@ -425,3 +425,93 @@ lasting consequences go in `docs/adr/` instead.
   running)" in about 1s, with no `claude` process left; `orch retry` requeued
   the failed Task, refused the cancelled one, and `orch cancel` cancelled the
   queued one.
+
+## Phase 1, issue #8: hard pause and resume, with fault injection
+
+- **One module.** `nightshift.pauses` holds §2.6: `pause_after_attempt`,
+  `promote_due` (expiry and requeue, called by the daemon before every
+  pick), `held_agents`, `session_to_resume`, and `orch pause` / `orch resume`
+  (`pause_by_hand`, `resume_by_hand`). Times come from the caller (fake
+  clocks in tests). New columns (migration 4): `simulate_rate_limit_after`,
+  `simulated_limit_at`, `pause_kind` (`usage_limit`, `simulated`,
+  `by_hand`), `pause_limit_type`, `pause_reset_at`, `resume_at`,
+  `resume_pending`, `pause_requested_at`. New config `usage:`
+  (`resume_session_max_hours: 24`, `reapproval_after_hours: 72`,
+  `probe_interval_minutes: 30`, `step_grace_seconds: 120`,
+  `simulated_reset_minutes: 5`).
+- **The pause path.** `run_attempt` asks the adapter `detect_rate_limit` on
+  every event (and the exit code). On a hit it calls
+  `AttemptControl.stop_after_step`: it tracks tool calls in flight (new
+  normalized event `tool_result`) and stops the agent once none is, or after
+  the grace; the watchdog enforces the grace even when the stream is quiet.
+  The Attempt ends `outcome = paused`, the Task `running -> paused_usage`
+  with the reset time if known. **Not a Failed Attempt**: the retry budget
+  is untouched; no `report.md` is written until the Task really ends. A
+  limit that comes up while the agent was finishing on its own (exit 0, no
+  stop) doesn't turn a finished Attempt into a pause. A pending limit wins
+  over a daemon stop or the runtime cap (the limit is the real reason); a
+  cancel wins over everything.
+- **Fault injection.** `orch add ... --simulate-rate-limit-after N` stores N
+  on the Task. In the first Attempt that reaches N Steps (tool calls in the
+  stream; counted per Attempt), the Nth Step's `tool_call` triggers the same
+  `stop_after_step` with a `RateLimit("simulated", now + 5 min)`; from there
+  it is the real path (the Nth Step finishes, SIGTERM, pause, resume). It
+  fires once per Task (`simulated_limit_at`), so the resumed Attempt runs
+  through. N isn't in `task.yaml` (§2.2's field list is fixed); `orch show`
+  prints it.
+- **When a paused Task comes back.** At `resume_at`: the reported reset
+  time; with no parseable reset, `probe_interval_minutes` (30) after the hit,
+  i.e. the Task itself is the probe until a minimal probe request exists. A
+  simulated limit's reset is `simulated_reset_minutes` ahead. **Agent hold:**
+  while a Task is paused on a real limit with its reset ahead, no queued Task
+  starts on that agent (`priority.evaluate(held_agents=)`); a simulated limit
+  holds only its own Task. `orch daemon run --exit-when-idle` exits while
+  Tasks are paused, as with `retry_wait`.
+- **Resume.** `resume_pending` marks a Task whose next Attempt continues
+  paused work. That Attempt resumes the last Attempt's session (`claude -p
+  --resume <id>`, prompt `pauses.RESUME_PROMPT`, protocol appended again)
+  if it ran on the same agent and the session is under 24h old, counted from
+  the first Attempt that used that session id. Otherwise it starts a fresh
+  session whose prompt is the original prompt plus a note to read `plan.md`
+  and `progress.md` first. A resume that fails before any Step (non-zero
+  exit / error result, 0 Steps) ends that Attempt `resume_failed` (not a
+  Failed Attempt) and a fresh Attempt starts at once in the same call. A
+  daemon stop of a resumed Attempt keeps `resume_pending`.
+- **Resume order** (§2.6: priority, then nearest deadline, then oldest).
+  `promote_due` handles paused Tasks in `priority.resume_order`, and the
+  queue order now puts Tasks with `resume_pending` ahead of fresh Tasks of
+  the same Effective priority, ordered among themselves by nearest deadline
+  (any level), then oldest. Urgent still beats everything; a fresh urgent
+  Task runs before a resumed normal one. Fresh Tasks keep issue #6's order.
+- **Expiry**, checked by the daemon in resume order before each pick: a
+  paused Task whose deadline has passed is `cancelled` with a final
+  `report.md` ("deadline ... passed while paused"). A Task paused more than
+  72h (since it entered `paused_usage`) moves to `awaiting_approval` with
+  `approved` false in the DB and `task.yaml`; `orch approve` queues it (its
+  session is then over 24h old, so it starts fresh). Expiry applies only to
+  paused Tasks; a queued Task past its deadline still runs (as urgent).
+- **`orch pause <id>`**: queued or retry_wait -> `paused_usage` with
+  `pause_kind = by_hand` and no `resume_at` (only `orch resume` ends it; the
+  72h and deadline rules still apply). A running Task under a live daemon
+  gets `pause_requested_at`; the watchdog sees it, lets the Step finish and
+  pauses (the CLI waits up to 30s or the grace; `--no-wait`). An orphaned
+  running Task is paused directly. A Task already paused on a limit becomes
+  paused by hand (no automatic resume). New transitions: queued ->
+  paused_usage, retry_wait -> paused_usage (paused_usage stays the state:
+  §2.1 has no other pause state).
+- **`orch resume <id>`**: paused_usage -> queued now, whatever the reset time
+  (if the Window is still out, it just pauses again); a running Task's
+  pending pause request is withdrawn; a Task awaiting re-approval is pointed
+  to `orch approve`.
+- **Claude adapter changes.** `allowed_warning` is no longer a hit (any
+  non-`allowed` status used to be); 429 / usage-limit error messages are;
+  `tool_result` events are emitted; `result_error` reads the `errors` list.
+- **Real-machine check (2026-10-21, 00:34 PDT)**, scratch config, haiku,
+  `simulated_reset_minutes: 0.5`: `orch add "Create three files ..."
+  --simulate-rate-limit-after 2 --yes`, real `orch daemon run`. Attempt 1
+  paused after 2 Steps (exit 143, `output/a.txt` written), resumed at the
+  reset with `--resume` on the same session id and finished `done` with all
+  three files and a current `progress.md`. `orch pause` on a running Task
+  (Bash `sleep 8` Steps) returned after 4s, once the Step finished; Attempt
+  1 `paused by hand after 2 Steps`; `orch resume` resumed the same session
+  and it finished `done`. No agent or daemon process was left running.

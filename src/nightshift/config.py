@@ -233,6 +233,19 @@ class Config:
     def retry_wait_minutes(self) -> list[float]:
         return [float(m) for m in (self.data.get("retries") or {}).get("wait_minutes", [10, 30])]
 
+    USAGE_DEFAULTS = {
+        "resume_session_max_hours": 24,
+        "reapproval_after_hours": 72,
+        "probe_interval_minutes": 30,
+        "step_grace_seconds": 120,
+        "simulated_reset_minutes": 5,
+    }
+
+    def usage(self, key: str) -> float:
+        """A ``usage:`` setting (pauses and resume, §2.6)."""
+        value = (self.data.get("usage") or {}).get(key)
+        return float(self.USAGE_DEFAULTS[key] if value is None else value)
+
 
 def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
@@ -269,6 +282,13 @@ def _validate(data: dict[str, Any]) -> None:
         or any(isinstance(w, bool) or not isinstance(w, (int, float)) or w < 0 for w in waits)
     ):
         raise ConfigError("retries.wait_minutes must be a non-empty list of minutes >= 0")
+    usage = data.get("usage") or {}
+    if not isinstance(usage, dict):
+        raise ConfigError("config section 'usage' must be a mapping")
+    for key in Config.USAGE_DEFAULTS:
+        value = usage.get(key, Config.USAGE_DEFAULTS[key])
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ConfigError(f"usage.{key} must be a number >= 0")
     queue = data.get("queue") or {}
     if not isinstance(queue, dict):
         raise ConfigError("config section 'queue' must be a mapping")

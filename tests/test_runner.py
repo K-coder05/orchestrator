@@ -35,7 +35,8 @@ def fake_provider(name, settings):
 def env(monkeypatch):
     monkeypatch.setenv("FAKE_STREAM", str(FIXTURES / "claude_stream.jsonl"))
     for k in ("FAKE_LEAK", "FAKE_RESULT", "FAKE_EXIT", "FAKE_NEEDS_YOU", "FAKE_SLEEP",
-              "FAKE_IGNORE_TERM"):
+              "FAKE_IGNORE_TERM", "FAKE_STEP_DELAY", "FAKE_RESUME_FAIL", "FAKE_LIMIT_AT",
+              "FAKE_RESETS_AT"):
         monkeypatch.delenv(k, raising=False)
     return monkeypatch
 

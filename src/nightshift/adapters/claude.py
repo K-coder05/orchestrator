@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -326,6 +327,9 @@ class ClaudeAdapter(AgentAdapter):
     def _user_events(self, msg: dict[str, Any]) -> list[Event]:
         events: list[Event] = []
         for block in (msg.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                events.append(Event(EventKind.TOOL_RESULT, {
+                    "tool_use_id": block.get("tool_use_id"), "is_error": bool(block.get("is_error"))}))
             if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error"):
                 events.append(
                     Event(EventKind.ERROR, {"tool_use_id": block.get("tool_use_id"), "tool_error": True,
@@ -335,18 +339,24 @@ class ClaudeAdapter(AgentAdapter):
 
     # -- results -------------------------------------------------------------
     def detect_rate_limit(self, event_or_exit: Event | int) -> RateLimit | None:
-        # Best effort until issue #9 records real hits: a rate_limit_event
-        # whose status is not "allowed" counts as a hit.
-        if isinstance(event_or_exit, Event) and event_or_exit.kind == EventKind.RATE_LIMIT_INFO:
-            info = event_or_exit.data
-            if info.get("status") and info.get("status") != "allowed":
-                reset = info.get("resetsAt")
-                reset_iso = (
-                    datetime.fromtimestamp(reset, tz=timezone.utc).isoformat()
-                    if isinstance(reset, (int, float))
-                    else None
-                )
-                return RateLimit(limit_type=info.get("rateLimitType"), reset_at=reset_iso)
+        """A rate-limit hit, from the stream. Best effort until real hits are
+        recorded (docs/adapters.md): a ``rate_limit_event`` whose status is
+        not ``allowed``/``allowed_warning`` (e.g. ``rejected``), or an agent
+        (not tool) error with HTTP status 429 or a usage-limit message. The
+        exit code alone says nothing (1 is every error)."""
+        if not isinstance(event_or_exit, Event):
+            return None
+        ev = event_or_exit
+        if ev.kind == EventKind.RATE_LIMIT_INFO:
+            status = str(ev.data.get("status") or "")
+            if status and not status.startswith("allowed"):
+                return RateLimit(limit_type=ev.data.get("rateLimitType"),
+                                 reset_at=_epoch_iso(ev.data.get("resetsAt")))
+            return None
+        if ev.kind == EventKind.ERROR and not ev.data.get("tool_error"):
+            message = str(ev.data.get("message") or "")
+            if ev.data.get("api_error_status") == 429 or _LIMIT_TEXT.search(message):
+                return RateLimit(limit_type=None, reset_at=None)
         return None
 
     def session_id(self) -> str | None:
@@ -365,7 +375,23 @@ class ClaudeAdapter(AgentAdapter):
     def result_error(self) -> str | None:
         if self._result is None or self.result_ok():
             return None
+        errors = self._result.get("errors")
+        if not self._result.get("result") and isinstance(errors, list) and errors:
+            # e.g. --resume of an unknown session: "No conversation found ..."
+            return "; ".join(str(e) for e in errors)
         return str(self._result.get("result") or self._result.get("subtype"))
+
+
+_LIMIT_TEXT = re.compile(
+    r"usage limit|rate limit|rate_limit|hit your limit|limit reached|too many requests",
+    re.IGNORECASE,
+)
+
+
+def _epoch_iso(value: Any) -> str | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+    return None
 
 
 def _usage_from_result(r: dict[str, Any], *, requests: int | None) -> list[Usage]:

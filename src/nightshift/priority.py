@@ -91,12 +91,30 @@ class Evaluation:
         return str(self.row["id"])
 
 
-def evaluate(cfg: Config, row: Row, now: datetime) -> Evaluation:
+def _col(row: Row, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
+
+def resuming(row: Row) -> bool:
+    """Whether the Task's next Attempt continues work a pause cut off."""
+    return bool(_col(row, "resume_pending", 0))
+
+
+def evaluate(
+    cfg: Config, row: Row, now: datetime, *, held_agents: Mapping[str, str] | None = None
+) -> Evaluation:
+    """``held_agents`` maps an agent to why it may not start Tasks now (its
+    usage Window is known to be out until a reset)."""
     eff = effective_priority(
         row["priority"], row["deadline"], now, urgent_within_hours=deadline_urgent_hours(cfg)
     )
     blocked = None
-    if row["run_at"] and parse_iso(row["run_at"]) > now:
+    if held_agents and row["agent"] in held_agents:
+        blocked = held_agents[row["agent"]]
+    elif row["run_at"] and parse_iso(row["run_at"]) > now:
         blocked = f"waiting until {row['run_at']} (--at)"
     elif row["long"] and eff != "urgent" and not in_long_window(cfg, now):
         start, end = long_window(cfg)
@@ -107,21 +125,44 @@ def evaluate(cfg: Config, row: Row, now: datetime) -> Evaluation:
 def _order_key(ev: Evaluation) -> tuple:
     row = ev.row
     deadline = parse_iso(row["deadline"]).timestamp() if row["deadline"] else float("inf")
-    # Urgent Tasks: nearest deadline first. Normal and background run in order.
+    resume = resuming(row)
+    # Urgent Tasks: nearest deadline first. Normal and background run in
+    # order. Within a level, Tasks resuming after a pause go first, in resume
+    # order (§2.6): nearest deadline, then oldest.
     return (
         RANK[ev.effective],
-        deadline if ev.effective == "urgent" else 0.0,
+        0 if resume else 1,
+        deadline if ev.effective == "urgent" or resume else 0.0,
         parse_iso(row["created_at"]).timestamp(),
     )
 
 
-def order(cfg: Config, rows: Iterable[Row], now: datetime) -> list[Evaluation]:
+def order(
+    cfg: Config, rows: Iterable[Row], now: datetime, *,
+    held_agents: Mapping[str, str] | None = None,
+) -> list[Evaluation]:
     """Queued Tasks in queue order (startable or not), Effective priority
     first. ``rows`` must already be oldest-first so equal keys keep order."""
-    return sorted((evaluate(cfg, r, now) for r in rows), key=_order_key)
+    return sorted(
+        (evaluate(cfg, r, now, held_agents=held_agents) for r in rows), key=_order_key
+    )
 
 
-def pick_next(cfg: Config, rows: Iterable[Row], now: datetime) -> Row | None:
+def resume_order(cfg: Config, rows: Iterable[Row], now: datetime) -> list[Row]:
+    """Paused Tasks in resume order (§2.6): Effective priority, then nearest
+    deadline (none last), then oldest."""
+    def key(r: Row) -> tuple:
+        eff = effective_priority(r["priority"], r["deadline"], now,
+                                 urgent_within_hours=deadline_urgent_hours(cfg))
+        deadline = parse_iso(r["deadline"]).timestamp() if r["deadline"] else float("inf")
+        return (RANK[eff], deadline, parse_iso(r["created_at"]).timestamp())
+    return sorted(rows, key=key)
+
+
+def pick_next(
+    cfg: Config, rows: Iterable[Row], now: datetime, *,
+    held_agents: Mapping[str, str] | None = None,
+) -> Row | None:
     """The queued Task to start now, or None if none may start.
 
     Urgent jumps the queue, normal runs in order, and background runs only
@@ -130,7 +171,7 @@ def pick_next(cfg: Config, rows: Iterable[Row], now: datetime) -> Row | None:
     by ``--at`` or the long-task window isn't waiting to run yet, so it
     doesn't block the queue.
     """
-    for ev in order(cfg, rows, now):
+    for ev in order(cfg, rows, now, held_agents=held_agents):
         if ev.blocked is None:
             return ev.row
     return None

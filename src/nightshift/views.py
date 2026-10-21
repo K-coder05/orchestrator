@@ -63,7 +63,8 @@ def format_list(
 
 SHOW_FIELDS = (
     "title state priority task_type agent agent_override internet template deadline run_at "
-    "long estimated_minutes max_runtime_minutes retries_used retry_at approved approved_at "
+    "long estimated_minutes max_runtime_minutes retries_used retry_at simulate_rate_limit_after "
+    "simulated_limit_at pause_kind pause_limit_type pause_reset_at resume_at approved approved_at "
     "schedule_name created_at state_changed_at folder"
 ).split()
 
@@ -94,6 +95,17 @@ def format_show(
     if row["state"] == str(TaskState.RETRY_WAIT) and row["retry_at"]:
         out += ["", f"Waiting: retry {row['retries_used']} at {row['retry_at']} "
                 f"(`orch retry {row['id']}` starts it now)"]
+    if row["state"] == str(TaskState.PAUSED_USAGE):
+        if row["resume_at"]:
+            out += ["", f"Waiting: paused ({row['pause_kind']}), queued again at "
+                    f"{row['resume_at']} (`orch resume {row['id']}` queues it now)"]
+        else:
+            out += ["", f"Waiting: paused by hand until `orch resume {row['id']}`"]
+    if row["resume_pending"] and TaskState(row["state"]) not in TERMINAL:
+        out += ["", "Next Attempt continues paused work (same session if under "
+                f"{cfg.usage('resume_session_max_hours') if cfg else 24:g}h old)"]
+    if row["pause_requested_at"] and row["state"] == str(TaskState.RUNNING):
+        out += ["", f"Pause requested at {row['pause_requested_at']}"]
     if row["cancel_requested_at"] and TaskState(row["state"]) not in TERMINAL:
         out += ["", f"Cancel requested at {row['cancel_requested_at']}"]
     out += ["", "Prompt:", *(f"  {line}" for line in row["prompt"].splitlines() or [""])]

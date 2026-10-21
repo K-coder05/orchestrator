@@ -57,6 +57,21 @@ retries:
   # Minutes in retry_wait before each retry (the last value repeats).
   wait_minutes: [10, 30]
 
+usage:
+  # Usage-limit pauses and resume (§2.6).
+  # A paused Task resumes its own agent session if the session is younger
+  # than this; otherwise a fresh session starts from plan.md + progress.md.
+  resume_session_max_hours: 24
+  # A Task paused longer than this needs re-approval (`orch approve`).
+  reapproval_after_hours: 72
+  # A limit hit with no reset time is retried after this many minutes.
+  probe_interval_minutes: 30
+  # On a limit hit, the Step in progress may finish for up to this long
+  # before the agent is stopped.
+  step_grace_seconds: 120
+  # Reset time reported by a simulated limit (--simulate-rate-limit-after).
+  simulated_reset_minutes: 5
+
 planning:
   # Free-form `orch add` asks an agent for an estimate and a Task type (§2.4).
   # null uses defaults.agent.

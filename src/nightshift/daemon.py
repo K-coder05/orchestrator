@@ -25,7 +25,7 @@ from typing import IO, Any
 
 import nightshift
 
-from . import failures
+from . import failures, pauses
 from .adapters import get_adapter
 from .config import Config
 from .db import Database
@@ -241,13 +241,29 @@ class QueueRunner:
             self.log(f"Task {tid} retry wait over; queued")
         return moved
 
+    def promote_paused(self) -> pauses.Promoted:
+        """Expire paused Tasks or requeue them once their reset time has come
+        (§2.6), in resume order."""
+        done = pauses.promote_due(self.cfg, self.db, self.clock())
+        for tid in done.cancelled:
+            self.log(f"Task {tid} deadline passed while paused; cancelled")
+        for tid in done.reapproval:
+            self.log(f"Task {tid} paused too long; awaiting re-approval")
+        for tid in done.resumed:
+            self.log(f"Task {tid} usage pause over; queued to resume")
+        return done
+
     def run_next(self) -> str | None:
         """Run one Attempt of the next queued Task; None if the queue is empty."""
         if self.stopping:
             return None
         self.promote_retries()
-        # Effective priority and time windows are re-evaluated on every pick.
-        row = pick_next(self.cfg, self.db.tasks_in_state(TaskState.QUEUED), self.clock())
+        self.promote_paused()
+        # Effective priority and time windows are re-evaluated on every pick;
+        # an agent out of usage starts nothing until its reset.
+        held = pauses.held_agents(self.cfg, self.db, self.clock())
+        row = pick_next(self.cfg, self.db.tasks_in_state(TaskState.QUEUED), self.clock(),
+                        held_agents=held)
         if row is None:
             return None
         task_id = row["id"]

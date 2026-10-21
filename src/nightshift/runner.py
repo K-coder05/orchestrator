@@ -13,9 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import failures, report
+from . import failures, pauses, report
 from .adapters import get_adapter
-from .adapters.base import AgentAdapter, EventKind, TaskContext
+from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
 from .config import Config
 from .db import Database
 from .failures import PostHook
@@ -51,6 +51,7 @@ def create_task(
     template: str | None = None,
     max_runtime_minutes: int | None = None,
     needs_approval: bool = False,
+    simulate_rate_limit_after: int | None = None,
     reason: str = "created by orch add",
 ) -> NewTask:
     """Create a Task: DB row, Task folder, ``task.yaml``.
@@ -66,11 +67,19 @@ def create_task(
     stored; the Effective priority is computed by the queue (§2.3).
     ``max_runtime_minutes`` (a template's cap) defaults to the Task type's
     cap, else ``defaults.max_runtime_minutes`` (§2.7).
+    ``simulate_rate_limit_after`` (fault injection, §3.1 item 15) makes the
+    first Attempt that reaches that many Steps hit a simulated rate limit.
     """
     created = now(cfg.timezone)
     ttype = task_type or cfg.default("task_type")
     agent_name = agent or cfg.default("agent")
     cfg.agent(agent_name)  # validates the agent is configured
+    if simulate_rate_limit_after is not None and (
+        isinstance(simulate_rate_limit_after, bool)
+        or not isinstance(simulate_rate_limit_after, int)
+        or simulate_rate_limit_after < 1
+    ):
+        raise ValueError("simulate_rate_limit_after must be a positive number of Steps")
     task_id = new_task_id(
         lambda i: db.task_id_exists(i) or any(cfg.tasks_dir.glob(f"*_{i}"))
     )
@@ -97,7 +106,9 @@ def create_task(
     folder = create_task_folder(
         cfg.tasks_dir, spec, created, plan=PLAN_PENDING if needs_approval else PLAN_STUB
     )
-    fields = spec.to_dict() | {"folder": str(folder)}
+    fields = spec.to_dict() | {
+        "folder": str(folder), "simulate_rate_limit_after": simulate_rate_limit_after,
+    }
     state = TaskState.AWAITING_APPROVAL if needs_approval else TaskState.QUEUED
     db.insert_task(fields, state, reason)
     return NewTask(spec=spec, folder=folder)
@@ -115,6 +126,8 @@ def _runtime_cap(cfg: Config, task_type: str, minutes: int | None) -> int:
 STOP_DAEMON = "daemon_stop"  # launchd/SIGTERM: the Task is requeued
 STOP_CANCEL = "cancel"  # orch cancel: the Task is cancelled
 STOP_RUNTIME_CAP = "runtime_cap"  # max runtime hit: a Failed Attempt
+STOP_USAGE_LIMIT = "usage_limit"  # a (possibly simulated) rate limit: the Task pauses
+STOP_PAUSE = "pause"  # orch pause: the Task pauses until orch resume
 
 #: Seconds between SIGTERM and SIGKILL when an agent ignores a stop.
 KILL_GRACE_SECONDS = 15.0
@@ -127,6 +140,10 @@ class AttemptControl:
     then ends the Attempt according to the first reason given: a daemon stop
     (the default; SIGTERM from launchd) puts the Task back in ``queued``, a
     cancel ends it ``cancelled``, and a runtime cap makes it a Failed Attempt.
+
+    ``stop_after_step(...)`` is the gentler stop of a usage limit or
+    ``orch pause``: the agent is stopped once no Step (tool call) is in
+    flight, or after ``grace_seconds`` at most, and the Task pauses.
     """
 
     def __init__(self) -> None:
@@ -134,6 +151,27 @@ class AttemptControl:
         self.stop_reason: str | None = None
         self.stop_requested_at: float | None = None
         self.proc: subprocess.Popen | None = None
+        #: Tool calls seen whose result hasn't arrived yet (the Step in progress).
+        self.inflight: set[str] = set()
+        #: (stop reason, pause kind, limit) of a pending stop-after-step.
+        self.pending: tuple[str, str, RateLimit | None] | None = None
+        self.pending_since: float | None = None
+        self.grace_seconds: float = 120.0
+
+    def stop_after_step(self, reason: str, kind: str, limit: RateLimit | None = None) -> None:
+        if self.pending is None:
+            self.pending = (reason, kind, limit)
+            self.pending_since = time.monotonic()
+        self.maybe_stop()
+
+    def maybe_stop(self) -> None:
+        """Carry out a pending stop-after-step once the Step is done."""
+        if self.pending is None or self.stop_requested:
+            return
+        overdue = self.pending_since is not None and (
+            time.monotonic() - self.pending_since >= self.grace_seconds)
+        if not self.inflight or overdue:
+            self.request_stop(self.pending[0])
 
     def request_stop(self, reason: str = STOP_DAEMON) -> None:
         if not self.stop_requested:
@@ -163,16 +201,20 @@ class _Watchdog(threading.Thread):
         self.done = threading.Event()
         self.interval = min(1.0, max(0.05, cap_seconds / 20))
 
-    def _cancel_requested(self, conn: sqlite3.Connection | None) -> bool:
+    def _requests(self, conn: sqlite3.Connection | None) -> tuple[bool, bool]:
+        """(cancel requested, pause requested) by ``orch cancel``/``orch pause``."""
         if conn is None:
-            return False
+            return False, False
         try:
             row = conn.execute(
-                "SELECT cancel_requested_at FROM tasks WHERE id = ?", (self.task_id,)
+                "SELECT cancel_requested_at, pause_requested_at FROM tasks WHERE id = ?",
+                (self.task_id,),
             ).fetchone()
         except sqlite3.Error:
-            return False
-        return row is not None and row[0] is not None
+            return False, False
+        if row is None:
+            return False, False
+        return row[0] is not None, row[1] is not None
 
     def run(self) -> None:
         conn = None
@@ -192,8 +234,14 @@ class _Watchdog(threading.Thread):
                     continue
                 if time.monotonic() - self.started >= self.cap_seconds:
                     c.request_stop(STOP_RUNTIME_CAP)
-                elif self._cancel_requested(conn):
+                    continue
+                cancel, pause = self._requests(conn)
+                if cancel:
                     c.request_stop(STOP_CANCEL)
+                    continue
+                if pause:
+                    c.stop_after_step(STOP_PAUSE, pauses.KIND_BY_HAND)
+                c.maybe_stop()
         finally:
             if conn is not None:
                 conn.close()
@@ -221,6 +269,7 @@ def run_attempt(
     clock: Callable[[], datetime] | None = None,
     post_hooks: Sequence[PostHook] = (),
     max_runtime_seconds: float | None = None,
+    continue_fresh: bool = False,
 ) -> AttemptResult:
     """Run one Attempt of a queued Task, then finalize its report.
 
@@ -231,9 +280,20 @@ def run_attempt(
     retry budget: the Task goes to ``retry_wait``, or ``failed`` once the
     budget is spent (see ``nightshift.failures``). ``clock`` dates the retry;
     ``max_runtime_seconds`` overrides the Task's cap (tests).
+
+    A rate limit (real, or simulated by ``--simulate-rate-limit-after``) or a
+    pause request lets the Step in progress finish, stops the agent and
+    pauses the Task (``nightshift.pauses``); that is not a Failed Attempt.
+    The next Attempt of a paused Task resumes its agent session when it is
+    young enough, else starts fresh from ``plan.md`` + ``progress.md``; a
+    resume that fails before any Step falls back to a fresh session at once
+    (``continue_fresh``).
     """
     clock = clock or (lambda: now(cfg.timezone))
     control = control or AttemptControl()
+    control.grace_seconds = cfg.usage("step_grace_seconds")
+    control.inflight.clear()
+    control.pending = control.pending_since = None
     row = db.get_task(task_id)
     if row is None:
         raise KeyError(task_id)
@@ -246,9 +306,14 @@ def run_attempt(
     # agent did to an earlier one carries over.
     policy = build_policy(cfg, task_id=task_id, workspace=folder, internet=row["internet"])
     permissions = adapter.write_permissions(folder, policy)
+    resuming = bool(row["resume_pending"])
+    choice = None
+    if resuming and not continue_fresh:
+        choice = pauses.session_to_resume(cfg, db, row, clock())
+    continuing = continue_fresh or resuming
     task = TaskContext(
         id=task_id,
-        prompt=row["prompt"],
+        prompt=pauses.fresh_prompt(row["prompt"]) if continuing else row["prompt"],
         task_type=row["task_type"],
         internet=row["internet"],
         protocol=agent_protocol(
@@ -256,7 +321,18 @@ def run_attempt(
             denied_domains=policy.denied_domains,
         ),
     )
-    command = adapter.build_command(task, folder, permissions)
+    resume_session = choice.session_id if choice is not None else None
+    if resume_session:
+        command = adapter.resume_command(
+            resume_session, pauses.RESUME_PROMPT, task=task, permissions=permissions
+        )
+        how = f"resuming {choice.why}"
+    else:
+        command = adapter.build_command(task, folder, permissions)
+        how = None
+        if continuing:
+            how = "fresh session from plan.md + progress.md" + (
+                f" ({choice.why})" if choice is not None else " (the resume failed)")
 
     attempt_no = len(db.attempts(task_id)) + 1
     stream_log = folder / "logs" / f"attempt-{attempt_no}.{agent_name}.jsonl"
@@ -264,8 +340,14 @@ def run_attempt(
     # The protocol is long and identical every time; keep the stored command readable.
     stored_argv = [redact(a) if a != task.protocol else "<agent protocol>" for a in command.argv]
     run_id = db.start_attempt(task_id, agent_name, stored_argv, str(stream_log))
-    db.transition(task_id, TaskState.RUNNING, f"Attempt {attempt_no} started on {agent_name}", run_id=run_id)
-    _log(folder, f"{iso(now(cfg.timezone))} Attempt {attempt_no} started: {json.dumps(stored_argv)}", redact)
+    started = f"Attempt {attempt_no} started on {agent_name}" + (f", {how}" if how else "")
+    db.transition(task_id, TaskState.RUNNING, started, run_id=run_id,
+                  set_fields={"resume_pending": 0})
+    _log(folder, f"{iso(now(cfg.timezone))} {started}: {json.dumps(stored_argv)}", redact)
+
+    # Fault injection: one simulated limit per Task, after N Steps of an Attempt.
+    simulate_after = row["simulate_rate_limit_after"] if not row["simulated_limit_at"] else None
+    steps = 0
 
     env = os.environ.copy() | command.env
     exit_code: int | None = None
@@ -325,8 +407,21 @@ def run_attempt(
                             session_recorded = True
                         elif ev.kind == EventKind.ERROR and not ev.data.get("tool_error"):
                             errors.append(str(ev.data.get("message")))
+                        if ev.kind == EventKind.TOOL_CALL:
+                            steps += 1
+                            control.inflight.add(str(ev.data.get("id") or f"step-{steps}"))
+                            if simulate_after and steps == simulate_after:
+                                control.stop_after_step(
+                                    STOP_USAGE_LIMIT, pauses.KIND_SIMULATED,
+                                    pauses.simulated_limit(cfg, clock()))
+                        elif ev.kind == EventKind.TOOL_RESULT:
+                            control.inflight.discard(str(ev.data.get("tool_use_id")))
+                        limit = adapter.detect_rate_limit(ev)
+                        if limit is not None:
+                            control.stop_after_step(STOP_USAGE_LIMIT, pauses.KIND_LIMIT, limit)
                         if on_event:
                             on_event(ev)
+                    control.maybe_stop()
             exit_code = proc.wait()
         except KeyboardInterrupt:
             interrupted = True
@@ -343,6 +438,10 @@ def run_attempt(
         stderr_log.write_text(redact("".join(stderr_chunks)))
         if stderr_chunks and exit_code:
             errors.append(redact("".join(stderr_chunks)).strip()[-500:])
+        if exit_code is not None and control.pending is None:
+            limit = adapter.detect_rate_limit(exit_code)
+            if limit is not None:
+                control.pending = (STOP_USAGE_LIMIT, pauses.KIND_LIMIT, limit)
 
     # -- decide the outcome --------------------------------------------------
     usage = adapter.usage_from_run()
@@ -355,6 +454,29 @@ def run_attempt(
     stop = control.stop_reason if control.stop_requested and proc is not None else None
     if stop == STOP_DAEMON and db.cancel_requested(task_id):
         stop = STOP_CANCEL  # `orch cancel` asked first; don't requeue it
+    # A limit or pause that came up ends the Attempt as a pause, unless the
+    # agent finished cleanly on its own before it could be stopped.
+    finished_alone = stop is None and exit_code == 0 and ok is not False
+    if control.pending is not None and stop != STOP_CANCEL and not interrupted and not finished_alone:
+        _reason, kind, limit = control.pending
+        step_note = f"after {steps} Step{'s' if steps != 1 else ''}"
+        if kind == pauses.KIND_SIMULATED:
+            end_reason = (f"Attempt {attempt_no} hit a simulated rate limit {step_note} "
+                          f"(--simulate-rate-limit-after {simulate_after})")
+        elif kind == pauses.KIND_BY_HAND:
+            end_reason = f"Attempt {attempt_no} paused by hand (orch pause) {step_note}"
+        else:
+            ltype = f" ({limit.limit_type})" if limit is not None and limit.limit_type else ""
+            end_reason = f"Attempt {attempt_no} hit {agent_name}'s usage limit{ltype} {step_note}"
+        end_reason = redact(end_reason)
+        db.finish_attempt(run_id, exit_code=exit_code, outcome="paused", end_reason=end_reason,
+                          session_id=adapter.session_id())
+        _log(folder, f"{iso(now(cfg.timezone))} Attempt {attempt_no} ended: {end_reason}", redact)
+        pauses.pause_after_attempt(cfg, db, task_id, kind=kind, limit=limit,
+                                   reason=end_reason, at=clock(), run_id=run_id)
+        return AttemptResult(run_id=run_id, state=TaskState.PAUSED_USAGE,
+                             session_id=adapter.session_id(), exit_code=exit_code)
+    db.clear_pause_request(task_id)
     if stop == STOP_DAEMON:
         end_reason = redact(f"daemon stopped during Attempt {attempt_no}; Task requeued")
         db.finish_attempt(
@@ -362,7 +484,9 @@ def run_attempt(
             session_id=adapter.session_id(),
         )
         _log(folder, f"{iso(now(cfg.timezone))} Attempt {attempt_no} ended: {end_reason}", redact)
-        db.transition(task_id, TaskState.QUEUED, end_reason, run_id=run_id)
+        # Work a pause cut off is still to be continued by the next Attempt.
+        db.transition(task_id, TaskState.QUEUED, end_reason, run_id=run_id,
+                      set_fields={"resume_pending": int(continuing)})
         return AttemptResult(
             run_id=run_id, state=TaskState.QUEUED, session_id=adapter.session_id(), exit_code=exit_code
         )
@@ -379,6 +503,23 @@ def run_attempt(
         end_reason = "interrupted from the terminal (Ctrl-C)"
     elif exit_code != 0 or ok is False or proc is None:
         err = adapter.result_error() or (errors[-1] if errors else None)
+        if resume_session and steps == 0 and proc is not None:
+            # The session could not be resumed (e.g. "No conversation found");
+            # not the agent's failure. Start a fresh session right away.
+            end_reason = redact(f"Attempt {attempt_no} could not resume session {resume_session}"
+                                + (f": {err}" if err else ""))
+            db.finish_attempt(run_id, exit_code=exit_code, outcome="resume_failed",
+                              end_reason=end_reason, session_id=adapter.session_id())
+            _log(folder, f"{iso(now(cfg.timezone))} Attempt {attempt_no} ended: {end_reason}",
+                 redact)
+            db.transition(task_id, TaskState.QUEUED,
+                          f"{end_reason}; starting a fresh session from plan.md + progress.md",
+                          run_id=run_id)
+            return run_attempt(
+                cfg, db, task_id, adapter_provider=adapter_provider, on_event=on_event,
+                control=control, clock=clock, post_hooks=post_hooks,
+                max_runtime_seconds=max_runtime_seconds, continue_fresh=True,
+            )
         failed_attempt = (f"Attempt {attempt_no} crashed: agent exited with code {exit_code}"
                           + (f": {err}" if err else ""))
     elif (folder / "needs_you.json").exists():

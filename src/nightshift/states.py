@@ -31,7 +31,10 @@ ALLOWED: dict[TaskState, frozenset[TaskState]] = {
     S.SCHEDULED: frozenset({S.QUEUED, S.AWAITING_APPROVAL, S.CANCELLED}),
     S.AWAITING_APPROVAL: frozenset({S.QUEUED, S.SCHEDULED, S.CANCELLED}),
     # queued -> failed: the daemon could not even start an Attempt (e.g. bad agent config).
-    S.QUEUED: frozenset({S.RUNNING, S.AWAITING_APPROVAL, S.SCHEDULED, S.FAILED, S.CANCELLED}),
+    # queued/retry_wait -> paused_usage: paused by hand (orch pause).
+    S.QUEUED: frozenset(
+        {S.RUNNING, S.AWAITING_APPROVAL, S.SCHEDULED, S.FAILED, S.CANCELLED, S.PAUSED_USAGE}
+    ),
     # running -> queued: the daemon was stopped mid-Attempt; the Task goes back in line.
     S.RUNNING: frozenset(
         {
@@ -46,10 +49,11 @@ ALLOWED: dict[TaskState, frozenset[TaskState]] = {
             S.CANCELLED,
         }
     ),
+    # paused_usage -> awaiting_approval: paused over 72h needs re-approval (§2.6).
     S.PAUSED_USAGE: frozenset({S.QUEUED, S.RUNNING, S.AWAITING_APPROVAL, S.CANCELLED}),
     S.PAUSED_SPEND: frozenset({S.QUEUED, S.RUNNING, S.CANCELLED}),
     S.NEEDS_YOU: frozenset({S.QUEUED, S.DONE, S.PARTIAL, S.FAILED, S.CANCELLED}),
-    S.RETRY_WAIT: frozenset({S.QUEUED, S.RUNNING, S.FAILED, S.CANCELLED}),
+    S.RETRY_WAIT: frozenset({S.QUEUED, S.RUNNING, S.FAILED, S.CANCELLED, S.PAUSED_USAGE}),
     # `orch retry` may requeue a finished-but-unsuccessful Task (§2.7).
     S.PARTIAL: frozenset({S.QUEUED}),
     S.FAILED: frozenset({S.QUEUED}),
