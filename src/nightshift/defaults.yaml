@@ -64,13 +64,24 @@ usage:
   resume_session_max_hours: 24
   # A Task paused longer than this needs re-approval (`orch approve`).
   reapproval_after_hours: 72
-  # A limit hit with no reset time is retried after this many minutes.
+  # A limit hit with no reset time: every this many minutes Nightshift sends
+  # a minimal probe request to see whether the Window has reset.
   probe_interval_minutes: 30
+  # A probe that takes longer than this counts as failed.
+  probe_timeout_seconds: 120
   # On a limit hit, the Step in progress may finish for up to this long
   # before the agent is stopped.
   step_grace_seconds: 120
   # Reset time reported by a simulated limit (--simulate-rate-limit-after).
   simulated_reset_minutes: 5
+  # On a real limit hit the agent CLI usually ends the session itself; it
+  # gets this long to do so (and report its usage) before it is stopped.
+  limit_exit_wait_seconds: 10
+  # Each agent's usage Windows and their length in hours (§1.5). Limit
+  # observations and Baselines are kept per Window; `orch usage` lists these.
+  # Claude: a rolling 5-hour Window plus a weekly cap.
+  windows:
+    claude: {five_hour: 5, seven_day: 168}
 
 planning:
   # Free-form `orch add` asks an agent for an estimate and a Task type (§2.4).

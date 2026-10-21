@@ -28,6 +28,14 @@ def fake_provider(name, settings):
         return [sys.executable, str(FIXTURES / "fake_claude.py")] + argv[1:]
 
     a._base_argv = base_argv
+    orig_probe = a.probe_command
+
+    def probe_command():
+        cmd = orig_probe()
+        cmd.argv = [sys.executable, str(FIXTURES / "fake_claude.py")] + cmd.argv[1:]
+        return cmd
+
+    a.probe_command = probe_command
     return a
 
 
@@ -36,7 +44,8 @@ def env(monkeypatch):
     monkeypatch.setenv("FAKE_STREAM", str(FIXTURES / "claude_stream.jsonl"))
     for k in ("FAKE_LEAK", "FAKE_RESULT", "FAKE_EXIT", "FAKE_NEEDS_YOU", "FAKE_SLEEP",
               "FAKE_IGNORE_TERM", "FAKE_STEP_DELAY", "FAKE_RESUME_FAIL", "FAKE_LIMIT_AT",
-              "FAKE_RESETS_AT"):
+              "FAKE_RESETS_AT", "FAKE_LIMIT_FORMAT", "FAKE_LIMIT_TEXT", "FAKE_PROBE",
+              "FAKE_PROBE_LOG"):
         monkeypatch.delenv(k, raising=False)
     return monkeypatch
 

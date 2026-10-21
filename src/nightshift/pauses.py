@@ -21,14 +21,14 @@ tests).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import failures
-from .adapters.base import RateLimit
+from .adapters.base import ProbeReply, RateLimit
 from .config import Config
 from .db import Database, StateChanged
 from .priority import resume_order
@@ -71,9 +71,10 @@ def _log(cfg: Config, row: Mapping[str, Any], at: datetime, text: str) -> None:
 
 
 def resume_time(cfg: Config, kind: str, limit: RateLimit | None, at: datetime) -> str | None:
-    """When the daemon requeues a Task paused at ``at``: the reported reset
-    time; with none, after ``usage.probe_interval_minutes`` (the reset is then
-    found by trying again). A pause by hand only ends by hand (None)."""
+    """When the daemon next looks at a Task paused at ``at``: the reported
+    reset time (it is then requeued); with none, after
+    ``usage.probe_interval_minutes``, when the daemon probes the agent
+    (:func:`promote_due`). A pause by hand only ends by hand (None)."""
     if kind == KIND_BY_HAND:
         return None
     if limit is not None and limit.reset_at:
@@ -104,7 +105,7 @@ def pause_after_attempt(
     elif limit is not None and limit.reset_at:
         why = f"{reason}; resets at {resume_at}"
     else:
-        why = f"{reason}; no reset time given, trying again at {resume_at}"
+        why = f"{reason}; no reset time given, probing at {resume_at}"
     fields: dict[str, Any] = {
         "pause_kind": kind,
         "pause_limit_type": limit.limit_type if limit else None,
@@ -144,14 +145,29 @@ class Promoted:
     resumed: list[str] = field(default_factory=list)
     reapproval: list[str] = field(default_factory=list)
     cancelled: list[str] = field(default_factory=list)
+    still_out: list[str] = field(default_factory=list)  # a probe found the limit still there
+    probes: dict[str, ProbeReply] = field(default_factory=dict)  # agent -> what its probe found
+
+#: Sends an agent a minimal probe request (``nightshift.usage.probe``).
+Prober = Callable[[str], ProbeReply]
 
 
 _CLEAR_PAUSE = {"pause_kind": None, "pause_limit_type": None, "pause_reset_at": None,
                 "resume_at": None}
 
 
-def promote_due(cfg: Config, db: Database, now: datetime) -> Promoted:
-    """Expire or requeue paused Tasks, in resume order (§2.6)."""
+def promote_due(cfg: Config, db: Database, now: datetime,
+                prober: Prober | None = None) -> Promoted:
+    """Expire or requeue paused Tasks, in resume order (§2.6).
+
+    A Task paused on a real limit with no known reset time is not requeued
+    blindly at its probe time: ``prober`` sends the agent a minimal request
+    first (once per agent per call). It went through: the Task is queued.
+    Still limited: the Task stays paused until the reset the probe reported,
+    else the next probe interval. The probe itself failed: the Task is
+    queued and tries for itself (it pauses again if the limit is still
+    there). Without a ``prober`` such Tasks are requeued at their probe time.
+    """
     out = Promoted()
     max_paused = timedelta(hours=cfg.usage("reapproval_after_hours"))
     for row in resume_order(cfg, db.tasks_in_state(TaskState.PAUSED_USAGE), now):
@@ -176,6 +192,21 @@ def promote_due(cfg: Config, db: Database, now: datetime) -> Promoted:
             elif row["resume_at"] and parse_iso(row["resume_at"]) <= now:
                 what = ("reset time" if row["pause_reset_at"] else "retry time")
                 reason = f"usage pause over ({what} {row['resume_at']}); queued to resume"
+                if (prober is not None and row["pause_kind"] == KIND_LIMIT
+                        and not row["pause_reset_at"]):
+                    agent = row["agent"]
+                    if agent not in out.probes:
+                        out.probes[agent] = prober(agent)
+                    found = out.probes[agent]
+                    if found.available:
+                        reason = f"probe: {agent} answered, its usage Window has reset; queued to resume"
+                    elif found.limit is not None:
+                        _still_out(cfg, db, row, found.limit, now)
+                        out.still_out.append(tid)
+                        continue
+                    else:
+                        reason = (f"probe of {agent} failed ({found.error}); queued to resume, "
+                                  "the Task tries for itself")
                 db.transition(tid, TaskState.QUEUED, reason, expect=TaskState.PAUSED_USAGE,
                               set_fields=_CLEAR_PAUSE)
                 _log(cfg, row, now, reason)
@@ -183,6 +214,25 @@ def promote_due(cfg: Config, db: Database, now: datetime) -> Promoted:
         except StateChanged:
             continue  # resumed, cancelled or paused by hand meanwhile
     return out
+
+
+def _still_out(cfg: Config, db: Database, row: Mapping[str, Any], limit: RateLimit,
+               now: datetime) -> None:
+    """A probe found the agent still out of usage: keep the Task paused until
+    the reset the probe reported, else the next probe interval."""
+    resume_at = resume_time(cfg, KIND_LIMIT, limit, now)
+    with db.tx() as c:
+        c.execute(
+            "UPDATE tasks SET resume_at = ?, pause_reset_at = ?, "
+            "pause_limit_type = COALESCE(?, pause_limit_type) WHERE id = ? AND state = ?",
+            (resume_at, resume_at if limit.reset_at else None, limit.limit_type, row["id"],
+             str(TaskState.PAUSED_USAGE)),
+        )
+    if limit.reset_at:
+        why = f"probe: {row['agent']} is still out of usage; resets at {resume_at}"
+    else:
+        why = f"probe: {row['agent']} is still out of usage, no reset time given; probing at {resume_at}"
+    _log(cfg, row, now, why)
 
 
 def _sync_yaml_unapproved(folder: Path) -> None:

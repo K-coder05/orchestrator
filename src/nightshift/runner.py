@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import failures, pauses, report
+from . import failures, pauses, report, usage
 from .adapters import get_adapter
 from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
 from .config import Config
@@ -157,19 +157,28 @@ class AttemptControl:
         self.pending: tuple[str, str, RateLimit | None] | None = None
         self.pending_since: float | None = None
         self.grace_seconds: float = 120.0
+        #: On a real limit, how long the agent may take to end the session
+        #: itself (and report its usage) before it is stopped.
+        self.limit_wait_seconds: float = 0.0
 
     def stop_after_step(self, reason: str, kind: str, limit: RateLimit | None = None) -> None:
         if self.pending is None:
             self.pending = (reason, kind, limit)
             self.pending_since = time.monotonic()
+        elif (self.pending[1] == kind and limit is not None and limit.reset_at
+              and (self.pending[2] is None or not self.pending[2].reset_at)):
+            # A later report of the same hit that carries the reset time.
+            self.pending = (self.pending[0], kind, limit)
         self.maybe_stop()
 
     def maybe_stop(self) -> None:
         """Carry out a pending stop-after-step once the Step is done."""
         if self.pending is None or self.stop_requested:
             return
-        overdue = self.pending_since is not None and (
-            time.monotonic() - self.pending_since >= self.grace_seconds)
+        elapsed = time.monotonic() - self.pending_since if self.pending_since is not None else 0.0
+        overdue = elapsed >= self.grace_seconds
+        if self.pending[1] == pauses.KIND_LIMIT and elapsed < self.limit_wait_seconds and not overdue:
+            return  # the CLI usually ends a session that hit a limit by itself
         if not self.inflight or overdue:
             self.request_stop(self.pending[0])
 
@@ -292,6 +301,7 @@ def run_attempt(
     clock = clock or (lambda: now(cfg.timezone))
     control = control or AttemptControl()
     control.grace_seconds = cfg.usage("step_grace_seconds")
+    control.limit_wait_seconds = cfg.usage("limit_exit_wait_seconds")
     control.inflight.clear()
     control.pending = control.pending_since = None
     row = db.get_task(task_id)
@@ -301,6 +311,8 @@ def run_attempt(
     redact = cfg.secrets.redact
     agent_name = row["agent"]
     adapter = adapter_provider(agent_name, cfg.agent(agent_name))
+    if hasattr(adapter, "clock"):
+        adapter.clock = clock  # reset times given as a clock time ("resets 3pm")
 
     # A fresh policy every Attempt, so config changes apply and nothing the
     # agent did to an earlier one carries over.
@@ -407,6 +419,8 @@ def run_attempt(
                             session_recorded = True
                         elif ev.kind == EventKind.ERROR and not ev.data.get("tool_error"):
                             errors.append(str(ev.data.get("message")))
+                        elif ev.kind == EventKind.RATE_LIMIT_INFO:
+                            usage.record_windows(db, agent_name, adapter.window_info(ev), clock())
                         if ev.kind == EventKind.TOOL_CALL:
                             steps += 1
                             control.inflight.add(str(ev.data.get("id") or f"step-{steps}"))
@@ -444,8 +458,8 @@ def run_attempt(
                 control.pending = (STOP_USAGE_LIMIT, pauses.KIND_LIMIT, limit)
 
     # -- decide the outcome --------------------------------------------------
-    usage = adapter.usage_from_run()
-    db.record_usage(run_id, task_id, agent_name, [u.as_dict() for u in usage])
+    db.record_usage(run_id, task_id, agent_name, [u.as_dict() for u in adapter.usage_from_run()],
+                    at=iso(clock()))
     report_text = (folder / "report.md").read_text() if (folder / "report.md").exists() else ""
     ok = adapter.result_ok()
     detail: str | None = None
@@ -472,6 +486,12 @@ def run_attempt(
         db.finish_attempt(run_id, exit_code=exit_code, outcome="paused", end_reason=end_reason,
                           session_id=adapter.session_id())
         _log(folder, f"{iso(now(cfg.timezone))} Attempt {attempt_no} ended: {end_reason}", redact)
+        if kind == pauses.KIND_LIMIT:
+            # A real hit (never a simulated one): a Limit observation.
+            obs = usage.record_limit_hit(cfg, db, agent_name, limit, at=clock(), source="attempt",
+                                         task_id=task_id, run_id=run_id)
+            if obs is not None:
+                _log(folder, f"{iso(now(cfg.timezone))} recorded Limit observation {obs}", redact)
         pauses.pause_after_attempt(cfg, db, task_id, kind=kind, limit=limit,
                                    reason=end_reason, at=clock(), run_id=run_id)
         return AttemptResult(run_id=run_id, state=TaskState.PAUSED_USAGE,

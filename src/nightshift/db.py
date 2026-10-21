@@ -153,6 +153,56 @@ MIGRATIONS: list[str] = [
     -- current Step.
     ALTER TABLE tasks ADD COLUMN pause_requested_at TEXT;
     """,
+    # 5: Limit observations and Window status (§1.5, §3.1 item 13).
+    """
+    -- One row per actual usage-limit hit in a Window, with the usage
+    -- Nightshift had recorded in that Window up to the hit. Baselines are
+    -- learned from these (lowest cost of the last 3 per agent and Window).
+    CREATE TABLE limit_observations (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent                  TEXT NOT NULL,
+        window                 TEXT NOT NULL,
+        limit_type             TEXT,
+        hit_at                 TEXT NOT NULL,
+        source                 TEXT NOT NULL,
+        task_id                TEXT REFERENCES tasks(id),
+        run_id                 INTEGER REFERENCES runs(id),
+        resets_at              TEXT,
+        window_start           TEXT NOT NULL,
+        cost_usd               REAL,
+        events_without_cost    INTEGER NOT NULL DEFAULT 0,
+        input_tokens           INTEGER NOT NULL DEFAULT 0,
+        output_tokens          INTEGER NOT NULL DEFAULT 0,
+        cache_creation_tokens  INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens      INTEGER NOT NULL DEFAULT 0,
+        requests               INTEGER NOT NULL DEFAULT 0,
+        utilization            REAL
+    );
+    CREATE INDEX limit_observations_window ON limit_observations(agent, window, id);
+
+    -- The latest status an agent reported for each of its Windows (reset
+    -- time, plan-wide utilization); tells where the current Window started.
+    CREATE TABLE window_status (
+        agent        TEXT NOT NULL,
+        window       TEXT NOT NULL,
+        resets_at    TEXT,
+        utilization  REAL,
+        status       TEXT,
+        seen_at      TEXT NOT NULL,
+        PRIMARY KEY (agent, window)
+    );
+
+    -- When the next probe of an agent out of usage is due (no reset time
+    -- known), and what the last probe found.
+    CREATE TABLE probes (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent      TEXT NOT NULL,
+        at         TEXT NOT NULL,
+        outcome    TEXT NOT NULL CHECK (outcome IN ('available', 'limited', 'error')),
+        resets_at  TEXT,
+        detail     TEXT
+    );
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -378,8 +428,9 @@ class Database:
         ).fetchall()
 
     # -- Usage ----------------------------------------------------------------
-    def record_usage(self, run_id: int, task_id: str, agent: str, usage: list[dict]) -> None:
-        at = self._now()
+    def record_usage(self, run_id: int, task_id: str, agent: str, usage: list[dict],
+                     *, at: str | None = None) -> None:
+        at = at or self._now()
         with self.tx() as c:
             for u in usage:
                 c.execute(
@@ -480,3 +531,67 @@ class Database:
         return self.conn.execute(
             "SELECT * FROM usage_events WHERE task_id = ? ORDER BY id", (task_id,)
         ).fetchall()
+
+    # -- Windows, Limit observations, probes (§1.5) -----------------------------
+    def agent_usage(self, agent: str) -> list[sqlite3.Row]:
+        """Every usage row of ``agent``: Attempts (``usage_events``) and
+        calls outside Attempts (planning calls, probes: ``planning_usage``)."""
+        cols = ("at, model, input_tokens, output_tokens, cache_creation_tokens, "
+                "cache_read_tokens, requests, cost_usd")
+        return self.conn.execute(
+            f"SELECT {cols}, 'attempt' AS kind FROM usage_events WHERE agent = ? "
+            f"UNION ALL SELECT {cols}, kind FROM planning_usage WHERE agent = ?",
+            (agent, agent),
+        ).fetchall()
+
+    def usage_agents(self) -> list[str]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT agent FROM usage_events UNION SELECT agent FROM planning_usage "
+            "UNION SELECT agent FROM limit_observations UNION SELECT agent FROM window_status"
+        ).fetchall()]
+
+    def insert_limit_observation(self, fields: dict[str, Any]) -> int:
+        cols = ", ".join(fields)
+        marks = ", ".join("?" for _ in fields)
+        with self.tx() as c:
+            cur = c.execute(f"INSERT INTO limit_observations ({cols}) VALUES ({marks})",
+                            list(fields.values()))
+            return int(cur.lastrowid)
+
+    def limit_observations(self, agent: str | None = None,
+                           window: str | None = None) -> list[sqlite3.Row]:
+        """Limit observations, oldest first."""
+        sql, args = "SELECT * FROM limit_observations WHERE 1 = 1", []
+        if agent is not None:
+            sql, args = sql + " AND agent = ?", [*args, agent]
+        if window is not None:
+            sql, args = sql + " AND window = ?", [*args, window]
+        return self.conn.execute(sql + " ORDER BY id", args).fetchall()
+
+    def set_window_status(self, agent: str, window: str, *, resets_at: str | None,
+                          utilization: float | None, status: str | None, seen_at: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "INSERT INTO window_status (agent, window, resets_at, utilization, status, seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (agent, window) DO UPDATE SET "
+                "resets_at = COALESCE(excluded.resets_at, resets_at), "
+                "utilization = COALESCE(excluded.utilization, utilization), "
+                "status = COALESCE(excluded.status, status), seen_at = excluded.seen_at",
+                (agent, window, resets_at, utilization, status, seen_at),
+            )
+
+    def window_status(self, agent: str) -> dict[str, sqlite3.Row]:
+        return {r["window"]: r for r in self.conn.execute(
+            "SELECT * FROM window_status WHERE agent = ?", (agent,)).fetchall()}
+
+    def record_probe(self, agent: str, *, at: str, outcome: str, resets_at: str | None,
+                     detail: str | None) -> None:
+        with self.tx() as c:
+            c.execute("INSERT INTO probes (agent, at, outcome, resets_at, detail) "
+                      "VALUES (?, ?, ?, ?, ?)", (agent, at, outcome, resets_at, detail))
+
+    def probes(self, agent: str | None = None) -> list[sqlite3.Row]:
+        if agent is None:
+            return self.conn.execute("SELECT * FROM probes ORDER BY id").fetchall()
+        return self.conn.execute("SELECT * FROM probes WHERE agent = ? ORDER BY id",
+                                 (agent,)).fetchall()

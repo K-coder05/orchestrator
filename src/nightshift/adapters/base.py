@@ -97,6 +97,20 @@ class RateLimit:
 
 
 @dataclass
+class WindowInfo:
+    """What the agent said about one of its usage Windows (not a hit).
+
+    Claude reports this on every ``rate_limit_event``; Nightshift keeps the
+    latest per agent and Window to know where the current Window starts.
+    """
+
+    window: str  # e.g. five_hour, seven_day
+    resets_at: str | None = None  # ISO 8601
+    utilization: float | None = None  # 0..1 of the whole plan, interactive use included
+    status: str | None = None
+
+
+@dataclass
 class Usage:
     """Usage for one model within one Attempt; every field the agent reports."""
 
@@ -122,6 +136,22 @@ class PlanningReply:
     text: str | None = None
     error: str | None = None
     usage: list[Usage] = field(default_factory=list)
+
+
+@dataclass
+class ProbeReply:
+    """What a minimal probe request found out about an agent's usage (§1.5).
+
+    ``available``: the request went through, the Window has reset.
+    ``limit``: it was refused by a usage limit (reset time if reported).
+    Neither: the probe itself failed (``error``) and says nothing.
+    """
+
+    available: bool
+    limit: RateLimit | None = None
+    error: str | None = None
+    usage: list[Usage] = field(default_factory=list)
+    windows: list[WindowInfo] = field(default_factory=list)
 
 
 class AgentAdapter(ABC):
@@ -178,6 +208,19 @@ class AgentAdapter(ABC):
     @abstractmethod
     def parse_planning_output(self, stdout: str, exit_code: int) -> PlanningReply:
         """Turn a planning call's output into a ``PlanningReply``."""
+
+    @abstractmethod
+    def probe_command(self) -> Command:
+        """The smallest request that tells whether the agent's usage Window
+        has reset: no tools, no session, a one-word answer (§1.5)."""
+
+    @abstractmethod
+    def parse_probe_output(self, stdout: str, exit_code: int) -> ProbeReply:
+        """Turn a probe's output into a ``ProbeReply``."""
+
+    def window_info(self, event: Event) -> list[WindowInfo]:
+        """Usage-Window status carried by ``event`` (none by default)."""
+        return []
 
     def result_ok(self) -> bool | None:
         """Whether the agent reported success (None if it never reported)."""

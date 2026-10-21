@@ -25,7 +25,7 @@ from typing import IO, Any
 
 import nightshift
 
-from . import failures, pauses
+from . import failures, pauses, usage
 from .adapters import get_adapter
 from .config import Config
 from .db import Database
@@ -182,6 +182,7 @@ class QueueRunner:
         log: Callable[[str], None] | None = None,
         clock: Callable[[], datetime] | None = None,
         post_hooks_for: Callable[[Config, Any], Any] = failures.post_hooks_for,
+        prober: Callable[[str], Any] | None = None,
     ):
         self.cfg = cfg
         self.db = db
@@ -192,6 +193,9 @@ class QueueRunner:
         # The queue's notion of "now"; tests pass a fake clock.
         self.clock = clock or (lambda: now(cfg.timezone))
         self.post_hooks_for = post_hooks_for
+        # Minimal probe requests for agents out of usage with no reset time.
+        self.prober = prober or (lambda agent: usage.probe(
+            self.cfg, self.db, agent, adapter_provider=self.adapter_provider, clock=self.clock))
         self.current: str | None = None
         self.control: AttemptControl | None = None
         self.started_at = iso(now(cfg.timezone))
@@ -244,7 +248,11 @@ class QueueRunner:
     def promote_paused(self) -> pauses.Promoted:
         """Expire paused Tasks or requeue them once their reset time has come
         (§2.6), in resume order."""
-        done = pauses.promote_due(self.cfg, self.db, self.clock())
+        done = pauses.promote_due(self.cfg, self.db, self.clock(), prober=self.prober)
+        for agent, found in done.probes.items():
+            what = ("available" if found.available else "still out of usage"
+                    if found.limit is not None else f"probe failed: {found.error}")
+            self.log(f"probed {agent}: {what}")
         for tid in done.cancelled:
             self.log(f"Task {tid} deadline passed while paused; cancelled")
         for tid in done.reapproval:

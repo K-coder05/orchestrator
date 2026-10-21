@@ -515,3 +515,66 @@ lasting consequences go in `docs/adr/` instead.
   (Bash `sleep 8` Steps) returned after 4s, once the Step finished; Attempt
   1 `paused by hand after 2 Steps`; `orch resume` resumed the same session
   and it finished `done`. No agent or daemon process was left running.
+
+## Phase 1, issue #9: reset detection, probing, Limit observations, `orch usage`
+
+- **Real format recorded.** A real five-hour limit hit happened on this Mac
+  on 2026-10-21 (00:52 PDT); the stream is `tests/fixtures/claude_limit_hit.jsonl`
+  and the format is in `docs/adapters.md`. `detect_rate_limit` now reads
+  `api_error: usage_limit_reached` / `api_error_params.rate_limit_info`
+  and the reset time and Window from the message text ("resets 3:20am
+  (America/Los_Angeles)", "session" -> `five_hour`, "weekly" ->
+  `seven_day`). A text clock time is resolved against the adapter's
+  `clock` (run_attempt passes its clock in). A later report of the same hit
+  can add a reset time the first one lacked.
+- **Probing replaces "the Task is the probe".** A Task paused on a real
+  limit with no reset time: at its `resume_at` (probe interval, 30 min) the
+  daemon calls `probe_command` once per agent (`pauses.promote_due(...,
+  prober=)`, default `usage.probe`; `QueueRunner(prober=)` is the seam).
+  Available -> queued; still limited -> stays paused until the reported
+  reset or the next interval (no state change, a log line); probe failed
+  (crash, timeout, unknown error) -> queued, so a broken probe can never
+  hold a Task forever. Known reset times still requeue without a probe.
+  New adapter abstract methods `probe_command()` / `parse_probe_output()`
+  (a Codex adapter must implement them) and an optional `window_info(event)`.
+- **Migration 5:** `limit_observations`, `window_status`, `probes`.
+  Probe usage goes to `planning_usage` (kind `probe`, task_id NULL); that
+  table now holds every non-Attempt call. `db.agent_usage(agent)` unions
+  both tables. `record_usage(..., at=)` dates usage with the runner's
+  clock.
+- **Usage of a stopped Attempt.** With no `result` line the Claude adapter
+  sums the per-message usage of the stream (tokens, one request per
+  message, no cost). To get the real cost on a limit hit, the agent gets
+  `usage.limit_exit_wait_seconds` (10) to end the session itself before
+  it is stopped (only for real limits, not simulated or by hand).
+- **Limit observations.** Recorded for every real hit (Attempt or probe),
+  never for a simulated one (it would teach a fake Baseline). Window:
+  the hit's `rateLimitType`; a hit that names none counts as the agent's
+  shortest configured Window (less usage: conservative). Window start:
+  `reset - length` when the reset is known, else the current Window from
+  `window_status`, else the trailing length. Usage up to the hit: every
+  row of that agent dated in `(start, hit]` (an Attempt's row is dated at
+  its end), cost-equivalent summed where reported, plus tokens, requests,
+  rows without cost and the last plan-wide utilization. One observation per
+  Window: a hit while the last observation's Window is still out (same
+  reset, reset still ahead, or no reset and within one length) is skipped.
+- **Baseline** = lowest cost-equivalent of the last 3 observations of a
+  Window, skipping observations with no own cost (0 or NULL: the Window
+  was used up interactively, which says nothing about capacity). It exists
+  from the first usable observation. Nothing acts on Baselines yet
+  (thresholds are Phase 2).
+- **Window lengths** in config `usage.windows.<agent>` (`claude:
+  {five_hour: 5, seven_day: 168}`); unlisted `seven_day*` types are 168h.
+- **`orch usage [--probe AGENT]`**: per agent and Window the current period,
+  Nightshift's usage in it (cost-equivalent, tokens, requests), the
+  agent-reported utilization, and the Baseline or "none yet (n
+  observations)"; then the latest Limit observations, the last probe and
+  Tasks paused on a limit. `cli.probe_provider` is the test seam.
+- **Real-machine check (2026-10-21).** Scratch config, haiku. At 00:52 the
+  plan was really out (five_hour 104%): `orch usage --probe claude`
+  reported `five_hour`, reset 03:20 PDT, and stored a Limit observation
+  ($0: none of the Window's usage was Nightshift's, so no Baseline from
+  it). At 03:24 a real Task ran `done`, and `orch usage --probe claude`
+  answered "available". A full real Attempt pausing on a real hit was not
+  run (the Window had reset by then); that path is covered with the fake
+  CLI replaying the recorded format.

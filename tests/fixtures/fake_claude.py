@@ -13,6 +13,62 @@ if os.environ.get("FAKE_IGNORE_TERM"):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 prompt = sys.stdin.read()
+LIMIT_TEXT = "You've hit your session limit \u00b7 resets 3:20am (America/Los_Angeles)"
+
+
+def limit_hit(fmt, resets_at, sid):
+    """The lines real claude 2.1.306 printed for a usage-limit hit
+    (tests/fixtures/claude_limit_hit.jsonl); exit code 1."""
+    text = os.environ.get("FAKE_LIMIT_TEXT", LIMIT_TEXT)
+    info = {"status": "rejected", "resetsAt": resets_at, "rateLimitType": "five_hour",
+            "overageStatus": "rejected", "isUsingOverage": False}
+    if fmt == "real":
+        print(json.dumps({"type": "rate_limit_event", "rate_limit_info": dict(
+            info, unifiedWindows={"five_hour": {"utilization": 1.04, "resetsAt": resets_at}}),
+            "session_id": sid}), flush=True)
+    if fmt == "none":
+        text = "Claude AI usage limit reached"
+    assistant = {"type": "assistant", "message": {"id": "synthetic-1", "model": "<synthetic>",
+                 "content": [{"type": "text", "text": text}], "usage": {"input_tokens": 0,
+                 "output_tokens": 0}}, "session_id": sid, "error": "rate_limit",
+                 "is_api_error_message": True, "api_error_status": 429}
+    if fmt == "real":
+        assistant |= {"api_error": "usage_limit_reached", "api_error_params": {"rate_limit_info": info}}
+    print(json.dumps(assistant), flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "result": text,
+                      "api_error_status": 429, "api_error": "usage_limit_reached" if fmt == "real" else None,
+                      "total_cost_usd": 0, "modelUsage": {}, "session_id": sid}), flush=True)
+    sys.exit(1)
+
+
+if "--no-session-persistence" in sys.argv:
+    # A probe (FAKE_PROBE: ok | real | text | none | error); no Task folder here.
+    if os.environ.get("FAKE_PROBE_LOG"):
+        with open(os.environ["FAKE_PROBE_LOG"], "a") as f:
+            f.write(json.dumps({"argv": sys.argv[1:], "stdin": prompt}) + "\n")
+    mode = os.environ.get("FAKE_PROBE", "ok")
+    sid = "probe-session"
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": sid}), flush=True)
+    if mode == "error":
+        print("boom", file=sys.stderr)
+        sys.exit(2)
+    if mode != "ok":
+        limit_hit(mode, int(os.environ.get("FAKE_RESETS_AT", "1792578000")), sid)
+    print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "allowed", "resetsAt": 1792578000, "rateLimitType": "five_hour",
+        "unifiedWindows": {"five_hour": {"utilization": 0.02, "resetsAt": 1792578000}}},
+        "session_id": sid}), flush=True)
+    print(json.dumps({"type": "assistant", "message": {"id": "msg_probe", "model": "claude-haiku-5-5",
+                      "content": [{"type": "text", "text": "OK"}],
+                      "usage": {"input_tokens": 9, "output_tokens": 1}}, "session_id": sid}), flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "OK",
+                      "session_id": sid, "total_cost_usd": 0.0001, "modelUsage": {
+                          "claude-haiku-5-5": {"inputTokens": 9, "outputTokens": 1,
+                                               "cacheReadInputTokens": 0,
+                                               "cacheCreationInputTokens": 0, "costUSD": 0.0001}}}),
+          flush=True)
+    sys.exit(0)
+
 Path("logs/fake_invocation.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": prompt}))
 with open("logs/fake_invocations.jsonl", "a") as f:
     f.write(json.dumps({"argv": sys.argv[1:], "stdin": prompt}) + "\n")
@@ -30,14 +86,11 @@ delay = float(os.environ.get("FAKE_STEP_DELAY") or 0)
 limit_at = int(os.environ.get("FAKE_LIMIT_AT") or 0)
 for n, line in enumerate(Path(os.environ["FAKE_STREAM"]).read_text().splitlines(), start=1):
     if limit_at and n == limit_at and not Path("logs/fake_limit_hit").exists():
-        # A real-looking limit hit: the CLI reports it and ends the session.
+        # A limit hit as real claude prints it; the CLI ends the session.
         Path("logs/fake_limit_hit").write_text("1")
-        print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
-            "status": "rejected", "resetsAt": int(os.environ.get("FAKE_RESETS_AT", "1792578000")),
-            "rateLimitType": "five_hour"}}), flush=True)
-        print(json.dumps({"type": "result", "subtype": "success", "is_error": True,
-                          "result": "Claude AI usage limit reached", "session_id": "x"}), flush=True)
-        sys.exit(1)
+        limit_hit(os.environ.get("FAKE_LIMIT_FORMAT", "real"),
+                  int(os.environ.get("FAKE_RESETS_AT", "1792578000")),
+                  "f5e745a1-aea4-451e-bef1-64b1544eb8de")
     print(line, flush=True)
     if delay:
         time.sleep(delay)

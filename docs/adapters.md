@@ -151,23 +151,105 @@ One `Usage` per model from `result.modelUsage`: input, output, cache-write and
 cache-read tokens, and `costUSD` as the **reported cost-equivalent**. On a
 subscription this is not money spent; the report shows it next to
 "$0.00 (subscription)". Request count is the number of distinct assistant
-`message.id`s in the Attempt (the API calls made). The raw per-model object is
-stored too, so no reported field is lost.
+`message.id`s in the Attempt (the API calls made; synthetic error messages
+don't count). The raw per-model object is stored too, so no reported field
+is lost.
 
-### Rate limits
+An Attempt stopped before its `result` line (SIGTERM on a pause, the
+runtime cap) still records usage: per model, the tokens of each assistant
+message seen in the stream (largest value per message id; one message spans
+several lines) and one request per message, with **no cost** (`cost_usd`
+NULL, `raw: {"source": "stream messages"}`). Window sums count such rows as
+"without cost".
 
-- Seen so far: only `rate_limit_event` with `status: "allowed"`. It arrives
-  during a normal run and includes window utilization and reset times.
-- **Not yet observed: an actual limit hit.** `detect_rate_limit` treats as a
-  hit (best guess; real formats still to be recorded here when one happens):
-  a `rate_limit_event` whose `status` doesn't start with `allowed` (so
-  `allowed_warning` is not a hit, `rejected` is), with `rateLimitType` and
-  `resetsAt` (Unix seconds -> ISO 8601) as limit type and reset time; or a
-  non-tool error (assistant `error` string or an `is_error` result) with
-  `api_error_status` 429 or a message matching usage limit / rate limit /
-  "hit your limit" / "limit reached" / "too many requests" (no reset time).
-  Tool output that mentions a rate limit is never a hit. The exit code alone
-  is not used (1 is every error).
+### Rate limits (real format, recorded 2026-10-21)
+
+**A real limit hit was observed** on 2.1.306 (Pro plan, haiku) at 00:52 PDT
+on 2026-10-21, with the five-hour Window used up. Recorded sample:
+`tests/fixtures/claude_limit_hit.jsonl`. `claude -p` refuses the request
+at once (no retries) and ends the session; exit code **1**; stderr empty.
+Three lines say so, in this order:
+
+1. `rate_limit_event` with `rate_limit_info.status: "rejected"`,
+   `rateLimitType: "five_hour"`, `resetsAt: <Unix seconds>`,
+   `overageStatus`, `isUsingOverage: false`, and `unifiedWindows`
+   (`five_hour.utilization` was `1.04`, `seven_day` `0.18`, each with its
+   `resetsAt`).
+2. A **synthetic assistant message** (`message.model: "<synthetic>"`, a UUID
+   as `message.id`, zero usage) whose text is
+   `You've hit your session limit · resets 3:20am (America/Los_Angeles)`,
+   with top-level `error: "rate_limit"`, `is_api_error_message: true`,
+   `api_error_status: 429`, **`api_error: "usage_limit_reached"`**,
+   `api_error_params.rate_limit_info` (same shape as the event, without
+   `unifiedWindows`) and `api_error_origin: "first_party"`.
+3. The `result` line: `subtype: "success"` but `is_error: true`,
+   `terminal_reason: "api_error"`, `api_error_status: 429`,
+   `api_error: "usage_limit_reached"` (no `api_error_params`), the same text
+   in `result`, `total_cost_usd: 0`, empty `modelUsage`.
+
+The reset time was right: a Task run at 03:24 the same night went through.
+`rateLimitType` values in the CLI's own schema: `five_hour`, `seven_day`,
+`seven_day_opus`, `seven_day_sonnet`, `seven_day_overage_included`,
+`overage`; `status`: `allowed`, `allowed_warning`, `rejected`. The schema
+also says `error: "rate_limit"` without `usage_limit_reached` can be a
+temporary server throttle, an org policy, or a 429 on an API key, and
+carries no `rate_limit_info`.
+
+`detect_rate_limit` (one hit per Attempt; the first report wins, a later
+one adds a missing reset time):
+
+- `rate_limit_event` with a status that is not `allowed`/`allowed_warning`
+  -> `rateLimitType`, `resetsAt`. (`allowed` events arrive during normal
+  runs; `allowed_warning` is not a hit.)
+- An agent error (not a tool's) carrying `api_error_params.rate_limit_info`
+  or `api_error: usage_limit_reached` -> type and reset from it, else from
+  the text.
+- Any other agent error with code `rate_limit`, HTTP 429, or usage-limit
+  wording ("hit your limit", "usage limit", "limit reached", ...) -> the
+  Window and reset time are read from the **text** if it has them:
+  `resets 3:20am (America/Los_Angeles)`, `resets Oct 25, 3pm (Zone)`, the
+  older `Claude AI usage limit reached|<epoch>`; "session"/"5-hour" ->
+  `five_hour`, "weekly" -> `seven_day` (`_opus`/`_sonnet` when named). A
+  clock time is the next such time; no zone means the Mac's zone. No reset
+  time at all -> Nightshift probes.
+- Tool output that mentions a rate limit is never a hit; the exit code
+  alone is not used (1 is every error).
+
+On a hit Nightshift gives the CLI `usage.limit_exit_wait_seconds` (10) to
+end the session itself (it does so at once), so the `result` line with the
+Attempt's usage is read before any SIGTERM.
+
+### Probing (§1.5)
+
+When a limit hit gave no parseable reset time, the paused Task is not just
+retried: every `usage.probe_interval_minutes` (30) the daemon sends one
+minimal probe request per agent (`probe_command`):
+
+```
+claude -p --output-format stream-json --verbose [--model <agents.claude.model>] \
+  --tools "" --restricted --strict-mcp-config --permission-prompts none \
+  --no-session-persistence --system-prompt "Answer with the single word OK."
+# stdin "OK?", cwd <agents_root>/data/probe, timeout usage.probe_timeout_seconds (120)
+```
+
+`parse_probe_output` runs the stream through the same parser: a limit hit
+-> still out (with the reset time if it now has one: the paused Tasks wait
+for it); a successful `result` -> available (paused Tasks are queued); else
+the probe failed (the Task is queued and finds out for itself). Uses the Task
+model, since some limits are per model. Verified for real on 2026-10-21: at
+00:52 the probe reported `five_hour`, reset 03:20 PDT; at 03:24 it answered
+OK (haiku: 612 cache-write tokens, about $0.0001 cost-equivalent).
+`orch usage --probe claude` runs one by hand. Probe usage is stored in
+`planning_usage` (kind `probe`), every probe in `probes`.
+
+### Usage Windows
+
+Every `rate_limit_event` (also `allowed` ones) updates `window_status`:
+per Window the latest `resetsAt`, `utilization` and status. `utilization`
+is plan-wide (interactive use included); `orch usage` shows it as "AGENT
+REPORTS". The current Window is `[resetsAt - length, now]` while that reset
+is ahead, else the trailing `length` (config `usage.windows.claude`:
+`five_hour: 5`, `seven_day: 168` hours).
 
 ### Pause and resume (§2.6)
 
@@ -225,10 +307,18 @@ stored too, so no reported field is lost.
   ignores SIGTERM is SIGKILLed after 15s. A Codex adapter needs no change for
   this; it goes through the same watchdog.
 
-### Known gap: Nightshift sees only its own usage
+### Known gap: interactive use is invisible to Nightshift
 
-Nightshift records usage only from its own sessions, not from interactive use
-of the same plan. Usage recorded at a limit hit therefore undercounts the
-Window, so learned Baselines err low (conservative). The `rate_limit_event`
-`utilization` field may let a later phase see whole-plan utilization; not used
-yet.
+Nightshift records usage only from its own calls (Attempts, planning calls,
+probes), never from interactive use of the same plan (the Claude app,
+`claude` in a terminal, this Mac or another device). So:
+
+- usage recorded in a Window, and at a limit hit, **undercounts** the
+  Window; Baselines learned from Limit observations err **low**
+  (conservative: Nightshift would stop earlier, never later);
+- a Window used up interactively gives a Limit observation with little or
+  no recorded usage; observations with no reported cost are skipped for the
+  Baseline;
+- the plan-wide `utilization` in `rate_limit_event` does include
+  interactive use; `orch usage` shows it next to Nightshift's own numbers,
+  but Baselines don't use it (yet).

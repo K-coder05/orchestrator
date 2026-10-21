@@ -7,13 +7,15 @@ import time
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from . import priority
+from . import priority, usage
 from .adapters import get_adapter
 from .adapters.base import Event, EventKind
 from .config import Config
 from .db import Database
 from .states import TERMINAL, TaskState
+from .timeutil import iso, parse_iso
 
 
 def _short_time(value: str | None) -> str:
@@ -248,3 +250,89 @@ def queue_summary(db: Database) -> dict[str, int]:
         counts[r["state"]] = r["n"]
     return counts
 
+
+
+# --------------------------------------------------------------------------
+# orch usage
+# --------------------------------------------------------------------------
+
+USAGE_NOTE = (
+    "Nightshift counts only its own usage (Attempts, planning calls, probes). Interactive use "
+    "of the same plan is invisible to it, so recorded usage undercounts each Window and "
+    "Baselines err low.")
+
+
+def _local(value: str | None, tz: str) -> str:
+    if not value:
+        return "-"
+    return parse_iso(value).astimezone(ZoneInfo(tz)).strftime("%Y-%m-%d %H:%M")
+
+
+def _cost(value: float | None) -> str:
+    return "not reported" if value is None else f"${value:.4f}"
+
+
+def usage_agents(cfg: Config, db: Database) -> list[str]:
+    """Configured agents first, then any other agent with recorded usage."""
+    names = list((cfg.data.get("agents") or {}).keys())
+    return names + sorted(a for a in db.usage_agents() if a not in names)
+
+
+def format_usage(cfg: Config, db: Database, now: datetime) -> str:
+    """Usage per agent and Window, and whether each Window has a Baseline."""
+    tz = cfg.timezone
+    out: list[str] = []
+    for agent in usage_agents(cfg, db):
+        statuses = db.window_status(agent)
+        observed = {o["window"] for o in db.limit_observations(agent)}
+        windows = list(cfg.windows(agent))
+        windows += sorted((set(statuses) | observed) - set(windows))
+        rows = []
+        for w in windows:
+            start, reset = usage.current_window(cfg, db, agent, w, now)
+            used = usage.usage_between(db, agent, start, now)
+            period = (f"{_local(iso(start), tz)} to {_local(iso(reset), tz)}"
+                      if reset else f"last {cfg.window_hours(agent, w):g}h (reset not known)")
+            st = statuses.get(w)
+            said = "-"
+            if st is not None and st["utilization"] is not None:
+                said = f"{st['utilization'] * 100:.0f}% used"
+            if st is not None and st["status"] == "rejected" and reset:
+                said = "out of usage" + (f", {said}" if said != "-" else "")
+            n = len(db.limit_observations(agent, w))
+            base = usage.baseline(db, agent, w)
+            base_cell = (f"{_cost(base.cost_usd)} (lowest of last {base.observations})"
+                         if base else f"none yet ({n} observation{'s' if n != 1 else ''})")
+            cost = ("$0.0000" if used.events == 0 else _cost(used.cost_usd)) + (f" +{used.events_without_cost} w/o cost"
+                                           if used.events_without_cost else "")
+            rows.append([w, period, cost, f"{used.input_tokens:,}", f"{used.output_tokens:,}",
+                         f"{used.cache_creation_tokens:,}", f"{used.cache_read_tokens:,}",
+                         f"{used.requests:,}", said, base_cell])
+        out.append(f"{agent}")
+        out.append(_table(["  WINDOW", "CURRENT PERIOD", "COST-EQUIVALENT", "INPUT", "OUTPUT",
+                           "CACHE WRITE", "CACHE READ", "REQUESTS", "AGENT REPORTS", "BASELINE"],
+                          [["  " + r[0], *r[1:]] for r in rows]))
+        obs = db.limit_observations(agent)[-5:]
+        if obs:
+            out.append("  Limit observations (latest last):")
+            for o in obs:
+                extra = (f", {o['events_without_cost']} usage rows without cost"
+                         if o["events_without_cost"] else "")
+                where = f" Task {o['task_id']}" if o["task_id"] else ""
+                out.append(f"    {_local(o['hit_at'], tz)}  {o['window']}  {_cost(o['cost_usd'])}"
+                           f"{extra} since {_local(o['window_start'], tz)}; resets "
+                           f"{_local(o['resets_at'], tz)}; from {o['source']}{where}")
+        probes = db.probes(agent)
+        if probes:
+            p = probes[-1]
+            out.append(f"  Last probe: {_local(p['at'], tz)} {p['outcome']}"
+                       + (f" ({p['detail']})" if p["detail"] else ""))
+        paused = [r for r in db.tasks_in_state(TaskState.PAUSED_USAGE)
+                  if r["agent"] == agent and r["pause_kind"] == "usage_limit"]
+        for r in paused:
+            when = (f"resets {_local(r['resume_at'], tz)}" if r["pause_reset_at"]
+                    else f"next probe {_local(r['resume_at'], tz)}")
+            out.append(f"  Paused on its limit: Task {r['id']} ({when})")
+        out.append("")
+    out.append(USAGE_NOTE)
+    return "\n".join(out)

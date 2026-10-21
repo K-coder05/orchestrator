@@ -58,6 +58,15 @@ The prompt is the Task's one-line prompt; the agent's plan is saved to
 planning can approve a Task: only `orch approve` or a yes at the `orch add`
 prompt can, and every decision is recorded in the `approvals` table.
 
+## Usage probes
+
+A probe (an agent out of usage with no known reset time, or `orch usage
+--probe`) is confined the same way as a planning call: `--tools ""`,
+`--restricted --strict-mcp-config`, `--no-session-persistence`, a fixed
+one-line system prompt and the fixed prompt "OK?" (no Task content), in
+`<agents_root>/data/probe/`. Its answer is never used, only whether it went
+through.
+
 ## Limits
 
 ### Files (§1.4)

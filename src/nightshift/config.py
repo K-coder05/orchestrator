@@ -239,7 +239,26 @@ class Config:
         "probe_interval_minutes": 30,
         "step_grace_seconds": 120,
         "simulated_reset_minutes": 5,
+        "probe_timeout_seconds": 120,
+        "limit_exit_wait_seconds": 10,
     }
+
+    def windows(self, agent: str) -> dict[str, float]:
+        """``usage.windows.<agent>``: the agent's usage Windows and their
+        length in hours (§1.5). ``orch usage`` always lists these."""
+        table = ((self.data.get("usage") or {}).get("windows") or {}).get(agent) or {}
+        return {str(k): float(v) for k, v in table.items()}
+
+    def window_hours(self, agent: str, window: str | None) -> float:
+        """Length of a Window. Unknown names: weekly-looking ones (``seven_day_*``)
+        are 168h; anything else, and a hit that names no Window, counts as the
+        agent's shortest Window (less recorded usage: a conservative Baseline)."""
+        table = self.windows(agent)
+        if window and window in table:
+            return table[window]
+        if window and window.startswith("seven_day"):
+            return 168.0
+        return min(table.values()) if table else 5.0
 
     def usage(self, key: str) -> float:
         """A ``usage:`` setting (pauses and resume, §2.6)."""
@@ -289,6 +308,13 @@ def _validate(data: dict[str, Any]) -> None:
         value = usage.get(key, Config.USAGE_DEFAULTS[key])
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
             raise ConfigError(f"usage.{key} must be a number >= 0")
+    windows = usage.get("windows") or {}
+    if not isinstance(windows, dict) or not all(
+        isinstance(t, dict) and all(
+            isinstance(h, (int, float)) and not isinstance(h, bool) and h > 0 for h in t.values())
+        for t in windows.values()
+    ):
+        raise ConfigError("usage.windows must map agent -> {window name: hours > 0}")
     queue = data.get("queue") or {}
     if not isinstance(queue, dict):
         raise ConfigError("config section 'queue' must be a mapping")

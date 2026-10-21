@@ -10,6 +10,7 @@ from pathlib import Path
 import click
 
 from . import daemon, failures, pauses, planning, views
+from . import usage as usage_mod
 from . import priority as prio
 from .adapters import get_adapter
 from .config import ConfigError, load_config
@@ -459,6 +460,41 @@ def report(ctx, task_id):
     if not path.exists():
         raise click.ClickException(f"{path} does not exist")
     click.echo(path.read_text(), nl=False)
+
+
+# Tests replace this to run probes against a fake agent.
+probe_provider = get_adapter
+
+
+@main.command("usage")
+@click.option("--probe", "probe_agents", multiple=True, metavar="AGENT",
+              help="First send AGENT a minimal probe request (repeatable) to see whether "
+              "its usage Window has reset.")
+@click.pass_context
+def usage_cmd(ctx, probe_agents):
+    """Show usage per Window and whether each Window has a Baseline."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        for agent in probe_agents:
+            try:
+                cfg.agent(agent)
+            except ConfigError as exc:
+                raise click.ClickException(str(exc)) from None
+            found = usage_mod.probe(cfg, db, agent, adapter_provider=probe_provider,
+                                    clock=lambda: _clock(cfg))
+            if found.available:
+                click.echo(f"probe {agent}: available")
+            elif found.limit is not None:
+                reset = found.limit.reset_at or "no reset time given"
+                click.echo(f"probe {agent}: out of usage ({found.limit.limit_type or 'limit'}; "
+                           f"{reset})")
+            else:
+                click.echo(f"probe {agent}: failed: {found.error}")
+        if probe_agents:
+            click.echo()
+        click.echo(views.format_usage(cfg, db, _clock(cfg)))
+    finally:
+        db.close()
 
 
 # Tests replace this to run doctor and the daemon against a FakeHost.

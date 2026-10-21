@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .base import (
     AgentAdapter,
@@ -17,9 +19,11 @@ from .base import (
     PermissionPolicy,
     Permissions,
     PlanningReply,
+    ProbeReply,
     RateLimit,
     TaskContext,
     Usage,
+    WindowInfo,
 )
 
 # Tools that change files; tool_use blocks for these also yield FILE_CHANGE.
@@ -73,6 +77,12 @@ class ClaudeAdapter(AgentAdapter):
         self._session_id: str | None = None
         self._result: dict[str, Any] | None = None
         self._message_ids: set[str] = set()
+        # Per API message: (model, usage) as last seen in the stream; the
+        # fallback for an Attempt stopped before its `result` line.
+        self._message_usage: dict[str, tuple[str | None, dict[str, Any]]] = {}
+        # "Now" for reset times given as a clock time ("resets 3pm"); tests
+        # replace it.
+        self.clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
     # -- invocation ----------------------------------------------------------
     def _base_argv(self, permissions: Permissions) -> list[str]:
@@ -142,6 +152,43 @@ class ClaudeAdapter(AgentAdapter):
             "--json-schema", json.dumps(schema, separators=(",", ":")),
         ]
         return Command(argv=argv, stdin=prompt)
+
+    def probe_command(self) -> Command:
+        """``claude -p`` with no tools, no session, a one-line system prompt
+        and a one-word answer: the cheapest request that tells whether the
+        Window has reset. stream-json, so the ``rate_limit_event`` (status and
+        reset time) comes along. Uses the Task model (``agents.claude.model``),
+        since some limits are per model."""
+        argv = [self.binary, "-p", "--output-format", "stream-json", "--verbose"]
+        if self.model:
+            argv += ["--model", self.model]
+        argv += [
+            "--tools", "",
+            "--restricted", "--strict-mcp-config",
+            "--permission-prompts", "none",
+            "--no-session-persistence",
+            "--system-prompt", PROBE_SYSTEM,
+        ]
+        return Command(argv=argv, stdin=PROBE_PROMPT)
+
+    def parse_probe_output(self, stdout: str, exit_code: int) -> ProbeReply:
+        probe = ClaudeAdapter({"model": self.model})
+        probe.clock = self.clock
+        limit: RateLimit | None = None
+        windows: list[WindowInfo] = []
+        for line in stdout.splitlines():
+            for ev in probe.parse_stream(line):
+                windows += probe.window_info(ev)
+                hit = probe.detect_rate_limit(ev)
+                if hit is not None and (limit is None or (limit.reset_at is None and hit.reset_at)):
+                    limit = hit
+        usage = probe.usage_from_run()
+        if limit is not None:
+            return ProbeReply(available=False, limit=limit, usage=usage, windows=windows)
+        if exit_code == 0 and probe.result_ok():
+            return ProbeReply(available=True, usage=usage, windows=windows)
+        err = probe.result_error() or f"no result from claude (exit code {exit_code})"
+        return ProbeReply(available=False, error=err, usage=usage, windows=windows)
 
     def parse_planning_output(self, stdout: str, exit_code: int) -> PlanningReply:
         msg: dict[str, Any] | None = None
@@ -294,6 +341,10 @@ class ClaudeAdapter(AgentAdapter):
                         {
                             "message": msg.get("result") or msg.get("subtype"),
                             "api_error_status": msg.get("api_error_status"),
+                            "api_error": msg.get("api_error"),
+                            "rate_limit_info": (msg.get("api_error_params") or {}).get(
+                                "rate_limit_info") if isinstance(msg.get("api_error_params"), dict)
+                            else None,
                         },
                     )
                 )
@@ -302,8 +353,14 @@ class ClaudeAdapter(AgentAdapter):
 
     def _assistant_events(self, msg: dict[str, Any]) -> list[Event]:
         message = msg.get("message") or {}
-        if message.get("id"):
+        synthetic = message.get("model") == "<synthetic>"  # an API error, not a request
+        if message.get("id") and not synthetic:
             self._message_ids.add(message["id"])
+            if isinstance(message.get("usage"), dict):
+                seen = self._message_usage.get(message["id"], (None, {}))[1]
+                merged = {k: max(v, seen.get(k) or 0) if isinstance(v, int) else v
+                          for k, v in message["usage"].items()}
+                self._message_usage[message["id"]] = (message.get("model"), merged)
         events: list[Event] = []
         for block in message.get("content") or []:
             btype = block.get("type")
@@ -321,7 +378,16 @@ class ClaudeAdapter(AgentAdapter):
         if message.get("usage"):
             events.append(Event(EventKind.USAGE, {"usage": message["usage"], "final": False}))
         if msg.get("error"):
-            events.append(Event(EventKind.ERROR, {"message": str(msg["error"])}))
+            text = " ".join(b.get("text", "") for b in message.get("content") or []
+                            if isinstance(b, dict) and b.get("type") == "text").strip()
+            params = msg.get("api_error_params") or {}
+            events.append(Event(EventKind.ERROR, {
+                "message": str(msg["error"]),  # the error code, e.g. rate_limit
+                "text": text or None,
+                "api_error": msg.get("api_error"),  # e.g. usage_limit_reached
+                "api_error_status": msg.get("api_error_status"),
+                "rate_limit_info": params.get("rate_limit_info") if isinstance(params, dict) else None,
+            }))
         return events
 
     def _user_events(self, msg: dict[str, Any]) -> list[Event]:
@@ -339,33 +405,87 @@ class ClaudeAdapter(AgentAdapter):
 
     # -- results -------------------------------------------------------------
     def detect_rate_limit(self, event_or_exit: Event | int) -> RateLimit | None:
-        """A rate-limit hit, from the stream. Best effort until real hits are
-        recorded (docs/adapters.md): a ``rate_limit_event`` whose status is
-        not ``allowed``/``allowed_warning`` (e.g. ``rejected``), or an agent
-        (not tool) error with HTTP status 429 or a usage-limit message. The
-        exit code alone says nothing (1 is every error)."""
+        """A usage-limit hit, from the stream (formats in docs/adapters.md):
+
+        - a ``rate_limit_event`` whose status is ``rejected`` (not
+          ``allowed``/``allowed_warning``): ``rateLimitType`` and ``resetsAt``;
+        - an API error on the synthetic assistant message (or the ``result``)
+          with ``api_error: usage_limit_reached`` and
+          ``api_error_params.rate_limit_info`` (same shape as the event);
+        - otherwise an agent (not tool) error with code ``rate_limit``, HTTP
+          429, or a usage-limit message; the reset time and Window are then
+          read from the text ("resets 3pm (America/Los_Angeles)", the older
+          "Claude AI usage limit reached|<epoch>") when it has them.
+
+        The exit code alone says nothing (1 is every error).
+        """
         if not isinstance(event_or_exit, Event):
             return None
         ev = event_or_exit
         if ev.kind == EventKind.RATE_LIMIT_INFO:
-            status = str(ev.data.get("status") or "")
-            if status and not status.startswith("allowed"):
-                return RateLimit(limit_type=ev.data.get("rateLimitType"),
-                                 reset_at=_epoch_iso(ev.data.get("resetsAt")))
+            return _limit_from_info(ev.data)
+        if ev.kind != EventKind.ERROR or ev.data.get("tool_error"):
             return None
-        if ev.kind == EventKind.ERROR and not ev.data.get("tool_error"):
-            message = str(ev.data.get("message") or "")
-            if ev.data.get("api_error_status") == 429 or _LIMIT_TEXT.search(message):
-                return RateLimit(limit_type=None, reset_at=None)
+        info = ev.data.get("rate_limit_info")
+        text = " ".join(str(ev.data.get(k) or "") for k in ("text", "message")).strip()
+        if isinstance(info, dict):
+            hit = _limit_from_info(info)
+            if hit is not None or ev.data.get("api_error") == "usage_limit_reached":
+                hit = hit or RateLimit(limit_type=info.get("rateLimitType"),
+                                       reset_at=_epoch_iso(info.get("resetsAt")))
+                if hit.reset_at is None:
+                    hit.reset_at = parse_reset_text(text, self.clock())
+                return hit
+        if (ev.data.get("api_error") == "usage_limit_reached"
+                or ev.data.get("message") == "rate_limit"
+                or ev.data.get("api_error_status") == 429
+                or _LIMIT_TEXT.search(text)):
+            return RateLimit(limit_type=window_from_text(text),
+                             reset_at=parse_reset_text(text, self.clock()))
         return None
+
+    def window_info(self, event: Event) -> list[WindowInfo]:
+        """Window status from a ``rate_limit_event``: the limiting Window
+        (``rateLimitType``/``resetsAt``/``utilization``) and every entry of
+        ``unifiedWindows``."""
+        if event.kind != EventKind.RATE_LIMIT_INFO:
+            return []
+        d = event.data
+        out: dict[str, WindowInfo] = {}
+        for name, w in (d.get("unifiedWindows") or {}).items():
+            if isinstance(w, dict):
+                out[name] = WindowInfo(name, _epoch_iso(w.get("resetsAt")),
+                                       _num(w.get("utilization")))
+        name = d.get("rateLimitType")
+        if isinstance(name, str) and name:
+            w = out.setdefault(name, WindowInfo(name))
+            w.status = d.get("status")
+            w.resets_at = _epoch_iso(d.get("resetsAt")) or w.resets_at
+            if _num(d.get("utilization")) is not None:
+                w.utilization = _num(d.get("utilization"))
+        return list(out.values())
 
     def session_id(self) -> str | None:
         return self._session_id
 
     def usage_from_run(self) -> list[Usage]:
-        if not self._result:
-            return []
-        return _usage_from_result(self._result, requests=len(self._message_ids) or None)
+        """From the ``result`` line when there is one. An Attempt stopped
+        before it (SIGTERM on a pause, the runtime cap) still has the usage
+        of each API message seen in the stream: tokens and requests per
+        model, but no reported cost (``cost_usd`` None)."""
+        if self._result:
+            return _usage_from_result(self._result, requests=len(self._message_ids) or None)
+        by_model: dict[str | None, Usage] = {}
+        for model, u in self._message_usage.values():
+            acc = by_model.setdefault(model, Usage(model=model, input_tokens=0, output_tokens=0,
+                                                   cache_creation_tokens=0, cache_read_tokens=0,
+                                                   requests=0, raw={"source": "stream messages"}))
+            acc.input_tokens += u.get("input_tokens") or 0
+            acc.output_tokens += u.get("output_tokens") or 0
+            acc.cache_creation_tokens += u.get("cache_creation_input_tokens") or 0
+            acc.cache_read_tokens += u.get("cache_read_input_tokens") or 0
+            acc.requests += 1
+        return list(by_model.values())
 
     def result_ok(self) -> bool | None:
         if self._result is None:
@@ -383,9 +503,96 @@ class ClaudeAdapter(AgentAdapter):
 
 
 _LIMIT_TEXT = re.compile(
-    r"usage limit|rate limit|rate_limit|hit your limit|limit reached|too many requests",
+    r"usage limit|rate limit|rate_limit|hit your limit|limit reached|too many requests"
+    r"|hit your (?:weekly|session|five-hour|5-hour|opus|sonnet)",
     re.IGNORECASE,
 )
+
+PROBE_SYSTEM = "Answer with the single word OK."
+PROBE_PROMPT = "OK?"
+
+_EPOCH_TEXT = re.compile(r"limit reached\|(\d{9,11})")
+_RESET_TEXT = re.compile(
+    r"resets?\s+(?:at\s+|on\s+)?"
+    r"(?:(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(?P<day>\d{1,2}),?"
+    r"\s+(?:at\s+)?)?"
+    r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>am|pm)\b"
+    r"(?:\s*\((?P<tz>[A-Za-z_]+(?:/[A-Za-z0-9_+\-]+)*)\))?",
+    re.IGNORECASE,
+)
+_MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+
+
+def parse_reset_text(text: str, now: datetime) -> str | None:
+    """The reset time in a limit message, as ISO 8601, or None.
+
+    Understands the older ``Claude AI usage limit reached|<epoch seconds>``
+    and clock times such as ``resets 3pm``, ``resets 11:30am
+    (America/Los_Angeles)`` or ``resets Oct 25, 3pm (Europe/Paris)``. A clock
+    time without a date is the next such time after ``now``; without a zone
+    it is in this Mac's local zone.
+    """
+    if not text:
+        return None
+    m = _EPOCH_TEXT.search(text)
+    if m:
+        return _epoch_iso(int(m.group(1)))
+    m = _RESET_TEXT.search(text)
+    if not m:
+        return None
+    tz: Any = None
+    if m.group("tz"):
+        try:
+            tz = ZoneInfo(m.group("tz"))
+        except (ZoneInfoNotFoundError, ValueError):
+            tz = None
+    local_now = now.astimezone(tz) if tz is not None else now.astimezone()
+    hour = int(m.group("h")) % 12 + (12 if m.group("ap").lower() == "pm" else 0)
+    minute = int(m.group("m") or 0)
+    if hour > 23 or minute > 59:
+        return None
+    if m.group("mon"):
+        month = _MONTHS.index(m.group("mon")[:3].lower()) + 1
+        try:
+            at = local_now.replace(month=month, day=int(m.group("day")), hour=hour,
+                                   minute=minute, second=0, microsecond=0)
+        except ValueError:
+            return None
+        if at < local_now - timedelta(days=1):
+            at = at.replace(year=at.year + 1)  # "Jan 2" seen in late December
+    else:
+        at = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if at <= local_now:
+            at += timedelta(days=1)
+    return at.isoformat(timespec="seconds")
+
+
+def window_from_text(text: str) -> str | None:
+    """The Window a limit message names, if it names one."""
+    t = text.lower()
+    if "weekly" in t or "week" in t or "7-day" in t:
+        if "opus" in t:
+            return "seven_day_opus"
+        if "sonnet" in t:
+            return "seven_day_sonnet"
+        return "seven_day"
+    if "session" in t or "5-hour" in t or "five-hour" in t or "5 hour" in t:
+        return "five_hour"
+    return None
+
+
+def _limit_from_info(info: dict[str, Any]) -> RateLimit | None:
+    status = str(info.get("status") or "")
+    if status and not status.startswith("allowed"):
+        return RateLimit(limit_type=info.get("rateLimitType"),
+                         reset_at=_epoch_iso(info.get("resetsAt")))
+    return None
+
+
+def _num(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
 
 
 def _epoch_iso(value: Any) -> str | None:
