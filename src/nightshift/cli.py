@@ -572,19 +572,22 @@ def _schedule_error(exc: Exception):
 
 @schedule_group.command("add")
 @click.argument("name")
-@click.option("--template", "template_name", required=True, metavar="T",
-              help="Template each Occurrence is made from (templates/T.yaml).")
-@click.option("--cron", "cron_rule", required=True, metavar="RULE",
+@click.option("--template", "template_name", default=None, metavar="T",
+              help="Template each Occurrence is made from (templates/T.yaml). "
+              "Default: the template named NAME.")
+@click.option("--cron", "cron_rule", default=None, metavar="RULE",
               help="Cron-style rule in local time: 'minute hour day-of-month month "
-              "day-of-week', e.g. '30 6 * * *' (6:30am daily), or @daily, @hourly...")
-@click.option("--catch-up", "catch_up", required=True, metavar="RULE",
+              "day-of-week', e.g. '30 6 * * *' (6:30am daily), or @daily, @hourly... "
+              "Default: the template's standard Schedule.")
+@click.option("--catch-up", "catch_up", default=None, metavar="RULE",
               help="For fires missed while the Mac slept: 'within <N>h' (run if the latest "
               "missed fire is at most N hours old, else skip) or 'next-wake' (always run). "
-              "Several missed fires always become one Occurrence.")
-@click.option("--overlap", type=click.Choice(list(schedules.OVERLAPS)), default="skip",
-              show_default=True,
+              "Several missed fires always become one Occurrence. "
+              "Default: the template's standard Schedule.")
+@click.option("--overlap", type=click.Choice(list(schedules.OVERLAPS)), default=None,
               help="When it fires while its previous Occurrence is unfinished: skip the new "
-              "fire, or replace (cancel) the old Occurrence.")
+              "fire, or replace (cancel) the old Occurrence. Default: the template's "
+              "standard Schedule, else skip.")
 @click.option("--request", default="", help="The request text the template gets ({{request}}).")
 @click.option("--priority", type=click.Choice(["urgent", "normal", "background"]), default=None)
 @click.option("--agent", default=None, help="Agent override for every Occurrence.")
@@ -592,7 +595,11 @@ def _schedule_error(exc: Exception):
 @click.pass_context
 def schedule_add(ctx, name, template_name, cron_rule, catch_up, overlap, request, priority, agent,
                  disabled):
-    """Add Schedule NAME. Fires before now never count as missed."""
+    """Add Schedule NAME. Fires before now never count as missed.
+
+    With a template that has a standard Schedule, the name alone is enough:
+    `orch schedule add posting-scan` sets up the daily 6:30am posting scan
+    (catch-up within 12h, else skip; overlap skip)."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
         try:

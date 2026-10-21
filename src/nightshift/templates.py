@@ -76,7 +76,9 @@ BUILTIN_DIR = Path(__file__).resolve().parents[2] / "templates"
 REQUIRED = ("task_type", "agent", "estimated_minutes", "max_runtime_minutes", "long",
             "internet", "prompt")
 OPTIONAL = ("name", "description", "inputs", "files", "values", "deadline", "post_hooks",
-            "report_diffs")
+            "report_diffs", "schedule")
+#: Keys of a template's ``schedule:`` block (its standard Schedule's rules).
+SCHEDULE_KEYS = ("cron", "catch_up", "overlap", "request")
 _VAR = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _URL = re.compile(r"https?://[^\s<>\"'`]+")
 
@@ -109,6 +111,9 @@ class Template:
     deadline: dict | None = None
     post_hooks: list[dict] = field(default_factory=list)
     report_diffs: list[dict] = field(default_factory=list)
+    #: The template's standard Schedule rules (``orch schedule add NAME``
+    #: uses them when no flag is given): {cron, catch_up, overlap}.
+    schedule: dict | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """What ``planning.from_template`` reads."""
@@ -219,6 +224,8 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
         _rel_path(name, "report_diffs file", d.get("file"))
         _input_file(name, files, "report_diffs against", d.get("against"))
 
+    schedule = _validate_schedule(name, data.get("schedule"))
+
     known = {"request", *inputs, *files, *values}
     used = set(_VAR.findall(data["prompt"]))
     if used - known:
@@ -231,7 +238,37 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
         internet=data["internet"], prompt=data["prompt"],
         description=str(data.get("description") or ""), inputs=dict(inputs), files=dict(files),
         values=dict(values), deadline=deadline, post_hooks=list(hooks), report_diffs=list(diffs),
+        schedule=schedule,
     )
+
+
+def _validate_schedule(name: str, block: Any) -> dict | None:
+    """A template's standard Schedule: ``schedule: {cron, catch_up,
+    overlap, request}`` (overlap defaults to skip, request to empty), checked
+    with the same rules as `orch schedule add`."""
+    if block is None:
+        return None
+    from . import cron, schedules  # late: schedules imports this module
+
+    if not isinstance(block, dict) or set(block) - set(SCHEDULE_KEYS) or not {
+            "cron", "catch_up"} <= set(block):
+        raise TemplateError(f"template {name!r}: schedule is {{cron: <rule>, catch_up: <rule>, "
+                            "overlap: skip|replace, request: <text>}} (overlap and request "
+                            "optional)")
+    try:
+        cron.parse(str(block["cron"]))
+        schedules.parse_catch_up(str(block["catch_up"]))
+    except (cron.CronError, schedules.ScheduleError) as exc:
+        raise TemplateError(f"template {name!r}: schedule: {exc}") from None
+    overlap = block.get("overlap", schedules.OVERLAP_SKIP)
+    if overlap not in schedules.OVERLAPS:
+        raise TemplateError(f"template {name!r}: schedule overlap must be one of "
+                            f"{', '.join(schedules.OVERLAPS)}")
+    request = block.get("request", "")
+    if not isinstance(request, str):
+        raise TemplateError(f"template {name!r}: schedule request must be text")
+    return {"cron": str(block["cron"]), "catch_up": str(block["catch_up"]), "overlap": overlap,
+            "request": request}
 
 
 def _input_file(name: str, files: dict, where: str, value: Any) -> None:

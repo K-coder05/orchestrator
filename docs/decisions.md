@@ -943,3 +943,53 @@ lasting consequences go in `docs/adr/` instead.
   (it would save it re-proposing known postings; dedupe makes it
   unnecessary for correctness). The Gate Test 2 schedule run belongs to
   the Gate work.
+
+## Phase 1, issue #14: the daily posting-scan Schedule and Gate Test 2
+
+- **Standard Schedules live in the template.** New optional template key
+  `schedule: {cron, catch_up, overlap, request}` (overlap defaults to
+  `skip`, request to empty), validated with the same parsers as `orch
+  schedule add`. `templates/posting-scan.yaml` carries the §3.1 item 10
+  rules: `30 6 * * *`, `within 12h`, `skip`, request "Daily scan for new
+  internship postings". Schedules are still only made by `orch schedule
+  add` (the DB stays the one source, #12); the template only supplies
+  defaults, so setting up the Phase 1 scan is one command:
+  `orch schedule add posting-scan`. `--template` now defaults to the
+  Schedule's name, and `--cron` / `--catch-up` / `--overlap` / `--request`
+  default to the template's block (any flag overrides it). A template
+  without a block still needs `--cron` and `--catch-up` (the spec gives no
+  default Catch-up rule). Nightshift never adds the Schedule by itself:
+  on the real `~/agents` you run that command once.
+- **Gate Test 2, simulated** (`tests/test_gate2.py`): the built-in template
+  and its standard Schedule added through the CLI, the daemon's
+  `QueueRunner`, the fake `claude` through the real adapter, the real merge
+  hook and report. Days pass on a fake clock; the laptop sleeping is a
+  `FakeHost` whose awake clock stops while wall time jumps. Covered: the
+  6:30 fire on time (poll), a fire missed while asleep caught up exactly
+  once on wake (more polls, a second wake check and a daemon restart make
+  nothing), three days asleep collapse into one Occurrence, a wake more than
+  12h late skips (next morning fires normally), a fire while the previous
+  scan is unfinished is skipped, and across the two runs no duplicate
+  Tracker rows (by URL and by key) and the second report lists only its
+  appended row.
+- **Real-machine check (2026-10-21).** Scratch config, real `claude`
+  (haiku), the posting-scan template and its standard rules except the
+  timing: `orch schedule add posting-scan --cron "6,30 5 * * *"` (two fires
+  a day so two runs happen within one morning; Catch-up within 12h and
+  Overlap skip from the template). `orch schedule add posting-scan` alone on
+  another scratch config showed `30 6 * * *`, `within 12h, else skip`,
+  `skip`. Run 1: daemon up at 05:06, on-time fire (trigger `poll`),
+  Occurrence `partial` in 7m32s ($0.20 cost-equivalent): 125 proposed, 116
+  appended, 9 dropped as duplicates. The daemon was then stopped across the
+  05:30 fire (the "laptop asleep" stand-in) and started at 09:52: "on
+  daemon start: Schedule posting-scan: fire at 05:30: created Occurrence"
+  (4.4h late, inside 12h), `partial` in 6m53s ($0.21): 133 proposed, 17
+  appended, 116 dropped as duplicates. Tracker afterwards: 133 rows, 133
+  distinct normalized URLs and keys, run 1's bytes unchanged at the head;
+  run 2's New postings table listed exactly its 17 appended rows and none
+  of run 1's. A third daemon start created nothing (`schedule_runs`: one
+  `poll/created`, one `start/created`). Both `partial`s are the agent's own
+  verdict (career pages not configured, some posting pages wouldn't load).
+  Not run for real: a lid-close sleep and wake (needs the user; covered by
+  `tests/test_gate2.py` with `FakeHost(awake_clock=...)`), and the real
+  6:30am time (the cron parser and DST handling are tested in #12).

@@ -74,6 +74,9 @@ otherwise an ordinary Task: its folder under `recurring/<name>/YYYY-MM-DD/`
 is its only writable place, and it gets the same per-Task permission policy,
 template post-hooks and caps as any other Task. Pre-approval skips only the
 plan approval; nothing in §1.6 that needs approval is ever done unasked.
+A template's `schedule:` block (posting-scan's 6:30am rules) only supplies
+defaults for `orch schedule add`: no Schedule exists, and nothing runs
+pre-approved, until you add it yourself.
 
 ## Template post-hooks (Nightshift-side tools)
 

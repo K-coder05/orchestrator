@@ -151,14 +151,42 @@ def _check_template(cfg: Config, template: str, request: str, agent: str | None)
         raise ScheduleError(str(exc)) from None
 
 
-def add(cfg: Config, db: Database, name: str, *, template: str, cron_rule: str,
-        catch_up: str | CatchUp, overlap: str = OVERLAP_SKIP, request: str = "",
-        priority: str | None = None, agent: str | None = None, enabled: bool = True,
-        at: datetime) -> Schedule:
-    """Add a Schedule. Fires before ``at`` never count as missed."""
+def standard_rules(cfg: Config, template: str) -> dict | None:
+    """The template's standard Schedule rules (its ``schedule:`` block):
+    {cron, catch_up, overlap}, or None when it has none."""
+    try:
+        return templates.load(cfg, template).schedule
+    except templates.TemplateError as exc:
+        raise ScheduleError(str(exc)) from None
+
+
+def add(cfg: Config, db: Database, name: str, *, template: str | None = None,
+        cron_rule: str | None = None, catch_up: str | CatchUp | None = None,
+        overlap: str | None = None, request: str = "", priority: str | None = None,
+        agent: str | None = None, enabled: bool = True, at: datetime) -> Schedule:
+    """Add a Schedule. Fires before ``at`` never count as missed.
+
+    ``template`` defaults to the Schedule's name; a rule left out comes from
+    the template's ``schedule:`` block (so ``orch schedule add posting-scan``
+    sets up the daily 6:30am scan, §3.1 item 10), and so does an empty
+    ``request``. Overlap defaults to skip.
+    """
     validate_name(name)
     if db.get_schedule(name) is not None:
         raise ScheduleError(f"a Schedule named {name!r} already exists")
+    template = template or name
+    std = standard_rules(cfg, template) or {}
+    request = request or std.get("request", "")
+    if cron_rule is None or catch_up is None or overlap is None:
+        missing = [flag for flag, v in (("--cron", cron_rule), ("--catch-up", catch_up))
+                   if v is None and flag.strip("-").replace("-", "_") not in std]
+        if missing:
+            raise ScheduleError(
+                f"template {template!r} has no standard Schedule (schedule: block), so "
+                f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} required")
+        cron_rule = std["cron"] if cron_rule is None else cron_rule
+        catch_up = std["catch_up"] if catch_up is None else catch_up
+        overlap = std.get("overlap", OVERLAP_SKIP) if overlap is None else overlap
     try:
         rule = cron.parse(cron_rule)
     except cron.CronError as exc:

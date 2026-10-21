@@ -1,6 +1,7 @@
 # posting-scan (§3.1 item 9): the daily internship scan. Usage:
-#   orch schedule add posting-scan --template posting-scan --cron "30 6 * * *" \
-#       --catch-up "within 12h"
+#   orch schedule add posting-scan      (the standard Schedule below: 6:30am
+#                                        daily, catch-up within 12h else skip,
+#                                        overlap skip; §3.1 item 10)
 #   orch add "Scan for new internship postings" --template posting-scan   (one-off)
 #
 # The agent checks the public tracker repos and career pages listed in
@@ -20,6 +21,14 @@ estimated_minutes: 20
 max_runtime_minutes: 60
 long: false
 internet: "on"
+
+# The standard Schedule `orch schedule add posting-scan` sets up (flags
+# override any of it).
+schedule:
+  cron: "30 6 * * *"
+  catch_up: within 12h
+  overlap: skip
+  request: Daily scan for new internship postings
 
 values:
   season: {config: templates.posting_scan.season}

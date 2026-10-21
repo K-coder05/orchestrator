@@ -26,7 +26,7 @@ orch cancel <id>             # any unfinished Task; stops a running agent
 orch list --status running
 orch logs <id> -f
 orch report <id>
-orch schedule add posting-scan --template posting-scan --cron "30 6 * * *" --catch-up "within 12h"
+orch schedule add posting-scan   # daily 6:30am, catch-up within 12h else skip, overlap skip
 orch schedule list           # also enable | disable | run-now | remove <name>
 ```
 
