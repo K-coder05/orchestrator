@@ -193,6 +193,13 @@ stored too, so no reported field is lost.
   were denied ("WebFetch denied access to domain:www.x") and other domains
   were fetched. Deny wins over allow.
 
+- **Stopping an Attempt** (runtime cap, `orch cancel`, daemon stop): Nightshift
+  sends SIGTERM; real `claude` 2.1.306 exited 143 within about a second
+  (checked 2026-10-21 with haiku: a 1-minute cap stopped a `sleep 100` Task
+  twice, and `orch cancel` stopped a running Task in about 1s). An agent that
+  ignores SIGTERM is SIGKILLed after 15s. A Codex adapter needs no change for
+  this; it goes through the same watchdog.
+
 ### Known gap: Nightshift sees only its own usage
 
 Nightshift records usage only from its own sessions, not from interactive use

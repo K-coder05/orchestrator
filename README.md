@@ -20,6 +20,8 @@ orch add "Write a haiku about the night shift to output/haiku.txt"   # asks y/n
 orch add "Tailor my resume" --priority urgent --deadline 2026-11-01 --at 02:00
 orch priority <id> background   # urgent | normal | background
 orch approve <id>            # or `orch deny <id>`, for Tasks awaiting approval
+orch retry <id>              # failed/partial: run again; retry_wait: retry now
+orch cancel <id>             # any unfinished Task; stops a running agent
 orch list --status running
 orch logs <id> -f
 orch report <id>
@@ -45,3 +47,10 @@ until that time, and long Tasks (Task types `coding` and `research` by
 default) start only between midnight and 7am unless urgent. All times are
 America/Los_Angeles. `orch show <id>` prints the Effective priority and why a
 queued Task is waiting.
+
+An Attempt that crashes, hits its runtime cap (2 hours, 6 for `coding`;
+`defaults.max_runtime_minutes`, `task_types.<t>.max_runtime_minutes`) or fails
+a post-hook is a Failed Attempt: the Task waits in `retry_wait` 10 minutes,
+then 30, and is retried on the same agent; after 2 retries it is `failed`.
+`orch retry <id>` requeues a failed Task with a fresh budget (or ends a
+`retry_wait` early), and `orch cancel <id>` cancels any unfinished Task.

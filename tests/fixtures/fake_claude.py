@@ -4,9 +4,13 @@ Behaviour is driven by env vars so tests can shape each Attempt.
 """
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
+
+if os.environ.get("FAKE_IGNORE_TERM"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 prompt = sys.stdin.read()
 Path("logs/fake_invocation.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": prompt}))

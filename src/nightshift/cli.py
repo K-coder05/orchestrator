@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import signal
 import sys
+import time
 from pathlib import Path
 
 import click
 
-from . import daemon, planning, views
+from . import daemon, failures, planning, views
 from . import priority as prio
 from .adapters import get_adapter
 from .config import ConfigError, load_config
+from . import db as db_mod
 from .db import Database
 from .doctor import format_report, run_doctor
 from .host import MacHost
@@ -247,6 +249,69 @@ def deny(ctx, task_id):
     _decide(ctx, task_id, False)
 
 
+@main.command()
+@click.argument("task_id")
+@click.pass_context
+def retry(ctx, task_id):
+    """Retry a failed or partial Task (fresh retry budget), or start a Task
+    in retry_wait now. It runs again on the same agent."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        _task_row(db, task_id)
+        try:
+            reason = failures.retry_by_hand(cfg, db, task_id, at=_clock(cfg))
+        except (failures.NotAllowed, db_mod.StateChanged) as exc:
+            raise click.ClickException(str(exc)) from None
+        click.echo(f"Task {task_id} queued: {reason}")
+        _daemon_note(cfg)
+    finally:
+        db.close()
+
+
+# How long `orch cancel` waits for the daemon to stop a running Attempt.
+CANCEL_WAIT_SECONDS = 30.0
+
+
+@main.command()
+@click.argument("task_id")
+@click.option("--no-wait", is_flag=True, help="Don't wait for the daemon to stop a running Task.")
+@click.pass_context
+def cancel(ctx, task_id, no_wait):
+    """Cancel a Task in any unfinished state. A running Task's agent is
+    stopped by the daemon (usually within a few seconds)."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        _task_row(db, task_id)
+        try:
+            res = failures.cancel(
+                cfg, db, task_id, at=_clock(cfg), daemon_up=daemon.daemon_running(cfg)
+            )
+        except failures.NotAllowed as exc:
+            raise click.ClickException(str(exc)) from None
+        if res.status == "cancelled":
+            click.echo(f"Task {task_id} cancelled (was {res.from_state}).")
+            return
+        click.echo(f"Task {task_id} is running; asked the daemon to stop it.", err=True)
+        if no_wait:
+            click.echo(f"Cancel requested for Task {task_id}.")
+            return
+        deadline = time.monotonic() + CANCEL_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            state = db.task_state(task_id)
+            if state != TaskState.RUNNING:
+                break
+            time.sleep(0.2)
+        state = db.task_state(task_id)
+        if state == TaskState.CANCELLED:
+            click.echo(f"Task {task_id} cancelled (was running).")
+        elif state == TaskState.RUNNING:
+            click.echo(f"Cancel requested for Task {task_id}; the daemon hasn't stopped it yet.")
+        else:
+            click.echo(f"Task {task_id} ended {state} before it could be cancelled.")
+    finally:
+        db.close()
+
+
 def _task_row(db: Database, task_id: str):
     row = db.get_task(task_id)
     if row is None:
@@ -403,7 +468,8 @@ def daemon_status(ctx):
         counts = views.queue_summary(db)
     finally:
         db.close()
-    click.echo(f"queue     {counts.get('queued', 0)} queued, {counts.get('running', 0)} running")
+    click.echo(f"queue     {counts.get('queued', 0)} queued, {counts.get('running', 0)} running, "
+               f"{counts.get('retry_wait', 0)} waiting to retry")
 
 
 @daemon_group.command("run")

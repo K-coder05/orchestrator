@@ -218,6 +218,25 @@ class Config:
         entry = (self.data.get("task_types") or {}).get(task_type) or {}
         return bool(entry.get("long", False))
 
+    def max_runtime_default(self, task_type: str) -> int:
+        """Runtime cap in minutes for one Attempt of this Task type (§2.7):
+        ``task_types.<type>.max_runtime_minutes``, else
+        ``defaults.max_runtime_minutes``."""
+        entry = (self.data.get("task_types") or {}).get(task_type) or {}
+        return int(entry.get("max_runtime_minutes") or self.default("max_runtime_minutes"))
+
+    @property
+    def max_retries(self) -> int:
+        return int((self.data.get("retries") or {}).get("max_retries", 2))
+
+    @property
+    def retry_wait_minutes(self) -> list[float]:
+        return [float(m) for m in (self.data.get("retries") or {}).get("wait_minutes", [10, 30])]
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
 
 def _validate(data: dict[str, Any]) -> None:
     for section in ("paths", "agents", "defaults"):
@@ -232,6 +251,24 @@ def _validate(data: dict[str, Any]) -> None:
             raise ConfigError(f"task_types.{name}.internet must be 'on' or 'off'")
         if not isinstance((entry or {}).get("long", False), bool):
             raise ConfigError(f"task_types.{name}.long must be true or false")
+        cap = (entry or {}).get("max_runtime_minutes")
+        if cap is not None and not _positive_int(cap):
+            raise ConfigError(f"task_types.{name}.max_runtime_minutes must be a positive integer")
+    if not _positive_int(data["defaults"].get("max_runtime_minutes")):
+        raise ConfigError("defaults.max_runtime_minutes must be a positive integer")
+    retries = data.get("retries") or {}
+    if not isinstance(retries, dict):
+        raise ConfigError("config section 'retries' must be a mapping")
+    max_retries = retries.get("max_retries", 2)
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+        raise ConfigError("retries.max_retries must be an integer >= 0")
+    waits = retries.get("wait_minutes", [10, 30])
+    if (
+        not isinstance(waits, list)
+        or not waits
+        or any(isinstance(w, bool) or not isinstance(w, (int, float)) or w < 0 for w in waits)
+    ):
+        raise ConfigError("retries.wait_minutes must be a non-empty list of minutes >= 0")
     queue = data.get("queue") or {}
     if not isinstance(queue, dict):
         raise ConfigError("config section 'queue' must be a mapping")

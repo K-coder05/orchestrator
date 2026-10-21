@@ -25,6 +25,7 @@ from typing import IO, Any
 
 import nightshift
 
+from . import failures
 from .adapters import get_adapter
 from .config import Config
 from .db import Database
@@ -180,6 +181,7 @@ class QueueRunner:
         adapter_provider: Callable = get_adapter,
         log: Callable[[str], None] | None = None,
         clock: Callable[[], datetime] | None = None,
+        post_hooks_for: Callable[[Config, Any], Any] = failures.post_hooks_for,
     ):
         self.cfg = cfg
         self.db = db
@@ -189,6 +191,7 @@ class QueueRunner:
         self._log = log or (lambda msg: None)
         # The queue's notion of "now"; tests pass a fake clock.
         self.clock = clock or (lambda: now(cfg.timezone))
+        self.post_hooks_for = post_hooks_for
         self.current: str | None = None
         self.control: AttemptControl | None = None
         self.started_at = iso(now(cfg.timezone))
@@ -226,15 +229,23 @@ class QueueRunner:
     # -- the loop -------------------------------------------------------------
     def recover(self) -> list[str]:
         """Fail Tasks a dead daemon left ``running``; call once at startup."""
-        failed = fail_orphaned(self.cfg, self.db)
-        for tid in failed:
-            self.log(f"Task {tid} was left running by a stopped daemon; marked failed")
-        return failed
+        settled = fail_orphaned(self.cfg, self.db, clock=self.clock)
+        for tid in settled:
+            self.log(f"Task {tid} was left running by a stopped daemon; now {self.db.task_state(tid)}")
+        return settled
+
+    def promote_retries(self) -> list[str]:
+        """Requeue Tasks whose ``retry_wait`` is over (§2.7)."""
+        moved = failures.promote_due(self.cfg, self.db, self.clock())
+        for tid in moved:
+            self.log(f"Task {tid} retry wait over; queued")
+        return moved
 
     def run_next(self) -> str | None:
         """Run one Attempt of the next queued Task; None if the queue is empty."""
         if self.stopping:
             return None
+        self.promote_retries()
         # Effective priority and time windows are re-evaluated on every pick.
         row = pick_next(self.cfg, self.db.tasks_in_state(TaskState.QUEUED), self.clock())
         if row is None:
@@ -255,6 +266,8 @@ class QueueRunner:
                 task_id,
                 adapter_provider=self.adapter_provider,
                 control=self.control,
+                clock=self.clock,
+                post_hooks=self.post_hooks_for(self.cfg, row),
             )
             self.log(f"Task {task_id} -> {result.state}")
         except Exception as exc:  # never let one Task kill the daemon

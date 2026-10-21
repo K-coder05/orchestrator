@@ -46,7 +46,16 @@ defaults:
   agent: claude
   task_type: general
   priority: normal
+  # Runtime cap of one Attempt (§2.7); hitting it is a Failed Attempt. A
+  # Task type or a template may set its own.
   max_runtime_minutes: 120
+
+retries:
+  # Failed Attempts (crash, runtime cap hit, failed post-hook) are retried on
+  # the same agent up to this many times (§2.7); then the Task is failed.
+  max_retries: 2
+  # Minutes in retry_wait before each retry (the last value repeats).
+  wait_minutes: [10, 30]
 
 planning:
   # Free-form `orch add` asks an agent for an estimate and a Task type (§2.4).
@@ -86,8 +95,10 @@ task_types:
   # internet: default for --internet when the Task doesn't set it (§1.4).
   # long: Tasks of this type are long Tasks, gated to the overnight window
   # (§2.3). Omitted means false.
+  # max_runtime_minutes: this type's runtime cap; omitted means
+  # defaults.max_runtime_minutes. Coding runs overnight, so it gets 6 hours.
   general: {internet: "off"}
-  coding: {internet: "off", long: true}
+  coding: {internet: "off", long: true, max_runtime_minutes: 360}
   comedy: {internet: "off"}
   research: {internet: "on", long: true}
   scraping: {internet: "on"}

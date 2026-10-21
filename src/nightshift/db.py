@@ -124,13 +124,30 @@ MIGRATIONS: list[str] = [
         raw                    TEXT
     );
     """,
+    # 3: retries and cancel requests (§2.7).
+    """
+    -- Failed Attempts charged to the retry budget since the Task was created
+    -- or last retried by hand.
+    ALTER TABLE tasks ADD COLUMN retries_used INTEGER NOT NULL DEFAULT 0;
+    -- When a Task in retry_wait goes back in the queue.
+    ALTER TABLE tasks ADD COLUMN retry_at TEXT;
+    -- Set by `orch cancel` for a running Task; the daemon stops the Attempt.
+    ALTER TABLE tasks ADD COLUMN cancel_requested_at TEXT;
+    """,
 ]
+
+#: Task columns ``transition(set_fields=...)`` may change with the state.
+TRANSITION_FIELDS = frozenset({"retries_used", "retry_at", "cancel_requested_at"})
 
 TASK_COLUMNS = (
     "id title slug prompt template task_type agent agent_override priority deadline run_at "
     "internet long estimated_minutes max_runtime_minutes approved approved_at schedule_name "
     "created_at folder"
 ).split()
+
+
+class StateChanged(Exception):
+    """A conditional transition found the Task in another state."""
 
 
 class Database:
@@ -203,20 +220,39 @@ class Database:
         return TaskState(row["state"])
 
     def transition(
-        self, task_id: str, to_state: TaskState, reason: str, *, run_id: int | None = None
+        self,
+        task_id: str,
+        to_state: TaskState,
+        reason: str,
+        *,
+        run_id: int | None = None,
+        expect: TaskState | None = None,
+        set_fields: dict[str, Any] | None = None,
     ) -> None:
-        """Move a Task to ``to_state``, recording timestamp and reason."""
+        """Move a Task to ``to_state``, recording timestamp and reason.
+
+        ``expect`` makes it conditional: if the Task is no longer in that
+        state (another process moved it), :class:`StateChanged` is raised and
+        nothing is written. ``set_fields`` updates columns from
+        ``TRANSITION_FIELDS`` in the same transaction.
+        """
         if not reason:
             raise ValueError("every transition needs a reason")
+        fields = dict(set_fields or {})
+        if bad := set(fields) - TRANSITION_FIELDS:
+            raise ValueError(f"transition cannot set {sorted(bad)}")
         with self.tx() as c:
             current = TaskState(
                 c.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()["state"]
             )
+            if expect is not None and current != expect:
+                raise StateChanged(f"Task {task_id} is {current}, no longer {expect}")
             check_transition(current, to_state)
             at = self._now()
+            extra = "".join(f", {k} = ?" for k in fields)
             c.execute(
-                "UPDATE tasks SET state = ?, state_changed_at = ? WHERE id = ?",
-                (str(to_state), at, task_id),
+                f"UPDATE tasks SET state = ?, state_changed_at = ?{extra} WHERE id = ?",
+                (str(to_state), at, *fields.values(), task_id),
             )
             c.execute(
                 "INSERT INTO transitions (task_id, from_state, to_state, at, reason, run_id) "
@@ -246,6 +282,21 @@ class Database:
         with self.tx() as c:
             if c.execute("UPDATE tasks SET priority = ? WHERE id = ?", (priority, task_id)).rowcount != 1:
                 raise KeyError(task_id)
+
+    def request_cancel(self, task_id: str) -> None:
+        """Ask the daemon to cancel a running Task (see ``nightshift.failures``)."""
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET cancel_requested_at = COALESCE(cancel_requested_at, ?) "
+                "WHERE id = ?",
+                (self._now(), task_id),
+            )
+
+    def cancel_requested(self, task_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT cancel_requested_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        return row is not None and row["cancel_requested_at"] is not None
 
     def transitions(self, task_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(

@@ -63,8 +63,8 @@ def format_list(
 
 SHOW_FIELDS = (
     "title state priority task_type agent agent_override internet template deadline run_at "
-    "long estimated_minutes max_runtime_minutes approved approved_at schedule_name created_at "
-    "state_changed_at folder"
+    "long estimated_minutes max_runtime_minutes retries_used retry_at approved approved_at "
+    "schedule_name created_at state_changed_at folder"
 ).split()
 
 
@@ -80,6 +80,10 @@ def format_show(
         value = row[f]
         if f in ("agent_override", "long", "approved"):
             value = "yes" if value else "no"
+        if f == "retries_used":
+            if not value:
+                continue
+            value = f"{value} of {cfg.max_retries}" if cfg is not None else value
         if value is None:
             continue
         out.append(f"  {f.ljust(width)}  {value}")
@@ -87,6 +91,11 @@ def format_show(
             out.append(f"  {'effective_priority'.ljust(width)}  {ev.effective}")
     if ev is not None and ev.blocked and row["state"] == str(TaskState.QUEUED):
         out += ["", f"Waiting: {ev.blocked}"]
+    if row["state"] == str(TaskState.RETRY_WAIT) and row["retry_at"]:
+        out += ["", f"Waiting: retry {row['retries_used']} at {row['retry_at']} "
+                f"(`orch retry {row['id']}` starts it now)"]
+    if row["cancel_requested_at"] and TaskState(row["state"]) not in TERMINAL:
+        out += ["", f"Cancel requested at {row['cancel_requested_at']}"]
     out += ["", "Prompt:", *(f"  {line}" for line in row["prompt"].splitlines() or [""])]
 
     attempts = db.attempts(row["id"])

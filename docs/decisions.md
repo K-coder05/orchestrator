@@ -347,3 +347,81 @@ lasting consequences go in `docs/adr/` instead.
   --yes` stored the LA-offset times, `orch priority` changed `task.yaml`, and
   `orch daemon run --exit-when-idle` left it queued (held by `--at`) without
   starting an agent.
+
+## Phase 1, issue #7: runtime caps, retries and cancel
+
+- **One module.** `nightshift.failures` holds the §2.7 rules: what a Failed
+  Attempt does to the retry budget (`after_failed_attempt`), the wait schedule
+  (`retry_wait`), requeueing due retries (`promote_due`), and `orch retry` /
+  `orch cancel` (`retry_by_hand`, `cancel`). Every time comes from the caller,
+  so the schedule is tested with a fake clock end to end through
+  `QueueRunner(clock=...)` and the fake agent.
+- **Failed Attempts** (CONTEXT.md): a crash (non-zero exit, an error result,
+  a binary that won't start, a daemon that died mid-Attempt), the runtime cap,
+  or a failed post-hook. They alone charge the budget. **Not** Failed
+  Attempts: the agent finishing and reporting `failed` itself (it judged its
+  own work; retrying the same prompt is unlikely to help, so the Task is
+  `failed` at once), `needs_you`, a daemon stop (requeued, as before), a
+  Nightshift exception before or during an Attempt (`fail_unstartable`, still
+  straight to `failed`: our bug, retrying would repeat it), and a usage pause
+  (when pausing lands it must bypass `after_failed_attempt`).
+- **Budget and waits.** New config `retries:` (`max_retries: 2`,
+  `wait_minutes: [10, 30]`, last value repeats). New columns (migration 3):
+  `tasks.retries_used` (charged since creation or the last `orch retry` of a
+  finished Task), `tasks.retry_at`, `tasks.cancel_requested_at`. A Failed
+  Attempt with budget left moves `running -> retry_wait` with `retry_at` =
+  end + wait; the daemon's `run_next` first moves every due `retry_wait` Task
+  to `queued` (a visible transition), then the normal priority pick applies.
+  With the budget spent the Task goes to `failed` with a final `report.md`
+  ("no retries left (2 of 2 used)"); 3 Attempts in total. Retries are same
+  agent, fresh session (no resume yet); switching agent on the second retry is
+  failover work. `report.md` is only finalized when the Task really ends, not
+  on each `retry_wait`. A Task waiting to retry doesn't block the queue.
+- **Runtime cap.** Per Attempt, not per Task (each retry gets the full cap).
+  `max_runtime_minutes` is set when the Task is created: the template's value
+  (`create_task(max_runtime_minutes=)`), else `task_types.<type>.
+  max_runtime_minutes` (coding: 360, the "6h for overnight coding"), else
+  `defaults.max_runtime_minutes` (120). Enforced by a watchdog thread in
+  `run_attempt` measuring `time.monotonic()`, which on macOS doesn't advance
+  during sleep; the daemon holds the machine awake while an Attempt runs
+  anyway. At the cap it SIGTERMs the agent and, if the agent ignores it for
+  15s (`KILL_GRACE_SECONDS`), SIGKILLs it.
+- **`AttemptControl.request_stop(reason)`** now carries why: `daemon_stop`
+  (default; requeue), `cancel`, `runtime_cap`. The first reason wins. A daemon
+  stop of a Task whose cancel was already requested ends it cancelled.
+- **Post-hooks** are callables `(folder, row)` that raise to fail
+  (`failures.PostHook`, `PostHookFailed`). They run in order after an Attempt
+  the agent finished `done` or `partial` (not `failed`/`needs_you`).
+  `QueueRunner(post_hooks_for=)` supplies them; `failures.post_hooks_for`
+  returns none for now. The template engine plugs its hooks in there.
+- **`orch cancel <id>`** works in every unfinished state. Not running: a
+  conditional transition (`db.transition(expect=...)`, raising `StateChanged`
+  if the daemon moved the Task meanwhile, then re-checked) to `cancelled`
+  plus a cancelled `report.md`. Running under a live daemon: the CLI can't
+  touch the daemon's process, so it sets `cancel_requested_at`; the watchdog
+  polls it about once a second through its own SQLite connection and stops
+  the agent, and `run_attempt` ends the Task `cancelled`. The CLI waits up to
+  30s for that (`--no-wait` to skip). Running with no daemon alive (orphan):
+  cancelled directly, open Attempt closed as `cancelled`. If the daemon dies
+  before acting on a request, recovery cancels instead of retrying.
+- **`orch retry <id>`**: `failed` or `partial` -> `queued` with the budget
+  reset (a new decision by me, so a fresh 2 retries); `retry_wait` -> `queued`
+  now, keeping the budget used. Other states are refused (`cancelled` stays
+  final; `needs_you` is answered, not retried).
+- **Recovery change.** A Task left `running` by a dead daemon was `failed`;
+  it is now a crash and gets a retry like any Failed Attempt.
+- **Fixed:** writing the prompt to an agent that was already stopped raised
+  `BrokenPipeError` out of `run_attempt`; it is now ignored.
+- `orch show` prints `retries_used` ("1 of 2"), `retry_at`, a `Waiting:
+  retry N at ...` line and a pending cancel request; `orch daemon status`
+  counts Tasks waiting to retry. `orch daemon run --exit-when-idle` exits
+  with Tasks still in `retry_wait` (idle = nothing queued).
+- **Real-machine check (2026-10-21, 00:14 PDT).** Scratch config, haiku,
+  `defaults.max_runtime_minutes: 1`, `retries: {max_retries: 1,
+  wait_minutes: [0.1]}`, real `orch daemon run`: a Task told to `sleep 100`
+  hit the cap at 61s (exit 143), waited in `retry_wait` 6s, retried, hit it
+  again and ended `failed` with "no retries left (1 of 1 used)" in
+  `report.md`. `orch cancel` on a running Task returned "cancelled (was
+  running)" in about 1s, with no `claude` process left; `orch retry` requeued
+  the failed Task, refused the cancelled one, and `orch cancel` cancelled the
+  queued one.

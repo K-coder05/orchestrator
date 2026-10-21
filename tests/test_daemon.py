@@ -35,7 +35,7 @@ class FakeAttempts:
         self.max_active = 0
         self.awake_during: list[bool] = []
 
-    def __call__(self, cfg, db, task_id, *, adapter_provider=None, control=None):
+    def __call__(self, cfg, db, task_id, *, adapter_provider=None, control=None, **_kw):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
@@ -127,11 +127,25 @@ def test_stop_mid_attempt_requeues_and_releases_awake(cfg, db, env):  # noqa: F8
     assert db.task_state(tid) == TaskState.QUEUED
     [attempt] = db.attempts(tid)
     assert attempt["outcome"] == "interrupted" and attempt["ended_at"]
+    assert db.get_task(tid)["retries_used"] == 0  # a daemon stop isn't a Failed Attempt
     assert "requeued" in db.transitions(tid)[-1]["reason"]
     assert host.awake_log == ["hold", "release"] and not host.awake_held()
 
 
-def test_recover_fails_tasks_left_running(cfg, db):
+def test_recover_retries_tasks_left_running(cfg, db):
+    tid = create_task(cfg, db, "orphan").spec.id
+    run = db.start_attempt(tid, "claude", ["claude"], "logs/attempt-1.claude.jsonl")
+    db.transition(tid, TaskState.RUNNING, "Attempt 1 started", run_id=run)
+    runner = QueueRunner(cfg, db, FakeHost(), run_attempt_fn=FakeAttempts(FakeHost()))
+    assert runner.recover() == [tid]
+    # A daemon dying mid-Attempt is a crash: a Failed Attempt, so it is retried.
+    assert db.task_state(tid) == TaskState.RETRY_WAIT
+    assert db.get_task(tid)["retries_used"] == 1
+    assert db.attempts(tid)[0]["outcome"] == "failed"
+
+
+def test_recover_fails_tasks_left_running_with_no_budget(cfg, db):
+    cfg.data["retries"]["max_retries"] = 0
     tid = create_task(cfg, db, "orphan").spec.id
     run = db.start_attempt(tid, "claude", ["claude"], "logs/attempt-1.claude.jsonl")
     db.transition(tid, TaskState.RUNNING, "Attempt 1 started", run_id=run)

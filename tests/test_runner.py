@@ -34,7 +34,8 @@ def fake_provider(name, settings):
 @pytest.fixture
 def env(monkeypatch):
     monkeypatch.setenv("FAKE_STREAM", str(FIXTURES / "claude_stream.jsonl"))
-    for k in ("FAKE_LEAK", "FAKE_RESULT", "FAKE_EXIT", "FAKE_NEEDS_YOU", "FAKE_SLEEP"):
+    for k in ("FAKE_LEAK", "FAKE_RESULT", "FAKE_EXIT", "FAKE_NEEDS_YOU", "FAKE_SLEEP",
+              "FAKE_IGNORE_TERM"):
         monkeypatch.delenv(k, raising=False)
     return monkeypatch
 
@@ -91,6 +92,7 @@ def test_partial_result_from_agent_report(cfg, db, env):
 
 
 def test_crash_is_failed(cfg, db, env):
+    cfg.data["retries"]["max_retries"] = 0  # budget spent: straight to failed
     env.setenv("FAKE_EXIT", "3")
     env.setenv("FAKE_RESULT", "none")
     new = create_task(cfg, db, "p")
@@ -102,6 +104,7 @@ def test_crash_is_failed(cfg, db, env):
 
 
 def test_error_result_is_failed(cfg, db, env):
+    cfg.data["retries"]["max_retries"] = 0  # budget spent: straight to failed
     env.setenv("FAKE_STREAM", str(FIXTURES / "claude_stream_error.jsonl"))
     env.setenv("FAKE_RESULT", "none")
     new = create_task(cfg, db, "p")
@@ -119,6 +122,7 @@ def test_needs_you(cfg, db, env):
 
 
 def test_missing_binary_is_failed(cfg, db, env):
+    cfg.data["retries"]["max_retries"] = 0  # budget spent: straight to failed
     def provider(name, settings):
         return ClaudeAdapter({"binary": "/nonexistent/claude"})
 
