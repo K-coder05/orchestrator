@@ -5,8 +5,11 @@
 # Inputs come from config: templates.resume_tailor.master_tex and
 # templates.resume_tailor.cover_letter_template are copied into the Task
 # folder (input/) when the Task is created. Nightshift (not the agent)
-# compiles both .tex files after the Attempt and fails it unless the resume
-# PDF is exactly 1 page. Nothing is ever submitted.
+# checks that every change traces to master.tex (trace_changes: each changed
+# line has a changes.md entry citing real master.tex lines, and every number
+# in the resume is in master.tex), compiles both .tex files and fails the
+# Attempt unless the resume PDF is exactly 1 page. The report gets a unified
+# diff of the resume against master.tex. Nothing is ever submitted.
 name: resume-tailor
 description: Tailor the resume and a cover letter to one posting (input - posting URL)
 task_type: resume
@@ -33,6 +36,10 @@ post_hooks:
   - hook: inputs_unchanged
   - hook: require_outputs
     files: [output/posting.json, output/resume.tex, output/cover_letter.tex, output/cover_letter.txt, output/changes.md]
+  - hook: trace_changes
+    resume: output/resume.tex
+    changes: output/changes.md
+    master: input/master.tex   # checked against Nightshift's pristine copy
   - hook: compile_latex
     source: output/resume.tex
     pdf: output/resume.pdf
@@ -42,6 +49,10 @@ post_hooks:
     pdf: output/cover_letter.pdf
   - hook: require_outputs
     files: [output/resume.pdf, output/cover_letter.pdf]
+
+# Nightshift writes these into report.md itself (after section 9).
+report_diffs:
+  - {file: output/resume.tex, against: input/master.tex}
 
 prompt: |
   Tailor my resume and write a cover letter for one job posting. My request:
@@ -71,9 +82,22 @@ prompt: |
      relevant bullets rather than shrinking fonts or margins below the
      original).
   3. Write `output/changes.md`: one entry per changed, moved or removed
-     bullet, each with the new text, the source line number(s) in
-     `{{master_tex}}` as `master.tex:L<n>` (e.g. `master.tex:L42-L43`), and a
-     one-line reason tied to the posting.
+     bullet (or other changed line), exactly in this format, and nothing
+     else besides an optional title line:
+
+         ### 1. <short label>
+         - Kind: reworded | moved | removed | condensed | merged
+         - New text: <the line exactly as it now reads in output/resume.tex>
+         - Source: master.tex:L<n> (a range is master.tex:L<n>-L<m>; list several with commas)
+         - Reason: <one line tied to the posting>
+
+     `Source` cites the line number(s) in `{{master_tex}}` the new text comes
+     from (line 1 is the first line of the file). Nightshift checks this
+     after you finish: every line of `output/resume.tex` that isn't a line of
+     `{{master_tex}}` word for word must be the `New text` of an entry, every
+     cited line must exist, and every number in `output/resume.tex` must
+     appear in `{{master_tex}}`. Any miss fails the Attempt. Don't list
+     unchanged bullets.
   4. Write `output/cover_letter.tex` from `{{cover_letter_template}}` (keep
      its layout; fill in the company, role and body), and the same letter as
      plain text in `output/cover_letter.txt`. Under one page, specific to the

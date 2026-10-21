@@ -55,8 +55,17 @@ def finalize(cfg: Config, db: Database, row: Mapping[str, Any], state: TaskState
             attempts=db.attempts(row["id"]),
             usage_rows=db.usage_for_task(row["id"]),
             redact=cfg.secrets.redact,
+            appendix=_appendix(cfg, row),
         )
         log_line(folder, f"{iso(at)} {reason}", cfg.secrets.redact)
+
+
+def _appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
+    if not row["template"]:
+        return None
+    from . import templates  # templates imports this module
+
+    return templates.report_appendix(cfg, row)
 
 
 # --------------------------------------------------------------------------

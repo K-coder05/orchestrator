@@ -81,7 +81,8 @@ def tcfg(tcfg_dir):
 @pytest.fixture
 def resume_env(env, monkeypatch):  # noqa: F811
     monkeypatch.setenv("FAKE_RESUME", "1")
-    for k in ("FAKE_RESUME_PAGES", "FAKE_CLOSE_DATE", "FAKE_SKIP_OUTPUT", "FAKE_TOUCH_INPUT"):
+    for k in ("FAKE_RESUME_PAGES", "FAKE_CLOSE_DATE", "FAKE_SKIP_OUTPUT", "FAKE_TOUCH_INPUT",
+              "FAKE_TRACE", "FAKE_PROGRESS", "FAKE_STEP_DELAY"):
         monkeypatch.delenv(k, raising=False)
     return monkeypatch
 
@@ -122,8 +123,12 @@ def test_repo_templates_load(cfg):
     assert tpl.max_runtime_minutes == 60
     assert tpl.deadline == {"from_output": "output/posting.json", "field": "close_date"}
     assert [h["hook"] for h in tpl.post_hooks] == [
-        "inputs_unchanged", "require_outputs", "compile_latex", "compile_latex", "require_outputs"]
-    resume_hook = tpl.post_hooks[2]
+        "inputs_unchanged", "require_outputs", "trace_changes", "compile_latex", "compile_latex",
+        "require_outputs"]
+    assert tpl.post_hooks[2] == {"hook": "trace_changes", "resume": "output/resume.tex",
+                                 "changes": "output/changes.md", "master": "input/master.tex"}
+    assert tpl.report_diffs == [{"file": "output/resume.tex", "against": "input/master.tex"}]
+    resume_hook = tpl.post_hooks[3]
     assert resume_hook["pdf"] == "output/resume.pdf" and resume_hook["pages"] == 1
 
 
@@ -457,3 +462,139 @@ def test_real_compile_cannot_read_private_files(cfg, tmp_path):
         cwd=folder / "output", writable=[folder], readable=[folder], private_roots=[private],
         timeout=float(s.get("timeout_seconds") or 120))
     assert res.exit_code != 0 and "not found" in res.output
+
+
+# --------------------------------------------------------------------------
+# Traceability and the diff in the report (resume-tailor)
+# --------------------------------------------------------------------------
+
+
+def _reason(cfg, tid):
+    db = Database(cfg.db_path, tz=cfg.timezone)
+    try:
+        return db.attempts(tid)[-1]["end_reason"]
+    finally:
+        db.close()
+
+
+def test_traced_resume_passes_and_the_report_has_the_diff(tcfg_dir, tcfg, resume_env):
+    tid = _add(tcfg_dir)
+    row, _ = _run(tcfg, tid)
+    assert row["state"] == "done", _reason(tcfg, tid)
+    folder = Path(row["folder"])
+    log = (folder / "logs" / "nightshift.log").read_text()
+    assert ("traceability: 1 changed line(s) in output/resume.tex, 1 entry in output/changes.md, "
+            "1 number(s) checked against master.tex: all trace") in log
+    text = (folder / "report.md").read_text()
+    assert text.count("## Appendix (written by Nightshift)") == 1
+    appendix = text.split("## Appendix (written by Nightshift)")[1]
+    assert "### Diff: output/resume.tex against master.tex" in appendix
+    assert "--- a/master.tex\n+++ b/output/resume.tex" in appendix
+    assert "-Built a cache that cut latency 40\\%" in appendix
+    assert "+Designed and Built a cache that cut latency 40\\%" in appendix
+    assert "```diff" in appendix
+    # The appendix sits after section 9, which is still Nightshift's.
+    assert text.index("## 9. Full logs") < text.index("## Appendix")
+
+
+@pytest.mark.parametrize("mode, message", [
+    ("uncited", "entry '1. Reworded the first bullet' (line 3) cites no master.tex line"),
+    ("badline", "cites master.tex:L999, but master.tex has 4 lines"),
+    ("noreason", "gives no Reason"),
+    ("unlisted", "output/resume.tex line 4 changed but no output/changes.md entry cites it: "
+                 "'Designed and Built a cache that cut latency 40%'"),
+    ("number", "has the number 7, which is not in master.tex"),
+])
+def test_untraceable_resume_fails_the_attempt(tcfg_dir, tcfg, resume_env, fake_tex, mode, message):
+    resume_env.setenv("FAKE_TRACE", mode)
+    tid = _add(tcfg_dir)
+    row, _ = _run(tcfg, tid)
+    reason = _reason(tcfg, tid)
+    assert row["state"] == "retry_wait", reason  # a Failed Attempt: retried
+    assert "post-hook trace_changes failed: " in reason and message in reason
+    assert fake_tex.calls() == []  # checked before anything is compiled
+    log = (Path(row["folder"]) / "logs" / "nightshift.log").read_text()
+    assert "  traceability: " in log and message in log
+    # Retry fails the same way; the failed report still carries the diff.
+    row, _ = _run(tcfg, tid)
+    assert row["state"] == "failed"
+    text = (Path(row["folder"]) / "report.md").read_text()
+    assert "trace_changes failed" in text and "### Diff: output/resume.tex against master.tex" in text
+
+
+def test_trace_uses_the_pristine_master(tcfg_dir, tcfg, resume_env, career):
+    """Editing the configured master.tex after `orch add` changes nothing:
+    citations are checked against the snapshot taken then."""
+    tid = _add(tcfg_dir)
+    (career / "master.tex").write_text("\\begin{document}\nsomething else\n\\end{document}\n")
+    row, _ = _run(tcfg, tid)
+    assert row["state"] == "done", _reason(tcfg, tid)
+
+
+def test_report_diffs_and_trace_must_name_an_input_file(cfg, tmp_path):
+    files = {"files": {"m": {"config": "a.b", "to": "input/m.tex"}}}
+    bad_hook = {"post_hooks": [{"hook": "trace_changes", "resume": "o/r.tex", "changes": "o/c.md",
+                                "master": "input/other.tex"}]}
+    with pytest.raises(templates.TemplateError, match="must be one of the template's input files"):
+        templates.parse(cfg, "t", tmp_path / "t.yaml", dict(GOOD) | files | bad_hook)
+    with pytest.raises(templates.TemplateError, match="report_diffs against must be one of"):
+        templates.parse(cfg, "t", tmp_path / "t.yaml", dict(GOOD) | files | {
+            "report_diffs": [{"file": "o/r.tex", "against": "input/nope.tex"}]})
+    with pytest.raises(templates.TemplateError, match="inside the Task folder"):
+        templates.parse(cfg, "t", tmp_path / "t.yaml", dict(GOOD) | files | {
+            "report_diffs": [{"file": "../r.tex", "against": "input/m.tex"}]})
+    ok = templates.parse(cfg, "t", tmp_path / "t.yaml", dict(GOOD) | files | {
+        "report_diffs": [{"file": "o/r.tex", "against": "input/m.tex"}],
+        "post_hooks": [{"hook": "trace_changes", "resume": "o/r.tex", "changes": "o/c.md",
+                        "master": "input/m.tex"}]})
+    assert ok.report_diffs == [{"file": "o/r.tex", "against": "input/m.tex"}]
+
+
+def test_report_appendix_when_the_resume_is_missing(tcfg_dir, tcfg, resume_env):
+    tid = _add(tcfg_dir)
+    db = Database(tcfg.db_path, tz=tcfg.timezone)
+    row = db.get_task(tid)
+    db.close()
+    assert "output/resume.tex was not written" in templates.report_appendix(tcfg, row)
+
+
+def test_gate1_rerun_with_simulated_limit_resumes_to_an_equivalent_result(tcfg_dir, tcfg, resume_env):
+    """Gate Test 1, second half, with the fake agent: pause midway, a
+    current progress.md, then the resumed session ends with the same output
+    files and every post-hook check passing."""
+    from test_pauses import Clock
+
+    resume_env.setenv("FAKE_STEP_DELAY", "0.05")
+    resume_env.setenv("FAKE_PROGRESS", "read the posting")
+    first = _add(tcfg_dir)
+    row, _ = _run(tcfg, first)
+    assert row["state"] == "done"
+    outputs = sorted(p.name for p in (Path(row["folder"]) / "output").iterdir())
+
+    tid = _add(tcfg_dir, "--simulate-rate-limit-after", "2")
+    db = Database(tcfg.db_path, tz=tcfg.timezone)
+    try:
+        clock = Clock()
+        qr = QueueRunner(tcfg, db, FakeHost(), adapter_provider=fake_provider, clock=clock)
+        assert qr.run_next() == tid
+        row = db.get_task(tid)
+        assert row["state"] == "paused_usage" and row["pause_kind"] == "simulated"
+        folder = Path(row["folder"])
+        log = (folder / "logs" / "nightshift.log").read_text()
+        assert "progress.md was updated during this Attempt" in log
+        assert (folder / "progress.md").read_text().strip().endswith("- read the posting")
+        assert not (folder / "output" / "resume.tex").exists()  # stopped midway
+        clock.advance(minutes=5)
+        assert qr.run_next() == tid
+        row = db.get_task(tid)
+        assert row["state"] == "done", db.attempts(tid)[-1]["end_reason"]
+        assert [a["outcome"] for a in db.attempts(tid)] == ["paused", "completed"]
+        invocations = [json.loads(x) for x in
+                       (folder / "logs" / "fake_invocations.jsonl").read_text().splitlines()]
+        assert "--resume" in invocations[1]["argv"]  # the same session continued
+    finally:
+        db.close()
+    assert sorted(p.name for p in (folder / "output").iterdir()) == outputs
+    log = (folder / "logs" / "nightshift.log").read_text()
+    assert ": all trace" in log and "compiled output/resume.tex -> output/resume.pdf: 1 page" in log
+    assert "### Diff: output/resume.tex against master.tex" in (folder / "report.md").read_text()

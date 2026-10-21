@@ -25,6 +25,9 @@ deadline yet (``--deadline`` always wins), sets it from the field (§2.3).
 
 Post-hooks run after an Attempt the agent finished ``done``/``partial``; a
 failing one is a Failed Attempt (§2.7). Hook names map to ``HOOKS``.
+
+``report_diffs: [{file: <output>, against: <input file>}]``: Nightshift adds
+a unified diff of each output against the pristine input to ``report.md``.
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from . import latex
+from . import latex, trace
 from .config import Config
 from .db import Database
 from .failures import PostHook, PostHookFailed
@@ -66,7 +69,7 @@ BUILTIN_DIR = Path(__file__).resolve().parents[2] / "templates"
 
 REQUIRED = ("task_type", "agent", "estimated_minutes", "max_runtime_minutes", "long",
             "internet", "prompt")
-OPTIONAL = ("name", "description", "inputs", "files", "deadline", "post_hooks")
+OPTIONAL = ("name", "description", "inputs", "files", "deadline", "post_hooks", "report_diffs")
 _VAR = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _URL = re.compile(r"https?://[^\s<>\"'`]+")
 
@@ -97,6 +100,7 @@ class Template:
     files: dict[str, dict] = field(default_factory=dict)
     deadline: dict | None = None
     post_hooks: list[dict] = field(default_factory=list)
+    report_diffs: list[dict] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         """What ``planning.from_template`` reads."""
@@ -184,6 +188,17 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
             raise TemplateError(
                 f"template {name!r}: post-hook {h!r} must name one of {', '.join(sorted(HOOKS))}")
         HOOKS[h["hook"]].validate(name, h)
+        for key in HOOKS[h["hook"]].file_keys:
+            _input_file(name, files, f"{h['hook']} {key}", h.get(key))
+    diffs = data.get("report_diffs") or []
+    if not isinstance(diffs, list):
+        raise TemplateError(f"template {name!r}: report_diffs must be a list")
+    for d in diffs:
+        if not isinstance(d, dict) or set(d) - {"file", "against"}:
+            raise TemplateError(f"template {name!r}: each report_diffs item is "
+                                "{file: <output>, against: <input file>}")
+        _rel_path(name, "report_diffs file", d.get("file"))
+        _input_file(name, files, "report_diffs against", d.get("against"))
 
     known = {"request", *inputs, *files}
     used = set(_VAR.findall(data["prompt"]))
@@ -196,8 +211,17 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
         max_runtime_minutes=data["max_runtime_minutes"], long=data["long"],
         internet=data["internet"], prompt=data["prompt"],
         description=str(data.get("description") or ""), inputs=dict(inputs), files=dict(files),
-        deadline=deadline, post_hooks=list(hooks),
+        deadline=deadline, post_hooks=list(hooks), report_diffs=list(diffs),
     )
+
+
+def _input_file(name: str, files: dict, where: str, value: Any) -> None:
+    """``value`` must be where one of the template's ``files`` is copied
+    (the check reads Nightshift's pristine copy, not the agent's)."""
+    targets = sorted(spec["to"] for spec in files.values())
+    if value not in targets:
+        raise TemplateError(f"template {name!r}: {where} must be one of the template's input "
+                            f"files ({', '.join(targets) or 'none'})")
 
 
 # --------------------------------------------------------------------------
@@ -361,6 +385,8 @@ def apply_output_deadline(cfg: Config, db: Database, task_id: str) -> str | None
 class HookKind:
     validate: Callable[[str, dict], None]
     build: Callable[[Config, Host, Template, dict], PostHook]
+    #: Keys naming one of the template's input files (checked against ``files``).
+    file_keys: tuple[str, ...] = ()
 
 
 def _named(fn: PostHook, name: str) -> PostHook:
@@ -455,10 +481,60 @@ def _build_unchanged(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHoo
     return _named(hook, "inputs_unchanged")
 
 
+def _validate_trace(name: str, h: dict) -> None:
+    unknown = sorted(set(h) - {"hook", "resume", "changes", "master"})
+    if unknown:
+        raise TemplateError(f"template {name!r}: trace_changes has unknown keys {', '.join(unknown)}")
+    for key in ("resume", "changes", "master"):
+        _rel_path(name, f"trace_changes {key}", h.get(key))
+
+
+def _pristine(cfg: Config, row: Mapping[str, Any], rel: str) -> Path:
+    p = pristine_dir(cfg, row["id"]) / rel
+    if not p.is_file():
+        raise PostHookFailed(f"the pristine copy of {rel} is gone")
+    return p
+
+
+def _read_text(p: Path, rel: str) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise PostHookFailed(f"can't read {rel}: {exc}") from None
+
+
+def _build_trace(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHook:
+    """Every change in the resume traces to master.tex (see ``trace``)."""
+    master_name = Path(h["master"]).name
+
+    def hook(folder: Path, row: Mapping[str, Any]) -> None:
+        master = _read_text(_pristine(cfg, row, h["master"]), h["master"])
+        resume = _read_text(_regular_file(folder, h["resume"]), h["resume"])
+        changes = _read_text(_regular_file(folder, h["changes"]), h["changes"])
+        res = trace.check(master, resume, changes, master_name=master_name,
+                          resume_name=h["resume"], changes_name=h["changes"])
+        say = lambda line: log_line(folder, line, cfg.secrets.redact, cfg.timezone)  # noqa: E731
+        summary = (f"traceability: {len(res.changed)} changed line(s) in {h['resume']}, "
+                   f"{len(res.entries)} entr{'y' if len(res.entries) == 1 else 'ies'} in "
+                   f"{h['changes']}, {res.numbers_checked} number(s) checked against {master_name}")
+        if res.ok:
+            say(f"{summary}: all trace")
+            return
+        say(f"{summary}: {len(res.problems)} problem(s)")
+        for p in res.problems:
+            say(f"  traceability: {p}")
+        shown = res.problems[:5]
+        more = len(res.problems) - len(shown)
+        raise PostHookFailed("; ".join(shown)
+                             + (f"; and {more} more (see logs/nightshift.log)" if more else ""))
+    return _named(hook, "trace_changes")
+
+
 HOOKS: dict[str, HookKind] = {
     "require_outputs": HookKind(_validate_require, _build_require),
     "compile_latex": HookKind(_validate_compile, _build_compile),
     "inputs_unchanged": HookKind(_validate_nothing, _build_unchanged),
+    "trace_changes": HookKind(_validate_trace, _build_trace, file_keys=("master",)),
 }
 
 
@@ -471,3 +547,61 @@ def post_hooks(cfg: Config, row: Mapping[str, Any], host: Host | None = None) ->
         host = MacHost()
     tpl = load(cfg, row["template"])
     return [HOOKS[h["hook"]].build(cfg, host, tpl, h) for h in tpl.post_hooks]
+
+
+# --------------------------------------------------------------------------
+# Report diffs
+# --------------------------------------------------------------------------
+
+#: A longer diff is cut in the report (the files are in the Task folder).
+REPORT_DIFF_MAX_LINES = 400
+
+
+def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
+    """The Nightshift-written part of a template Task's ``report.md``: each
+    ``report_diffs`` item as a unified diff of an output against the pristine
+    copy of an input file (resume-tailor: ``output/resume.tex`` against
+    ``master.tex``). None when the template has none. Never raises."""
+    if not row["template"]:
+        return None
+    try:
+        tpl = load(cfg, row["template"])
+    except TemplateError:
+        return None
+    if not tpl.report_diffs:
+        return None
+    folder = Path(row["folder"])
+    parts = []
+    for d in tpl.report_diffs:
+        against = Path(d["against"]).name
+        title = f"### Diff: {d['file']} against {against}"
+        original = pristine_dir(cfg, row["id"]) / d["against"]
+        new = folder / d["file"]
+        if not original.is_file():
+            parts.append(f"{title}\n\nThe pristine copy of {d['against']} is gone.")
+            continue
+        if new.is_symlink() or not new.is_file():
+            parts.append(f"{title}\n\n{d['file']} was not written.")
+            continue
+        try:
+            latex.inside(folder, new)
+            diff = trace.unified_diff(original.read_text(errors="replace"),
+                                      new.read_text(errors="replace"),
+                                      f"a/{against}", f"b/{d['file']}")
+        except (OSError, latex.LatexError) as exc:
+            parts.append(f"{title}\n\nCould not diff it: {exc}")
+            continue
+        if not diff:
+            parts.append(f"{title}\n\n{d['file']} is identical to {against}.")
+            continue
+        lines = diff.splitlines()
+        note = ""
+        if len(lines) > REPORT_DIFF_MAX_LINES:
+            note = (f"\n\n_(cut at {REPORT_DIFF_MAX_LINES} of {len(lines)} lines; run "
+                    f"`diff -u {d['against']} {d['file']}` against the Task folder for the rest)_")
+            lines = lines[:REPORT_DIFF_MAX_LINES]
+        added = sum(1 for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+        removed = sum(1 for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+        parts.append(f"{title}\n\n{added} line(s) added, {removed} removed.\n\n"
+                     + trace.fenced("\n".join(lines), "diff") + note)
+    return "\n\n".join(parts)

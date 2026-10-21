@@ -356,6 +356,7 @@ def run_attempt(
     stderr_log = folder / "logs" / f"attempt-{attempt_no}.{agent_name}.stderr.log"
     # The protocol is long and identical every time; keep the stored command readable.
     stored_argv = [redact(a) if a != task.protocol else "<agent protocol>" for a in command.argv]
+    progress_before = _mtime(folder / "progress.md")
     run_id = db.start_attempt(task_id, agent_name, stored_argv, str(stream_log))
     started = f"Attempt {attempt_no} started on {agent_name}" + (f", {how}" if how else "")
     db.transition(task_id, TaskState.RUNNING, started, run_id=run_id,
@@ -499,6 +500,12 @@ def run_attempt(
         db.finish_attempt(run_id, exit_code=exit_code, outcome="paused", end_reason=end_reason,
                           session_id=adapter.session_id())
         _log(folder, f"{iso(now(cfg.timezone))} Attempt {attempt_no} ended: {end_reason}", redact)
+        # What the next Attempt picks up from (Gate 1: progress.md is current).
+        progress_now = _mtime(folder / "progress.md")
+        _log(folder, f"{iso(now(cfg.timezone))} progress.md " + (
+            "is missing" if progress_now is None else
+            "was updated during this Attempt" if progress_now != progress_before else
+            "was NOT updated during this Attempt"), redact)
         if kind == pauses.KIND_LIMIT:
             # A real hit (never a simulated one): a Limit observation.
             obs = usage.record_limit_hit(cfg, db, agent_name, limit, at=clock(), source="attempt",
@@ -593,9 +600,17 @@ def run_attempt(
         attempts=db.attempts(task_id),
         usage_rows=db.usage_for_task(task_id),
         redact=redact,
+        appendix=templates.report_appendix(cfg, row) if row["template"] else None,
     )
     db.transition(task_id, state, end_reason, run_id=run_id)
     return AttemptResult(run_id=run_id, state=state, session_id=adapter.session_id(), exit_code=exit_code)
+
+
+def _mtime(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def _finalize(cfg: Config, db: Database, row, state: TaskState, reason: str) -> None:

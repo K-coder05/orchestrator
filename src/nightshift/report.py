@@ -2,7 +2,9 @@
 
 The agent writes a draft with sections 1-7. Nightshift owns sections 8
 (time, usage and cost per agent) and 9 (link to the full logs) and rewrites
-them from Attempt and usage data when the Task finishes.
+them from Attempt and usage data when the Task finishes. A template Task
+may also get an appendix after section 9 (e.g. resume-tailor's diff against
+``master.tex``), rewritten each time from the Task's files.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ SECTIONS: list[str] = [
 NIGHTSHIFT_OWNED = {8, 9}
 PLACEHOLDER = "_(not written yet)_"
 NIGHTSHIFT_PLACEHOLDER = "_(filled in by Nightshift when the Task finishes)_"
+APPENDIX_HEADING = "## Appendix (written by Nightshift)"
 
 
 def skeleton(title: str) -> str:
@@ -186,6 +189,7 @@ def finalize(
     attempts: list,
     usage_rows: list,
     redact=lambda s: s,
+    appendix: str | None = None,
 ) -> str:
     """Rewrite ``report.md`` from the agent's draft plus Nightshift's data."""
     path = folder / "report.md"
@@ -223,6 +227,10 @@ def finalize(
     parts = [head, ""]
     for i, heading in enumerate(SECTIONS, start=1):
         parts += [f"## {heading}", "", body[i], ""]
+    # Unnumbered, so a later finalize reads it as part of section 9 (which
+    # Nightshift rewrites) and it is never duplicated.
+    if appendix:
+        parts += [APPENDIX_HEADING, "", appendix.strip(), ""]
     text = redact("\n".join(parts))
     path.write_text(text)
     return text

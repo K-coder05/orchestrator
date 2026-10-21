@@ -82,6 +82,11 @@ if "--resume" in sys.argv and os.environ.get("FAKE_RESUME_FAIL"):
                       "errors": [f"No conversation found with session ID: {sid}"]}), flush=True)
     sys.exit(1)
 
+if os.environ.get("FAKE_PROGRESS"):
+    # A Checkpoint before the first Step.
+    with open("progress.md", "a") as f:
+        f.write(f"- {os.environ['FAKE_PROGRESS']}\n")
+
 delay = float(os.environ.get("FAKE_STEP_DELAY") or 0)
 limit_at = int(os.environ.get("FAKE_LIMIT_AT") or 0)
 for n, line in enumerate(Path(os.environ["FAKE_STREAM"]).read_text().splitlines(), start=1):
@@ -108,15 +113,34 @@ if os.environ.get("FAKE_RESUME"):
     skip = set(os.environ.get("FAKE_SKIP_OUTPUT", "").split(","))
     pages = os.environ.get("FAKE_RESUME_PAGES", "1")
     close = os.environ.get("FAKE_CLOSE_DATE")
+    # resume.tex: master.tex with its first body line reworded, and a
+    # changes.md entry citing it. FAKE_TRACE breaks the traceability:
+    # uncited | badline | number | unlisted | noreason.
+    trace = os.environ.get("FAKE_TRACE", "")
+    master = Path("input/master.tex").read_text().splitlines()
+    body = next(i for i, ln in enumerate(master) if "begin{document}" in ln) + 1
+    while not master[body].strip() or master[body].lstrip().startswith("\\begin"):
+        body += 1
+    new_line = "Designed and " + master[body].strip()
+    if trace == "number":
+        new_line += " across 7 teams"
+    resume = list(master)
+    resume[body] = new_line
+    resume.insert(1, "% FAKE_PAGES=" + pages)
+    source = {"uncited": "the master resume", "badline": "master.tex:L999"}.get(
+        trace, f"master.tex:L{body + 1}")
+    entry = (f"### 1. Reworded the first bullet\n- Kind: reworded\n- New text: {new_line}\n"
+             f"- Source: {source}\n" + ("" if trace == "noreason" else
+                                        "- Reason: matches the posting\n"))
+    changes = "# Resume changes\n\n" + ("" if trace == "unlisted" else entry)
     outputs = {
         "posting.json": json.dumps({"company": "Acme", "role": "SWE Intern",
                                     "close_date": close or None}),
-        "resume.tex": "\\documentclass{article}\n% FAKE_PAGES=" + pages
-                      + "\n\\begin{document}Resume\\end{document}\n",
+        "resume.tex": "\n".join(resume) + "\n",
         "cover_letter.tex": "\\documentclass{letter}\n% FAKE_PAGES=1\n"
                             "\\begin{document}Dear Acme\\end{document}\n",
         "cover_letter.txt": "Dear Acme,\n",
-        "changes.md": "- moved bullet (master.tex:L3): matches the posting\n",
+        "changes.md": changes,
     }
     for name, body in outputs.items():
         if name not in skip:

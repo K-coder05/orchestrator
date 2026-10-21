@@ -84,6 +84,14 @@ a web page to write it), so the compile runs through `Host.run_confined`:
 `resume-tailor` also never runs on a LinkedIn posting: `orch add` refuses a
 posting URL on any of `permissions.denied_domains`.
 
+`resume-tailor` must never invent experience or numbers (§2.11). That is
+checked by Nightshift, not left to the agent:
+
+| Limit | Status | How |
+|---|---|---|
+| Every changed resume line traces to `master.tex` | **Technically enforced** (mechanically; meaning is for you) | The `trace_changes` post-hook fails the Attempt if a changed body line of `output/resume.tex` has no `changes.md` entry, an entry cites no `master.tex` line or a line that doesn't exist (or only blank ones), or has no reason. It reads Nightshift's pristine copy of `master.tex`, which the agent can't reach. It can't tell whether a reword *means* the same as the cited line (e.g. "multi-user" -> "collaborative"): the unified diff in the report is there for that review. |
+| No invented numbers | **Technically enforced** | Every number in the resume's document body (percentages, counts, amounts, years) must appear somewhere in `master.tex`. LaTeX lengths and comments are skipped. A real number used in a new context (a "40%" moved to another bullet) still passes. |
+
 ## Limits
 
 ### Files (§1.4)

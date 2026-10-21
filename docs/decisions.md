@@ -682,3 +682,77 @@ lasting consequences go in `docs/adr/` instead.
   agent's own `pdflatex` was auto-denied (it needs a permission prompt), and
   it reported `partial` for the unchecked page count; the prompt now tells
   it not to compile and that this is no reason for partial.
+
+## Phase 1, issue #11: resume traceability checks and Gate Test 1
+
+- **New `trace_changes` post-hook** (`nightshift.trace`, registered in
+  `templates.HOOKS`), run in `resume-tailor` after the outputs exist and
+  before anything is compiled (cheap checks first). Params: `resume`,
+  `changes`, `master` (`master` must be one of the template's `files`
+  destinations; the hook reads Nightshift's pristine copy in
+  `<data>/inputs/<task-id>/`, so neither the agent nor an edit of the real
+  `master.tex` after `orch add` can move the line numbers). A failure is a
+  Failed Attempt with the first five problems in the reason and every
+  problem in `logs/nightshift.log` (`  traceability: ...`), so a retry knows
+  what to fix; a pass logs one summary line.
+- **What "changed bullet" means.** Rather than trusting the agent's list,
+  Nightshift derives the changes itself: a *changed line* is a line of the
+  resume's document body, with visible text, that isn't (comment-stripped,
+  whitespace-normalised) a line of `master.tex`. Layout-only lines
+  (`\begin{itemize}`, `\vspace{-2pt}`) and the preamble don't count; moved
+  bullets are verbatim lines, so they need no entry, and removed ones add
+  nothing. Every changed line must be covered by a `changes.md` entry whose
+  `New text` contains it (after stripping LaTeX/Markdown and case; or
+  `difflib` ratio >= 0.85), so a wrapped bullet or one quoted with or
+  without its LaTeX still matches. This catches the agent quietly changing a
+  line it didn't list, which a check of `changes.md` alone would miss.
+- **`changes.md` format** is now spelled out in the prompt (`### N. label`
+  then `- Kind:`, `- New text:`, `- Source: master.tex:L<n>[-L<m>]`,
+  `- Reason:`). The parser is lenient because haiku's own layouts varied
+  (numbered items, `**Source:**` bold labels, notes sections that cite lines
+  for unchanged bullets): an entry is a heading or top-level list item whose
+  block has a `New text`/`Kind`/`Reason` field or a real `L<n>` citation;
+  notes and titles are ignored. Citations are `L<n>` / `L<n>-L<m>` in the
+  `Source` field (with or without `master.tex:`). Each entry needs at least
+  one, all inside the file, not all blank/comment lines, and a `Reason`.
+  The check can't judge whether the new wording means the same as the cited
+  line; that's what the diff in the report is for.
+- **Numbers**: every number token (`\d+(,\d{3})*(\.\d+)?`, commas dropped,
+  so `1,200` == `1200`) in the resume's body must occur anywhere in
+  `master.tex`. LaTeX lengths with a unit attached (`10pt`, `0.5in`,
+  `-2pt`, `0.9\textwidth`) and comments are skipped; "3 in class" is not a
+  length. Years count as numbers too, so a changed date fails.
+- **The diff in the report**: new optional template key `report_diffs:
+  [{file, against}]` (`against` must be a `files` destination; diffed
+  against the pristine copy). `templates.report_appendix(cfg, row)` renders
+  each as a `diff` code fence (fence longer than any backtick run in it; cut
+  at 400 lines) under `## Appendix (written by Nightshift)` after section 9.
+  The heading is unnumbered, so a later finalize reads it as part of section
+  9 (Nightshift's) and rewrites it rather than duplicating it.
+  `report.finalize(..., appendix=)`; both the runner and
+  `failures.finalize` pass it, so a failed resume Task's report shows the
+  diff too.
+- **Pause log line**: when an Attempt pauses, the runner logs whether
+  `progress.md` was updated during that Attempt (mtime compared with its
+  start), as evidence for "pauses with a current `progress.md`".
+- **fake_claude**: `FAKE_RESUME` now writes `resume.tex` as `master.tex`
+  with its first body line reworded plus a matching `changes.md` entry;
+  `FAKE_TRACE=uncited|badline|number|unlisted|noreason` breaks one rule;
+  `FAKE_PROGRESS=<text>` appends a Checkpoint to `progress.md` before the
+  stream. Real-run fixtures: `tests/fixtures/sample_{master,resume}.tex`,
+  `sample_changes.md` (a haiku run from the #10 check).
+- **Gate Test 1 on this Mac (2026-10-21, 03:52-04:01 PDT)**, scratch config,
+  haiku, TeX Live 2026, live Figma SWE intern posting on Greenhouse, sample
+  one-page `master.tex` (no real `~/Documents/career/resume/master.tex`
+  exists on this machine yet; the gate should be re-run on it once it does).
+  Run 1: `orch add "Tailor my resume and a cover letter for <URL>"
+  --template resume-tailor`, `orch daemon run --exit-when-idle`: `done` in
+  1m 33s, $0.020; 2 changed lines, 2 entries, 12 numbers, all trace; resume
+  1 page; the report ends with the diff; the only network tool calls were
+  two WebFetch GETs of the posting (nothing submitted). Run 2: same with
+  `--simulate-rate-limit-after 10`: paused after 10 Steps with
+  `posting.json` and `resume.tex` written and `progress.md` updated
+  ("progress.md was updated during this Attempt"), resumed the same session
+  after the 5-minute simulated reset, `done`; the same 7 output files, all
+  post-hook checks passed (2 changed lines traced, 1 page), $0.020 over 2
+  Attempts.
