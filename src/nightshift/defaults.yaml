@@ -45,6 +45,20 @@ defaults:
   priority: normal
   max_runtime_minutes: 120
 
+daemon:
+  # launchd LaunchAgent label; the plist is ~/Library/LaunchAgents/<label>.plist.
+  label: com.nightshift.daemon
+
+wake:
+  # Optional scheduled wake (§1.9). `orch doctor` prints the pmset command
+  # built from these; Nightshift never runs it. days: any of MTWRFSU.
+  days: MTWRFSU
+  time: "01:55:00"
+
+doctor:
+  # Mismatch tolerance for free disk versus machine.free_disk_gb (fraction).
+  free_disk_tolerance: 0.2
+
 task_types:
   # internet: default for --internet when the Task doesn't set it (§1.4).
   general: {internet: "off"}

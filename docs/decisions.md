@@ -85,3 +85,47 @@ lasting consequences go in `docs/adr/` instead.
   when internet is on, `--permission-prompts none` so nothing can hang
   waiting for a prompt, and never `--dangerously-skip-permissions`. The full
   §1.4/§1.6 policy and `docs/safety.md` are issue #4.
+
+## Phase 1, issue #2: `orch doctor`
+
+- **Host seam grows read-only probes.** `Host` gained `hardware()`,
+  `os_version()`, `free_disk_bytes()`, `which()`, `tool_version()`,
+  `python_version()`, `python_package_version()` and `launchd_status()`.
+  `MacHost` uses `system_profiler SPHardwareDataType -json` (model name, chip;
+  serial and UUID are dropped), `sysctl` (`hw.memsize`, `hw.model`, chip
+  fallback), `sw_vers -productVersion`, `shutil.disk_usage` and `launchctl
+  print gui/<uid>/<label>`. `FakeHost` is a dataclass with those facts as
+  fields, records every version command in `commands_run`, and is what all
+  doctor tests use. Nothing in the seam changes system state.
+- **Free disk** is measured on the volume holding `paths.agents_root` (or its
+  nearest existing parent), since that is where Task data lands.
+- **Mismatch rules** against `machine` in config: RAM compares whole GiB;
+  macOS compares the configured components as a prefix (`"26"` matches
+  `26.6.2`); chip compares case-insensitively; model passes when the
+  machine's family name ("MacBook Pro") appears in the configured model
+  (the machine doesn't report the screen size); free disk is a mismatch
+  only when it differs by more than `doctor.free_disk_tolerance` (default
+  20%), because free space drifts. A fact that can't be read is reported as
+  a mismatch ("could not read …") so it is never silently unverified.
+- **Tool checks.** Each check passes if any candidate is found: TeX is
+  `latexmk` or `pdflatex`; the PDF page-count tool is `pdfinfo`, `qpdf` or
+  the `pypdf` package in Nightshift's environment. Agent binaries come from
+  `agents.<name>.binary` when configured. Version commands run on the
+  resolved path with `--version` (`-v` for `latexmk`/`pdfinfo`), stdin
+  closed, 10 s timeout. Python and Node below the §1.1 versions (3.12, 22)
+  get a warning but don't fail doctor: Nightshift runs on its own `.venv`
+  interpreter, which doctor also reports.
+- **Exit code.** `orch doctor` exits 1 when any tool is missing or any
+  mismatch is found, 0 otherwise. launchd "not installed" is a valid state
+  and never fails doctor.
+- **New config keys** (in `defaults.yaml`/`config.example.yaml`):
+  `daemon.label` (`com.nightshift.daemon`; plist expected at
+  `~/Library/LaunchAgents/<label>.plist`, for the daemon issue to reuse),
+  `wake.days`/`wake.time` (validated: letters from `MTWRFSU`, `HH:MM:SS`),
+  and `doctor.free_disk_tolerance`. Doctor prints `sudo pmset repeat wake
+  <days> <time>` (default 01:55:00, just before the 2am schedules) and never
+  runs it.
+- **Real-machine check (2026-10-20).** This Mac is an Apple M2 Pro, so doctor
+  correctly reports a chip mismatch against the M3 placeholder; Codex CLI,
+  Gemini CLI and a PDF page-count tool are missing; `python3` on PATH is
+  3.11.5 (warning). The user should set `machine.chip` in their config.

@@ -9,6 +9,8 @@ import click
 from .adapters.base import EventKind
 from .config import ConfigError, load_config
 from .db import Database
+from .doctor import format_report, run_doctor
+from .host import MacHost
 from .runner import create_task, run_attempt
 
 
@@ -68,6 +70,27 @@ def add(ctx, prompt, task_type, agent, priority, internet):
     click.echo(f"Task {new.spec.id}: {result.state}")
     click.echo(f"Report: {new.folder / 'report.md'}")
     sys.exit(0 if result.state in ("done", "partial", "needs_you") else 1)
+
+
+# Tests replace this to run doctor against a FakeHost.
+host_factory = MacHost
+
+
+@main.command()
+@click.pass_context
+def doctor(ctx):
+    """Check whether this Mac is ready to run Nightshift (read-only).
+
+    Exits 1 when a tool is missing or a machine fact doesn't match config.
+    """
+    host = host_factory()
+    try:
+        cfg = load_config(ctx.obj["config_dir"], host=host)
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from None
+    report = run_doctor(cfg, host)
+    click.echo(format_report(report))
+    sys.exit(0 if report.ok else 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

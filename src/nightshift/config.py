@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import stat
 from dataclasses import dataclass, field
 from importlib import resources
@@ -216,6 +217,12 @@ def _validate(data: dict[str, Any]) -> None:
     for name, entry in (data.get("task_types") or {}).items():
         if (entry or {}).get("internet", "off") not in ("on", "off"):
             raise ConfigError(f"task_types.{name}.internet must be 'on' or 'off'")
+    wake = data.get("wake") or {}
+    days = str(wake.get("days", "MTWRFSU"))
+    if not days or any(c not in "MTWRFSU" for c in days):
+        raise ConfigError("wake.days must be letters from MTWRFSU, e.g. MTWRF")
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d:[0-5]\d", str(wake.get("time", "01:55:00"))):
+        raise ConfigError("wake.time must be HH:MM:SS (24-hour), e.g. 01:55:00")
 
 
 def load_config(
