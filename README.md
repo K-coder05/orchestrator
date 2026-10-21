@@ -15,7 +15,9 @@ python3.12 -m venv .venv            # see docs/decisions.md if 3.12 isn't instal
 
 ```sh
 cp config.example.yaml ~/.config/nightshift/config.yaml   # optional; all keys have defaults
-orch daemon install          # launchd agent (KeepAlive) that runs queued Tasks
+orch daemon install          # launchd agent (KeepAlive) that runs queued Tasks;
+                             # refuses if the repo is in ~/Desktop, ~/Documents or
+                             # ~/Downloads (macOS privacy protection, see docs/decisions.md #3)
 orch add "Write a haiku about the night shift to output/haiku.txt"   # asks y/n
 orch add "Tailor my resume" --priority urgent --deadline 2026-11-01 --at 02:00
 orch add "Tailor my resume and a cover letter for <posting URL>" --template resume-tailor

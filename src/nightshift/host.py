@@ -104,6 +104,13 @@ class Host(Protocol):
         """Unload the agent if loaded and delete its plist. None on success."""
         ...
 
+    def protected_folders(self) -> list[Path]:
+        """Folders macOS privacy protection (TCC) keeps from a launchd agent
+        unless its program was granted access: a daemon whose Python,
+        source or data lives in one hangs or gets ``Operation not
+        permitted`` (docs/decisions.md #3, real launchd)."""
+        ...
+
     def hold_awake(self) -> None:
         """Start holding the machine awake (idempotent)."""
         ...
@@ -234,6 +241,11 @@ class MacHost:
     def launch_agents_dir(self) -> Path:
         return Path("~/Library/LaunchAgents").expanduser()
 
+    def protected_folders(self) -> list[Path]:
+        home = Path.home()
+        return [home / "Desktop", home / "Documents", home / "Downloads",
+                home / "Library" / "Mobile Documents", Path("/Volumes")]
+
     def _domain(self) -> str:
         return f"gui/{os.getuid()}"
 
@@ -335,6 +347,9 @@ class FakeHost:
     plists: dict[str, bytes] = field(default_factory=dict)
     #: Error message the next launchd install/uninstall returns, if any.
     launchd_error: str | None = None
+    #: What ``protected_folders`` returns (none by default, so tests running
+    #: from a repo under ~/Desktop can still install).
+    protected: list[Path] = field(default_factory=list)
     awake: bool = False
     #: ``"hold"``/``"release"`` in call order (only state changes are recorded).
     awake_log: list[str] = field(default_factory=list)
@@ -376,6 +391,9 @@ class FakeHost:
 
     def launch_agents_dir(self) -> Path:
         return Path("/fake/LaunchAgents")
+
+    def protected_folders(self) -> list[Path]:
+        return list(self.protected)
 
     def launchd_install(self, label: str, plist: bytes) -> str | None:
         if self.launchd_error:

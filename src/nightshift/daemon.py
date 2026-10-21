@@ -21,6 +21,7 @@ import plistlib
 import sys
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
@@ -160,9 +161,88 @@ def build_plist(cfg: Config, *, python: str | None = None, path_env: str | None 
             "PATH": path_env,
             "PYTHONPATH": src_dir,
             "NIGHTSHIFT_CONFIG_DIR": str(cfg.config_dir),
+            # stdout is a file under launchd: without this, log lines sit in
+            # Python's block buffer and daemon.log looks empty.
+            "PYTHONUNBUFFERED": "1",
         },
     }
     return plistlib.dumps(data)
+
+
+@dataclass(frozen=True)
+class AccessProblem:
+    """A path the launchd daemon needs that sits in a privacy-protected
+    folder. ``blocking``: the daemon can't start or run Tasks at all
+    (otherwise only some Tasks lose an input or a readable folder)."""
+
+    what: str
+    path: Path
+    folder: Path
+    blocking: bool
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    try:
+        return path.is_relative_to(folder.resolve())
+    except OSError:
+        return False
+
+
+def launchd_access_problems(cfg: Config, host: Host, *, python: str | None = None) -> list[AccessProblem]:
+    """Paths the launchd agent reads that macOS privacy protection (TCC)
+    keeps from it. Verified on this Mac: a LaunchAgent whose Python lives
+    under ~/Desktop hangs in dyld before Python starts, and a launchd job
+    reading a file there gets ``Operation not permitted``."""
+    from .templates import templates_dir  # lazy: templates imports a lot
+
+    folders = host.protected_folders()
+    if not folders:
+        return []
+    python = python or sys.executable
+    needed: list[tuple[str, Path, bool]] = [
+        ("Python", Path(python), True),
+        ("Nightshift source", Path(nightshift.__file__).parent, True),
+        ("config dir", cfg.config_dir, True),
+        ("agents_root", cfg.agents_root, True),
+        ("templates dir", templates_dir(cfg), True),
+        ("Tracker", cfg.tracker_path, True),
+    ]
+    for tname, section in ((cfg.data.get("templates") or {}).items()):
+        if isinstance(section, dict):
+            for key, value in section.items():
+                if isinstance(value, str) and value.startswith(("~", "/")):
+                    needed.append((f"templates.{tname}.{key}", Path(value), False))
+    for d in (cfg.data.get("permissions") or {}).get("read_only_dirs") or []:
+        needed.append(("permissions.read_only_dirs", Path(str(d)), False))
+    out: list[AccessProblem] = []
+    for what, path, blocking in needed:
+        real = path.expanduser().resolve()
+        for folder in folders:
+            if _inside(real, folder):
+                out.append(AccessProblem(what, real, folder, blocking))
+                break
+    return out
+
+
+def format_access_problems(problems: list[AccessProblem], python: str | None = None) -> list[str]:
+    """Human lines for ``orch daemon install`` and ``orch doctor``."""
+    if not problems:
+        return []
+    real_python = Path(python or sys.executable).resolve()
+    lines = []
+    for p in problems:
+        kind = "daemon can't run" if p.blocking else "a launchd-run Task touching it waits on a privacy prompt"
+        lines.append(f"{p.what} {p.path} is in {p.folder} ({kind})")
+    lines.append(
+        "macOS privacy protection (TCC) keeps launchd agents out of Desktop, Documents, "
+        "Downloads, iCloud Drive and external volumes: the access either fails or waits, "
+        "unattended, on a \"python3.12 would like to access ...\" dialog. Move these "
+        "outside them (the repo with its .python/.venv, then re-run `orch daemon "
+        f"install`), or allow {real_python} that folder (answer the dialog once at the "
+        "Mac, or give it Full Disk Access in System Settings > Privacy & Security) and "
+        "install with --allow-protected."
+    )
+    return lines
 
 
 # --------------------------------------------------------------------------

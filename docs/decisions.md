@@ -165,8 +165,57 @@ lasting consequences go in `docs/adr/` instead.
   even when macOS hides the editable-install `.pth`, and with the `PATH` from
   install time, because launchd's default PATH wouldn't find `claude` in
   `~/.local/bin`. Re-run `orch daemon install` after moving the repo or venv.
-  Verified with `plutil -lint` on a generated plist; the real
-  bootstrap/bootout has not been run on this Mac (tests use `FakeHost`).
+  Verified with `plutil -lint` on a generated plist; tests use `FakeHost`.
+  The real bootstrap/bootout was run later (see "Real launchd" below).
+- **Real launchd (2026-10-21, macOS 26.6.2).** Run on this Mac with the real
+  `~/agents` and `~/.config/nightshift`:
+  - From the repo in `~/Desktop`, `orch daemon install` loaded the agent
+    (`launchctl print` showed state running, a pid) but the daemon never
+    started: its process hung in dyld `open()` of the venv's Python (which
+    lives in the repo's `.python/`). macOS privacy protection (TCC) had put up
+    a "python3.12 would like to access files in your Desktop folder" dialog
+    and the open blocked until it was answered. `daemon.log` stayed empty and
+    `orch daemon status` said "not running" while launchd showed a pid. A
+    `launchctl submit` job using `/bin/sh` got `Operation not permitted` on a
+    file in `~/Desktop` right away (platform binaries get a silent deny, other
+    binaries get a dialog).
+  - **Fix:** `orch daemon install` now checks, through the new
+    `Host.protected_folders()` (MacHost: `~/Desktop`, `~/Documents`,
+    `~/Downloads`, `~/Library/Mobile Documents`, `/Volumes`), every path the
+    daemon needs (`daemon.launchd_access_problems`): the Python executable
+    (resolved), Nightshift's source, config dir, agents_root, templates dir and
+    Tracker are blocking, so install refuses with the fix (move the repo
+    together with `.python/` and `.venv/`, or allow that Python the folder,
+    then `--allow-protected`). Template input files and
+    `permissions.read_only_dirs` in a protected folder only warn. `orch
+    doctor` lists the same lines under launchd and is "Not ready" on a
+    blocking one. The plist also sets `PYTHONUNBUFFERED=1`: under launchd
+    stdout is a file, so log lines otherwise sat in Python's buffer.
+  - With a copy of the runtime (`.python`, venv site-packages, `src`,
+    `templates`) staged outside protected folders, the real install worked:
+    the plist passed `plutil -lint`; `launchctl print` showed state running,
+    pid 64165, runs 1; `orch daemon status` and `orch doctor` agreed; daemon.log
+    had "daemon started (pid 64165)" at once; `claude` resolved on the plist's
+    PATH (`~/.nvm/.../bin/claude`, 2.1.307). `kill 64165` led to "daemon
+    stopped", then launchd restarted it (pid 64260, runs 2, last terminating
+    signal 15).
+  - One haiku smoke Task (`orch add "... output/hi.txt" --yes`) ran on the
+    launchd daemon with `caffeinate -i -s -w` as a daemon child only while it
+    was running, and nothing held afterwards. It ended `done` with
+    `output/hi.txt` = "hi", but only after about 23 minutes: claude's start
+    raised a Documents-folder TCC dialog attributed to the daemon's Python
+    (responsible process), and the Attempt waited until someone answered it
+    at the Mac. So **the first launchd-run Tasks may wait on macOS privacy
+    dialogs**. Answer them once (or give the Python Full Disk Access) before
+    leaving the daemon unattended; an unanswered one holds the Task until its
+    runtime cap. The same claude command and settings run from a `/bin/sh`
+    launchd job raised no dialog, so which file claude opened in `~/Documents`
+    is unknown.
+  - After that dialog had been allowed for the repo's Python, `orch daemon
+    install --allow-protected` from the repo started the daemon normally.
+  - `orch daemon uninstall` booted the agent out (`launchctl print`: could not
+    find service) and deleted the plist; no daemon, caffeinate or claude
+    process was left, and daemon.log ended with "daemon stopped".
 - **Stopping mid-Attempt requeues.** SIGTERM (launchd stop/bootout) or SIGINT
   makes the daemon terminate the agent through `runner.AttemptControl`; the
   Attempt ends with outcome `interrupted` and the Task goes `running ->

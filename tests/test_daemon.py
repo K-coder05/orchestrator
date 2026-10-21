@@ -203,6 +203,8 @@ def test_plist_runs_daemon_under_keepalive(cfg):
     assert env["PATH"].split(":")[0] == "/venv/bin"
     assert env["NIGHTSHIFT_CONFIG_DIR"] == str(cfg.config_dir)
     assert env["PYTHONPATH"].endswith("src")
+    # launchd's stdout is a file: unbuffered, or daemon.log stays empty.
+    assert env["PYTHONUNBUFFERED"] == "1"
     assert data["StandardOutPath"] == str(daemon.log_path(cfg))
 
 
@@ -235,6 +237,44 @@ def test_daemon_install_status_uninstall(config_dir, fake_host):
     assert r.exit_code == 0, r.output
     assert fake_host.plists == {}
     assert "not installed" in _orch(config_dir, "daemon", "status").output
+
+
+def test_install_refuses_when_daemon_files_are_privacy_protected(config_dir, fake_host, cfg, tmp_path):
+    # Real launchd on macOS: a LaunchAgent whose Python lives under ~/Desktop
+    # hung in dyld before Python started (TCC). Install must refuse up front.
+    fake_host.protected = [cfg.agents_root.parent]
+    r = _orch(config_dir, "daemon", "install")
+    assert r.exit_code == 1, r.output
+    assert "not installing" in r.output and "agents_root" in r.output
+    assert "--allow-protected" in r.output and "Full Disk Access" in r.output
+    assert fake_host.plists == {}
+
+    r = _orch(config_dir, "daemon", "install", "--allow-protected")
+    assert r.exit_code == 0, r.output
+    assert "com.nightshift.daemon" in fake_host.plists
+    assert "warning: agents_root" in r.output
+
+
+def test_install_warns_but_installs_for_protected_task_inputs(config_dir, fake_host, tmp_path):
+    docs = tmp_path / "Documents"
+    (config_dir / "config.yaml").write_text(
+        (config_dir / "config.yaml").read_text()
+        + f"permissions:\n  read_only_dirs: [{docs / 'career'}]\n"
+        + f"templates:\n  resume_tailor:\n    master_tex: {docs / 'career' / 'master.tex'}\n"
+    )
+    fake_host.protected = [docs]
+    r = _orch(config_dir, "daemon", "install")
+    assert r.exit_code == 0, r.output
+    assert "warning: permissions.read_only_dirs" in r.output
+    assert "warning: templates.resume_tailor.master_tex" in r.output
+
+
+def test_access_problems_classify_blocking(cfg, tmp_path):
+    host = FakeHost(protected=[tmp_path])
+    found = {p.what: p.blocking for p in daemon.launchd_access_problems(cfg, host, python="/usr/bin/python3")}
+    assert found["agents_root"] is True and found["config dir"] is True
+    assert "Python" not in found  # /usr/bin is not protected
+    assert daemon.launchd_access_problems(cfg, FakeHost(), python="/x") == []
 
 
 def test_daemon_install_failure_exits_nonzero(config_dir, fake_host):

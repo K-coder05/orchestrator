@@ -66,6 +66,10 @@ class DoctorReport:
     launchd: LaunchdStatus
     wake_command: str
     config_path: Path
+    #: Lines from daemon.format_access_problems; ``access_blocking`` means
+    #: the launchd daemon can't run at all.
+    access: list[str] = field(default_factory=list)
+    access_blocking: bool = False
 
     @property
     def missing(self) -> list[ToolResult]:
@@ -73,7 +77,7 @@ class DoctorReport:
 
     @property
     def ok(self) -> bool:
-        return not self.missing and not self.mismatches
+        return not self.missing and not self.mismatches and not self.access_blocking
 
 
 def tool_specs(cfg: Config) -> list[ToolSpec]:
@@ -193,6 +197,9 @@ def run_doctor(cfg: Config, host: Host) -> DoctorReport:
     disk_path = cfg.agents_root
     free = host.free_disk_bytes(disk_path)
     label = str((cfg.data.get("daemon") or {}).get("label", "com.nightshift.daemon"))
+    from . import daemon  # lazy: daemon imports the runner stack
+
+    problems = daemon.launchd_access_problems(cfg, host)
     return DoctorReport(
         hardware=hw,
         os_version=os_version,
@@ -204,6 +211,8 @@ def run_doctor(cfg: Config, host: Host) -> DoctorReport:
         launchd=host.launchd_status(label),
         wake_command=wake_command(cfg),
         config_path=cfg.source or cfg.config_dir / "config.yaml",
+        access=daemon.format_access_problems(problems),
+        access_blocking=any(p.blocking for p in problems),
     )
 
 
@@ -256,6 +265,7 @@ def format_report(r: DoctorReport) -> str:
         "",
         "launchd",
         f"  {_launchd_line(r.launchd)}",
+        *[f"  - {line}" for line in r.access],
         "",
         "Scheduled wake (optional, §1.9; run it yourself, Nightshift never does)",
         f"  {r.wake_command}",
@@ -269,5 +279,7 @@ def format_report(r: DoctorReport) -> str:
             parts.append(f"{len(r.missing)} missing tool(s): {', '.join(t.label for t in r.missing)}")
         if r.mismatches:
             parts.append(f"{len(r.mismatches)} config mismatch(es)")
+        if r.access_blocking:
+            parts.append("the launchd daemon can't reach its files (see launchd)")
         lines.append("Not ready: " + "; ".join(parts) + ".")
     return "\n".join(lines)

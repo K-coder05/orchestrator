@@ -221,3 +221,24 @@ def test_cli_doctor_exit_codes(config_dir, monkeypatch):
     assert res.exit_code == 1
     assert "MISSING" in res.output
     assert "sudo pmset repeat wake" in res.output
+
+
+def test_launchd_access_problems_are_reported(config_dir, tmp_path):
+    # On real launchd a daemon whose agents_root sits in a TCC-protected
+    # folder can't run; a read-only dir there only blocks Tasks touching it.
+    protected = tmp_path / "Desktop"
+    write_config(config_dir, {
+        "paths": {"agents_root": str(protected / "agents")},
+        "permissions": {"read_only_dirs": [str(protected / "notes")]},
+    })
+    r = doctor(config_dir, matching_host(protected=[protected]))
+    text = format_report(r)
+    assert not r.ok and r.access_blocking
+    assert f"agents_root {protected / 'agents'} is in {protected} (daemon can't run)" in text
+    assert "permissions.read_only_dirs" in text and "privacy prompt" in text
+    assert "the launchd daemon can't reach its files" in text
+
+
+def test_no_access_problems_outside_protected_folders(config_dir, tmp_path):
+    r = doctor(config_dir, matching_host(protected=[tmp_path / "Desktop"]))
+    assert r.ok and r.access == []

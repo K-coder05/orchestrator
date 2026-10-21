@@ -749,11 +749,21 @@ def _load(ctx, host):
 
 
 @daemon_group.command("install")
+@click.option("--allow-protected", is_flag=True,
+              help="Install even though Nightshift's Python, source or data is in a "
+                   "privacy-protected folder (only after granting Python Full Disk Access).")
 @click.pass_context
-def daemon_install(ctx):
+def daemon_install(ctx, allow_protected):
     """Write the LaunchAgent plist and load it (replaces an existing one)."""
     host = host_factory()
     cfg = _load(ctx, host)
+    problems = daemon.launchd_access_problems(cfg, host)
+    lines = daemon.format_access_problems(problems)
+    if any(p.blocking for p in problems) and not allow_protected:
+        raise click.ClickException(
+            "not installing: the launchd daemon could not start or run Tasks.\n  "
+            + "\n  ".join(lines)
+        )
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     err = host.launchd_install(daemon.label(cfg), daemon.build_plist(cfg))
     if err:
@@ -761,6 +771,8 @@ def daemon_install(ctx):
     st = host.launchd_status(daemon.label(cfg))
     click.echo(f"Installed {st.label}: {st.plist_path}")
     click.echo(f"Daemon log: {daemon.log_path(cfg)}")
+    for line in lines:
+        click.echo(f"warning: {line}", err=True)
 
 
 @daemon_group.command("uninstall")
