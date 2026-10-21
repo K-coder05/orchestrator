@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import failures, pauses, report, usage
+from . import failures, pauses, report, templates, usage
 from .adapters import get_adapter
 from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
 from .config import Config
@@ -53,6 +53,8 @@ def create_task(
     needs_approval: bool = False,
     simulate_rate_limit_after: int | None = None,
     reason: str = "created by orch add",
+    title: str | None = None,
+    agent_override: bool | None = None,
 ) -> NewTask:
     """Create a Task: DB row, Task folder, ``task.yaml``.
 
@@ -69,6 +71,9 @@ def create_task(
     cap, else ``defaults.max_runtime_minutes`` (§2.7).
     ``simulate_rate_limit_after`` (fault injection, §3.1 item 15) makes the
     first Attempt that reaches that many Steps hit a simulated rate limit.
+    ``title`` (default: the prompt) names the Task and its folder, for
+    template Tasks whose prompt is the rendered template. ``agent_override``
+    defaults to whether ``agent`` was given.
     """
     created = now(cfg.timezone)
     ttype = task_type or cfg.default("task_type")
@@ -85,12 +90,12 @@ def create_task(
     )
     spec = TaskSpec(
         id=task_id,
-        title=title_from_prompt(prompt),
-        slug=slugify(prompt),
+        title=title_from_prompt(title or prompt),
+        slug=slugify(title or prompt),
         prompt=prompt,
         task_type=ttype,
         agent=agent_name,
-        agent_override=agent is not None,
+        agent_override=(agent is not None) if agent_override is None else bool(agent_override),
         priority=priority or cfg.default("priority"),
         deadline=deadline,
         run_at=run_at,
@@ -460,6 +465,14 @@ def run_attempt(
     # -- decide the outcome --------------------------------------------------
     db.record_usage(run_id, task_id, agent_name, [u.as_dict() for u in adapter.usage_from_run()],
                     at=iso(clock()))
+    if row["template"]:
+        # A template's deadline source (a posting's close date, §2.3): after
+        # every Attempt, paused ones included, so the queue and pause expiry see it.
+        try:
+            templates.apply_output_deadline(cfg, db, task_id)
+        except Exception as exc:  # bad agent output must never break the Attempt
+            _log(folder, f"{iso(now(cfg.timezone))} could not read the deadline source: {exc}",
+                 redact)
     report_text = (folder / "report.md").read_text() if (folder / "report.md").exists() else ""
     ok = adapter.result_ok()
     detail: str | None = None

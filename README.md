@@ -18,6 +18,7 @@ cp config.example.yaml ~/.config/nightshift/config.yaml   # optional; all keys h
 orch daemon install          # launchd agent (KeepAlive) that runs queued Tasks
 orch add "Write a haiku about the night shift to output/haiku.txt"   # asks y/n
 orch add "Tailor my resume" --priority urgent --deadline 2026-11-01 --at 02:00
+orch add "Tailor my resume and a cover letter for <posting URL>" --template resume-tailor
 orch priority <id> background   # urgent | normal | background
 orch approve <id>            # or `orch deny <id>`, for Tasks awaiting approval
 orch retry <id>              # failed/partial: run again; retry_wait: retry now
@@ -39,6 +40,17 @@ folder. `orch daemon status` shows whether it is up; `orch daemon run` runs it
 in a terminal instead of under launchd. `orch show <id>` lists a Task's
 Attempts and state history. Set `NIGHTSHIFT_CONFIG_DIR` to use a different
 config directory.
+
+`--template T` makes the Task from `templates/T.yaml` instead: no planning
+call or question; the template sets the estimate, Task type, agent, runtime
+cap, internet and long-task flag, renders the prompt, and adds post-hooks
+that check the output. `resume-tailor` copies `master.tex` and your
+cover-letter template (paths in `templates.resume_tailor` in config) into the
+Task folder, and Nightshift compiles the agent's `output/resume.tex` and
+`output/cover_letter.tex` itself (sandboxed; needs TeX and `pypdf`). The
+Attempt fails unless the resume PDF is exactly 1 page. The posting's stated
+close date becomes the deadline unless `--deadline` is given. Nothing is ever
+submitted: you review `output/` and apply yourself.
 
 The queue runs by Effective priority: urgent first (nearest deadline first),
 then normal in order, then background only when nothing else can start. A

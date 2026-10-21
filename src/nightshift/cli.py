@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from . import daemon, failures, pauses, planning, views
+from . import daemon, failures, pauses, planning, templates, views
 from . import usage as usage_mod
 from . import priority as prio
 from .adapters import get_adapter
@@ -76,6 +76,8 @@ def _daemon_note(cfg) -> None:
 
 @main.command()
 @click.argument("prompt")
+@click.option("--template", "template_name", default=None, metavar="T",
+              help="Make the Task from template T (templates/T.yaml): no planning call.")
 @click.option("--type", "task_type", default=None, help="Task type (overrides the proposed one).")
 @click.option("--agent", default=None, help="Agent override (default by config).")
 @click.option(
@@ -106,15 +108,23 @@ def _daemon_note(cfg) -> None:
     "Attempt, through the real pause/resume path. Fires once per Task.",
 )
 @click.pass_context
-def add(ctx, prompt, task_type, agent, priority, deadline, at, internet, yes, simulate_after):
-    """Plan and queue a free-form Task; the daemon runs it.
+def add(ctx, prompt, template_name, task_type, agent, priority, deadline, at, internet, yes,
+        simulate_after):
+    """Plan and queue a Task; the daemon runs it.
 
-    A quick planning call estimates the minutes and proposes a Task type,
-    and you confirm both (unless --yes). Tasks estimated over 30 minutes get
-    a plan.md that you approve here or later with `orch approve <id>`.
+    Free-form: a quick planning call estimates the minutes and proposes a
+    Task type, and you confirm both (unless --yes). With --template the
+    template sets both and there is no call or question. Tasks estimated
+    over 30 minutes get a plan.md that you approve here or later with
+    `orch approve <id>`.
     """
     cfg, db = _open(ctx.obj["config_dir"])
     try:
+        if template_name:
+            _add_from_template(cfg, db, prompt, template_name, task_type=task_type, agent=agent,
+                               priority=priority, deadline=deadline, at=at, internet=internet,
+                               simulate_after=simulate_after)
+            return
         try:
             cfg.agent(agent or cfg.default("agent"))
             # Parse times before spending a planning call on a typo.
@@ -153,39 +163,87 @@ def add(ctx, prompt, task_type, agent, priority, deadline, at, internet, yes, si
             )
         except ConfigError as exc:
             raise click.ClickException(str(exc)) from None
-        tid = new.spec.id
-        planning.record_usage(db, tid, "estimate", proposal)
-        _timing_notes(cfg, new.spec)
-        if simulate_after:
-            click.echo(f"Fault injection: a simulated rate limit after {simulate_after} "
-                       f"Step{'s' if simulate_after != 1 else ''}")
-        if not long_task:
-            click.echo(f"Task {tid} queued: {new.folder}")
-            _daemon_note(cfg)
-            return
-
-        click.echo(f"Task {tid} is awaiting approval: {new.folder}")
-        click.echo("Planning: writing plan.md...", err=True)
-        try:
-            plan_text = planning.write_plan(cfg, db, tid, adapter_provider=planning_provider)
-        except planning.PlanningError as exc:
-            click.echo(f"Could not write a plan: {exc}", err=True)
-            click.echo(f"Approve it without a plan with `orch approve {tid}`, or `orch deny {tid}`.")
-            return
-        click.echo("")
-        click.echo(plan_text.rstrip())
-        click.echo("")
-        if _ask("Approve this plan?"):
-            planning.approve(cfg, db, tid, via="orch add")
-            click.echo(f"Task {tid} queued.")
-            _daemon_note(cfg)
-        else:
-            click.echo(
-                f"Task {tid} stays awaiting approval. "
-                f"`orch approve {tid}` queues it; `orch deny {tid}` cancels it."
-            )
+        planning.record_usage(db, new.spec.id, "estimate", proposal)
+        _after_create(cfg, db, new, long_task=long_task, simulate_after=simulate_after)
     finally:
         db.close()
+
+
+def _add_from_template(cfg, db, prompt, name, *, task_type, agent, priority, deadline, at,
+                       internet, simulate_after) -> None:
+    """``orch add --template``: estimate, type and settings from the template."""
+    try:
+        tpl = templates.load(cfg, name)
+        instance = templates.instantiate(cfg, tpl, prompt)
+        proposal = planning.from_template(tpl.as_dict())
+        cfg.agent(agent or tpl.agent)
+        current = _clock(cfg)
+        deadline_at = prio.parse_deadline(deadline, current, cfg.timezone) if deadline else None
+        run_at = prio.parse_at(at, current, cfg.timezone) if at else None
+    except (ConfigError, planning.PlanningError, templates.TemplateError) as exc:
+        raise click.ClickException(f"{exc}. Nothing was queued.") from None
+    ttype = task_type or tpl.task_type
+    click.echo(f"Template:  {tpl.name}" + (f" ({tpl.description})" if tpl.description else ""))
+    click.echo(f"Estimate:  {proposal.estimated_minutes} minutes (from the template)")
+    click.echo(f"Task type: {ttype}" + (" (from --type)" if task_type else ""))
+    for var in tpl.inputs:
+        click.echo(f"Input:     {var} = {instance.values[var]}")
+    for f in instance.files:
+        click.echo(f"Input:     {f.source} -> {f.to}")
+    if tpl.deadline and not deadline_at:
+        click.echo(f"Deadline:  from the agent's {tpl.deadline['from_output']} "
+                   f"({tpl.deadline['field']}), if the posting states one")
+    long_task = planning.needs_plan(cfg, proposal.estimated_minutes)
+    try:
+        new = create_task(
+            cfg, db, instance.prompt, title=prompt, task_type=ttype, agent=agent or tpl.agent,
+            agent_override=agent is not None, priority=priority, deadline=deadline_at,
+            run_at=run_at, long=tpl.long, internet=internet or tpl.internet,
+            estimated_minutes=proposal.estimated_minutes, template=tpl.name,
+            max_runtime_minutes=tpl.max_runtime_minutes, needs_approval=long_task,
+            simulate_rate_limit_after=simulate_after,
+            reason=f"created by orch add --template {tpl.name} (estimated "
+                   f"{proposal.estimated_minutes} min"
+                   + (", needs plan approval)" if long_task else ", no plan needed)"),
+        )
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from None
+    templates.install_inputs(cfg, instance, new.folder, new.spec.id)
+    _after_create(cfg, db, new, long_task=long_task, simulate_after=simulate_after)
+
+
+def _after_create(cfg, db, new, *, long_task: bool, simulate_after) -> None:
+    """Report the new Task and, over the plan threshold, plan and ask."""
+    tid = new.spec.id
+    _timing_notes(cfg, new.spec)
+    if simulate_after:
+        click.echo(f"Fault injection: a simulated rate limit after {simulate_after} "
+                   f"Step{'s' if simulate_after != 1 else ''}")
+    if not long_task:
+        click.echo(f"Task {tid} queued: {new.folder}")
+        _daemon_note(cfg)
+        return
+
+    click.echo(f"Task {tid} is awaiting approval: {new.folder}")
+    click.echo("Planning: writing plan.md...", err=True)
+    try:
+        plan_text = planning.write_plan(cfg, db, tid, adapter_provider=planning_provider)
+    except planning.PlanningError as exc:
+        click.echo(f"Could not write a plan: {exc}", err=True)
+        click.echo(f"Approve it without a plan with `orch approve {tid}`, or `orch deny {tid}`.")
+        return
+    click.echo("")
+    click.echo(plan_text.rstrip())
+    click.echo("")
+    if _ask("Approve this plan?"):
+        planning.approve(cfg, db, tid, via="orch add")
+        click.echo(f"Task {tid} queued.")
+        _daemon_note(cfg)
+    else:
+        click.echo(
+            f"Task {tid} stays awaiting approval. "
+            f"`orch approve {tid}` queues it; `orch deny {tid}` cancels it."
+        )
 
 
 def _timing_notes(cfg, spec) -> None:

@@ -578,3 +578,107 @@ lasting consequences go in `docs/adr/` instead.
   answered "available". A full real Attempt pausing on a real hit was not
   run (the Window had reset by then); that path is covered with the fake
   CLI replaying the recorded format.
+
+## Phase 1, issue #10: template engine and `resume-tailor`
+
+- **Templates are YAML in the repo's `templates/`** (`templates.dir` in
+  config overrides it). Required keys: `task_type`, `agent`,
+  `estimated_minutes`, `max_runtime_minutes`, `long`, `internet`, `prompt`;
+  optional: `description`, `inputs`, `files`, `deadline`, `post_hooks`.
+  Unknown keys, unknown variables, unknown hooks and paths that leave the
+  Task folder are load errors (`nightshift.templates.parse`), so a typo
+  fails `orch add`, never a 2am Occurrence. `tests/test_templates.py` loads
+  every repo template.
+- **Variables are `{{name}}`**, not `{name}`/`$name`, because prompts talk
+  about LaTeX and JSON, which are full of braces and dollar signs. Sources:
+  `{{request}}` (the `orch add` text), `inputs` (`from: url` = the first
+  http(s) URL in the request) and `files` (the relative path of a copied
+  input file). The rendered prompt is the Task's `prompt` (what the agent
+  gets, also on resume/fresh retries); the request names the Task (`title`,
+  slug, folder) and is quoted inside the prompt.
+- **`orch add "<request>" --template T`** makes no planning call and asks no
+  y/n: §2.4's confirmation is for free-form Tasks, and the estimate and type
+  come from the template (`planning.from_template`). A template over the
+  plan threshold would still go through plan.md + approval (none does).
+  `--type`, `--agent`, `--internet`, `--priority`, `--deadline`, `--at` and
+  `--simulate-rate-limit-after` override as for free-form Tasks; the
+  template's agent is not an `agent_override`.
+- **Input files are copied, not referenced.** `files:` names a config key
+  (`templates.resume_tailor.master_tex`, `.cover_letter_template`); at
+  `orch add` the file is read (missing = nothing queued) and written to the
+  Task folder (`input/master.tex`, `input/cover_letter_template.tex`) plus a
+  pristine copy in `<agents_root>/data/inputs/<task-id>/`, which agents can't
+  reach. The snapshot keeps line numbers stable for the `changes.md`
+  citations even if `master.tex` is edited while the Task waits, and works
+  when the configured path is outside the read-only folders. The
+  `inputs_unchanged` hook fails an Attempt whose agent edited its copy (and
+  restores it). The traceability checks (citations, numbers, the diff in
+  the report) should compare against the pristine copy.
+- **Deadline source** `deadline: {from_output: output/posting.json, field:
+  close_date}`: the posting is only read by the agent, so its close date
+  can't be known at `orch add`. After **every** Attempt (paused ones too, so
+  the queue and pause expiry see it) Nightshift reads that file and, if the
+  Task has no deadline yet, sets it (`YYYY-MM-DD` = 23:59:59 LA, or ISO
+  8601), in the DB and `task.yaml`, with a log line. `--deadline` always
+  wins (a Task that has a deadline is never changed). A null/missing date
+  means no deadline (normal priority); a non-date is logged and ignored; a
+  passed date is kept (it's a fact about the posting). The prompt tells the
+  agent to write `posting.json` first thing and never guess a date.
+- **Post-hooks** are named in the template and built by
+  `templates.HOOKS`: `require_outputs` (regular, non-empty files; symlinks
+  don't count), `compile_latex` (source, pdf, optional exact `pages`) and
+  `inputs_unchanged`. `failures.post_hooks_for(cfg, row, host)` returns a
+  template Task's hooks; the daemon passes its host. resume-tailor:
+  inputs unchanged -> `posting.json`, `resume.tex`, `cover_letter.tex`,
+  `cover_letter.txt`, `changes.md` exist -> compile resume (exactly 1 page)
+  -> compile cover letter -> both PDFs exist. Any failure is a Failed
+  Attempt with the reason (e.g. "output/resume.pdf has 2 pages; it must be
+  exactly 1"), so it gets the normal retries; the prompt tells a retry to
+  read `logs/nightshift.log` and fix what the hook named.
+- **Nightshift compiles, the agent doesn't have to.** The PDFs in
+  `output/` are always Nightshift's own compile (anything the agent put
+  there is replaced). The agent may try `pdflatex` in its sandbox to check
+  the page count, but nothing depends on it. Compiler: `templates.latex.
+  binary`, else `latexmk` on PATH, else the engine (`pdflatex`, run twice);
+  `-interaction=nonstopmode -halt-on-error -no-shell-escape
+  -file-line-error`, aux files and `compile.log` in `logs/latex/<name>/`,
+  `templates.latex.timeout_seconds` (120). Page count with `pypdf` (new
+  dependency; the §1.9 page-count tool, pure Python, installed into
+  `.venv` only).
+- **The compile is sandboxed** (`Host.run_confined`, macOS Seatbelt via
+  `sandbox-exec`): agent-written TeX comes from an agent that read a web
+  page, and `\input{/any/file}` would pull a private file into the PDF.
+  TeX's own `openin_any=p` does **not** stop `\input` of absolute paths in
+  pdfTeX (checked on TeX Live 2026: it read `~/…` happily), so it is set
+  only as an extra layer. The profile denies network, denies reads under
+  your home folder and `agents_root` except the Task folder and
+  `templates.latex.readable_dirs` (`~/Library/texmf`, `~/Library/texlive`),
+  and allows writes only in the Task folder and the per-user temp dir.
+  Verified: a real compile could not `\input` a file outside the Task folder
+  ("File not found"). The compile never follows the agent's symlinks out of
+  the Task folder (source, PDF and build paths are checked; a link at the
+  PDF path is replaced, not written through).
+- **LinkedIn posting URLs are refused** at `orch add` (any of
+  `permissions.denied_domains`), since the agent couldn't fetch them anyway
+  (§1.6).
+- **Nothing is ever submitted**: the template prompt says so and points to
+  `needs_you.json`; technically the Task has no tool that can submit
+  anything (WebFetch is read-only, shell has no network, no MCP/browser
+  tools). See `docs/safety.md`.
+- **Out of scope here** (the traceability issue): failing on uncited
+  bullets, nonexistent cited lines or numbers missing from `master.tex`,
+  and the unified diff in `report.md`. The prompt already asks for
+  `master.tex:L<n>` citations in `changes.md`.
+- **Real-machine check (2026-10-21, 03:39 PDT).** Scratch config, haiku,
+  a sample one-page `master.tex` and letter template, TeX Live 2026
+  (`latexmk` 4.88): `orch add "Tailor my resume and a cover letter for
+  <Figma SWE intern posting on Greenhouse>" --template resume-tailor`, real
+  `orch daemon run`. The agent fetched the posting, wrote all outputs with
+  `master.tex:L<n>` citations, didn't touch its inputs, and said the
+  application is for me to submit; Nightshift compiled both (resume 1 page)
+  and the Task ended `done` in 1m 33s ($0.019 cost-equivalent). The posting
+  states no close date, so `close_date` was null and no deadline was set
+  (the close-date path is covered with the fake agent). On a first run the
+  agent's own `pdflatex` was auto-denied (it needs a permission prompt), and
+  it reported `partial` for the unchecked page count; the prompt now tells
+  it not to compile and that this is no reason for partial.

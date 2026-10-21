@@ -67,6 +67,23 @@ one-line system prompt and the fixed prompt "OK?" (no Task content), in
 `<agents_root>/data/probe/`. Its answer is never used, only whether it went
 through.
 
+## Template post-hooks (Nightshift-side tools)
+
+Some templates run tools on what the agent wrote, after the Attempt and
+outside the agent's session: `resume-tailor` compiles `output/resume.tex` and
+`output/cover_letter.tex` with LaTeX. That input is untrusted (the agent read
+a web page to write it), so the compile runs through `Host.run_confined`:
+
+| Limit | Status | How |
+|---|---|---|
+| The compile can't read private files into the PDF | **Technically enforced** (verified) | macOS Seatbelt (`sandbox-exec`) profile: reads under your home folder and `agents_root` are denied except the Task folder and `templates.latex.readable_dirs` (`~/Library/texmf`, `~/Library/texlive`). A real `\input{<file outside the Task folder>}` failed with "File not found". TeX's own `openin_any=p` is also set but does **not** stop `\input` of absolute paths in pdfTeX (verified), so it is not relied on. |
+| The compile writes only inside the Task folder | **Technically enforced** | Same profile: writes only to the Task folder and the per-user temp dir (`/private/var/folders`). Nightshift's own copy of the PDF never follows a symlink the agent left (paths are checked; a link at the PDF path is replaced). |
+| No shell escape / network from TeX | **Technically enforced** | `-no-shell-escape` (`shell_escape=f`), and the profile denies all network. |
+| `sandbox-exec` itself | **Gap (future)** | Deprecated by Apple, though still shipped in macOS 26 and used by Claude Code's own sandbox. If it goes away, `MacHost.run_confined` needs another confinement. |
+
+`resume-tailor` also never runs on a LinkedIn posting: `orch add` refuses a
+posting URL on any of `permissions.denied_domains`.
+
 ## Limits
 
 ### Files (§1.4)
@@ -100,6 +117,7 @@ through.
 | Limit | Status | How |
 |---|---|---|
 | Push to GitHub, deploy, send messages, post, submit applications or coursework, log into accounts | **Technically enforced** for anything that needs network from the shell; **instruction-only** through the web tools | Shell commands have no network. WebFetch only reads pages (no forms, no POSTs). The protocol tells the agent to raise `needs_you.json`. `git push`, `gh` are also on the Bash deny-list. |
+| Submit a job application (`resume-tailor`) | **Technically enforced** that it can't (no tool can submit: WebFetch only reads, shell has no network, no MCP or browser tools); **instruction-only** beyond that | The template prompt says never to submit, fill in forms, log in or contact anyone, and to say in Needs you that the application is ready for you to submit. |
 | Spend money | **Instruction-only** for now | Spending caps arrive with paid credits (Phase 2). |
 | Install system packages with Homebrew | **Technically enforced** | `/opt/homebrew` isn't writable from the sandbox and there's no network; `brew` and `sudo` are also on the deny-list. |
 | Delete files outside the Task folder | **Technically enforced** | Same as the write limit above. |

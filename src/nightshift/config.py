@@ -344,6 +344,20 @@ def _validate(data: dict[str, Any]) -> None:
         value = planning.get(key, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             raise ConfigError(f"planning.{key} must be a positive number")
+    templates = data.get("templates") or {}
+    if not isinstance(templates, dict):
+        raise ConfigError("config section 'templates' must be a mapping")
+    tex = templates.get("latex") or {}
+    if not isinstance(tex, dict):
+        raise ConfigError("templates.latex must be a mapping")
+    if tex.get("engine", "pdflatex") not in ("pdflatex", "xelatex", "lualatex"):
+        raise ConfigError("templates.latex.engine must be pdflatex, xelatex or lualatex")
+    secs = tex.get("timeout_seconds", 120)
+    if isinstance(secs, bool) or not isinstance(secs, (int, float)) or secs <= 0:
+        raise ConfigError("templates.latex.timeout_seconds must be a positive number")
+    dirs = tex.get("readable_dirs") or []
+    if not isinstance(dirs, list) or not all(isinstance(d, str) for d in dirs):
+        raise ConfigError("templates.latex.readable_dirs must be a list of paths")
     poll = (data.get("daemon") or {}).get("poll_seconds", 5)
     if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("daemon.poll_seconds must be a positive number")

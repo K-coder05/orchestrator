@@ -1,0 +1,91 @@
+# resume-tailor (§3.1 item 9): a 1-page resume and a cover letter tailored to
+# one posting. Usage:
+#   orch add "Tailor my resume and a cover letter for <posting URL>" --template resume-tailor
+#
+# Inputs come from config: templates.resume_tailor.master_tex and
+# templates.resume_tailor.cover_letter_template are copied into the Task
+# folder (input/) when the Task is created. Nightshift (not the agent)
+# compiles both .tex files after the Attempt and fails it unless the resume
+# PDF is exactly 1 page. Nothing is ever submitted.
+name: resume-tailor
+description: Tailor the resume and a cover letter to one posting (input - posting URL)
+task_type: resume
+agent: claude
+estimated_minutes: 20
+max_runtime_minutes: 60
+long: false
+internet: "on"
+
+inputs:
+  posting_url: {from: url}   # the first http(s) URL in the request
+
+files:
+  master_tex: {config: templates.resume_tailor.master_tex, to: input/master.tex}
+  cover_letter_template: {config: templates.resume_tailor.cover_letter_template, to: input/cover_letter_template.tex}
+
+# The posting's stated close date becomes the Task's deadline (§2.3), unless
+# --deadline was given. Read after every Attempt.
+deadline:
+  from_output: output/posting.json
+  field: close_date
+
+post_hooks:
+  - hook: inputs_unchanged
+  - hook: require_outputs
+    files: [output/posting.json, output/resume.tex, output/cover_letter.tex, output/cover_letter.txt, output/changes.md]
+  - hook: compile_latex
+    source: output/resume.tex
+    pdf: output/resume.pdf
+    pages: 1
+  - hook: compile_latex
+    source: output/cover_letter.tex
+    pdf: output/cover_letter.pdf
+  - hook: require_outputs
+    files: [output/resume.pdf, output/cover_letter.pdf]
+
+prompt: |
+  Tailor my resume and write a cover letter for one job posting. My request:
+  "{{request}}"
+
+  Posting: {{posting_url}}
+  My master resume (LaTeX): `{{master_tex}}`
+  My cover-letter LaTeX template: `{{cover_letter_template}}`
+  Both are read-only inputs: never edit them.
+
+  Do this in order, keeping `progress.md` current after each step:
+
+  1. Read the posting with your web fetch tool. If it can't be read (login
+     wall, error, not a job posting), write `needs_you.json` and stop. Then
+     write `output/posting.json` right away, as
+     {"company": "...", "role": "...", "location": "...", "url": "{{posting_url}}",
+      "close_date": "YYYY-MM-DD or null", "close_date_text": "..."}
+     `close_date` is the application close date the posting states, or null
+     when it states none. Never guess one.
+  2. Write `output/resume.tex`: a copy of `{{master_tex}}` tailored to this
+     posting. Reorder, trim, and reword bullets so the most relevant
+     experience comes first, using the posting's terms where they truthfully
+     fit. Never invent experience, skills, titles, dates or numbers: every
+     line must trace to content already in `{{master_tex}}`, and every number
+     (percentages, counts, amounts) must appear there. Keep the preamble and
+     layout. It must compile to exactly one page with pdflatex (cut less
+     relevant bullets rather than shrinking fonts or margins below the
+     original).
+  3. Write `output/changes.md`: one entry per changed, moved or removed
+     bullet, each with the new text, the source line number(s) in
+     `{{master_tex}}` as `master.tex:L<n>` (e.g. `master.tex:L42-L43`), and a
+     one-line reason tied to the posting.
+  4. Write `output/cover_letter.tex` from `{{cover_letter_template}}` (keep
+     its layout; fill in the company, role and body), and the same letter as
+     plain text in `output/cover_letter.txt`. Under one page, specific to the
+     posting, claims only from `{{master_tex}}`.
+  5. Don't compile anything yourself (your shell can't run LaTeX here).
+     Nightshift compiles both .tex files after you finish, into
+     `output/resume.pdf` and `output/cover_letter.pdf`, and fails this
+     Attempt if the resume isn't exactly one page or anything above is
+     missing. An unchecked page count is not a reason to report partial.
+  6. Write `report.md`. Under Needs you, say the application is ready for me
+     to review and submit myself.
+
+  Never submit an application, fill in a form, create an account, log in or
+  contact anyone: I submit it myself. If `logs/nightshift.log` shows a failed
+  post-hook from an earlier Attempt, fix what it names first.

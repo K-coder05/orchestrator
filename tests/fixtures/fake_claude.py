@@ -103,6 +103,27 @@ if leak:
     print(f"debug: token is {leak}", flush=True)
     print(f"stderr token {leak}", file=sys.stderr)
 
+if os.environ.get("FAKE_RESUME"):
+    # What a resume-tailor agent writes (templates/resume-tailor.yaml).
+    skip = set(os.environ.get("FAKE_SKIP_OUTPUT", "").split(","))
+    pages = os.environ.get("FAKE_RESUME_PAGES", "1")
+    close = os.environ.get("FAKE_CLOSE_DATE")
+    outputs = {
+        "posting.json": json.dumps({"company": "Acme", "role": "SWE Intern",
+                                    "close_date": close or None}),
+        "resume.tex": "\\documentclass{article}\n% FAKE_PAGES=" + pages
+                      + "\n\\begin{document}Resume\\end{document}\n",
+        "cover_letter.tex": "\\documentclass{letter}\n% FAKE_PAGES=1\n"
+                            "\\begin{document}Dear Acme\\end{document}\n",
+        "cover_letter.txt": "Dear Acme,\n",
+        "changes.md": "- moved bullet (master.tex:L3): matches the posting\n",
+    }
+    for name, body in outputs.items():
+        if name not in skip:
+            Path("output", name).write_text(body)
+    if os.environ.get("FAKE_TOUCH_INPUT"):
+        Path("input/master.tex").write_text("tampered\n")
+
 result = os.environ.get("FAKE_RESULT", "done")
 if result != "none":
     Path("output/haiku.txt").write_text("quiet night\n")

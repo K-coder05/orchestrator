@@ -101,6 +101,28 @@ queue:
   long_window_start: "00:00"
   long_window_end: "07:00"
 
+templates:
+  # Template YAML files (§3.1 item 9); null = the repo's templates/ folder.
+  dir: null
+  # Inputs of the resume-tailor template. Copied into each Task folder
+  # (input/) when the Task is created; the originals are never changed.
+  resume_tailor:
+    master_tex: ~/Documents/career/resume/master.tex
+    cover_letter_template: ~/Documents/career/resume/cover_letter_template.tex
+  # How post-hooks compile LaTeX. They run Nightshift-side after the Attempt,
+  # sandboxed: no network, nothing under your home folder readable except
+  # the Task folder and readable_dirs, writes only in the Task folder.
+  latex:
+    # null finds latexmk, else the engine itself, on PATH.
+    binary: null
+    # pdflatex | xelatex | lualatex
+    engine: pdflatex
+    timeout_seconds: 120
+    # TeX's own per-user folders (your packages and font caches).
+    readable_dirs:
+      - ~/Library/texmf
+      - ~/Library/texlive
+
 daemon:
   # launchd LaunchAgent label; the plist is ~/Library/LaunchAgents/<label>.plist.
   label: com.nightshift.daemon

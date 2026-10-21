@@ -181,7 +181,7 @@ class QueueRunner:
         adapter_provider: Callable = get_adapter,
         log: Callable[[str], None] | None = None,
         clock: Callable[[], datetime] | None = None,
-        post_hooks_for: Callable[[Config, Any], Any] = failures.post_hooks_for,
+        post_hooks_for: Callable[[Config, Any], Any] | None = None,
         prober: Callable[[str], Any] | None = None,
     ):
         self.cfg = cfg
@@ -192,7 +192,9 @@ class QueueRunner:
         self._log = log or (lambda msg: None)
         # The queue's notion of "now"; tests pass a fake clock.
         self.clock = clock or (lambda: now(cfg.timezone))
-        self.post_hooks_for = post_hooks_for
+        # Template post-hooks; confined tools (the LaTeX compile) run through `host`.
+        self.post_hooks_for = post_hooks_for or (
+            lambda cfg, row: failures.post_hooks_for(cfg, row, self.host))
         # Minimal probe requests for agents out of usage with no reset time.
         self.prober = prober or (lambda agent: usage.probe(
             self.cfg, self.db, agent, adapter_provider=self.adapter_provider, clock=self.clock))

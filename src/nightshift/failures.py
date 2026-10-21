@@ -71,10 +71,15 @@ def runtime_cap_seconds(cfg: Config, row: Mapping[str, Any]) -> float:
     return float(minutes) * 60
 
 
-def post_hooks_for(cfg: Config, row: Mapping[str, Any]) -> Sequence[PostHook]:
-    """The post-hooks of a Task. Free-form Tasks have none; templates bring
-    their own (the template engine plugs in here)."""
-    return ()
+def post_hooks_for(cfg: Config, row: Mapping[str, Any], host: Any = None) -> Sequence[PostHook]:
+    """The post-hooks of a Task. Free-form Tasks have none; template Tasks
+    get their template's (``nightshift.templates``). ``host`` runs confined
+    tools such as the LaTeX compile (default: the real Mac)."""
+    if not row["template"]:
+        return ()
+    from . import templates  # templates imports this module
+
+    return templates.post_hooks(cfg, row, host)
 
 
 def run_post_hooks(

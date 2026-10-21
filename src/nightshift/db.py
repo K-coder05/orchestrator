@@ -356,6 +356,12 @@ class Database:
             if c.execute("UPDATE tasks SET priority = ? WHERE id = ?", (priority, task_id)).rowcount != 1:
                 raise KeyError(task_id)
 
+    def set_deadline(self, task_id: str, deadline: str | None) -> None:
+        """Set a Task's deadline (a template's deadline source; not a state change)."""
+        with self.tx() as c:
+            if c.execute("UPDATE tasks SET deadline = ? WHERE id = ?", (deadline, task_id)).rowcount != 1:
+                raise KeyError(task_id)
+
     def request_cancel(self, task_id: str) -> None:
         """Ask the daemon to cancel a running Task (see ``nightshift.failures``)."""
         with self.tx() as c:

@@ -5,7 +5,8 @@ implementation; ``FakeHost`` keeps core logic testable on any OS.
 
 Probes are read-only. The only state-changing calls are the daemon's own:
 installing/removing its LaunchAgent (``orch daemon install|uninstall``) and
-holding ``caffeinate`` while a Task runs. System settings are never changed:
+holding ``caffeinate`` while a Task runs. ``run_confined`` runs Nightshift's
+own post-hook tools (LaTeX) under a Seatbelt profile. System settings are never changed:
 ``pmset`` in particular is never run (§1.9); ``orch doctor`` only prints it.
 """
 
@@ -20,6 +21,15 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+
+
+@dataclass(frozen=True)
+class ConfinedRun:
+    """The result of ``Host.run_confined``."""
+
+    exit_code: int | None  # None: could not start, or timed out
+    output: str  # stdout and stderr together
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +113,23 @@ class Host(Protocol):
 
     def awake_held(self) -> bool:
         """Whether this process is currently holding the machine awake."""
+        ...
+
+    def run_confined(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        writable: list[Path],
+        readable: list[Path],
+        private_roots: list[Path],
+        env: dict[str, str] | None = None,
+        timeout: float = 120,
+    ) -> ConfinedRun:
+        """Run a Nightshift-side tool (e.g. the LaTeX compile of a post-hook)
+        on agent-written input: no network, no reads under ``private_roots``
+        except ``readable`` and ``writable``, writes only to ``writable``
+        (and the system temp dir)."""
         ...
 
 
@@ -252,6 +279,15 @@ class MacHost:
     def awake_held(self) -> bool:
         return self._caffeinate is not None and self._caffeinate.poll() is None
 
+    def run_confined(self, argv, *, cwd, writable, readable, private_roots, env=None,
+                     timeout=120) -> ConfinedRun:
+        # macOS Seatbelt through sandbox-exec (deprecated but still shipped,
+        # and what Claude Code's own sandbox uses underneath).
+        profile = sandbox_profile(writable=writable, readable=readable,
+                                  private_roots=private_roots)
+        return _run_capture(["/usr/bin/sandbox-exec", "-p", profile, *argv], cwd=cwd, env=env,
+                            timeout=timeout)
+
     def launchd_status(self, label: str) -> LaunchdStatus:
         plist = self.launch_agents_dir() / f"{label}.plist"
         proc = _run(["launchctl", "print", f"gui/{os.getuid()}/{label}"])
@@ -291,6 +327,8 @@ class FakeHost:
     awake: bool = False
     #: ``"hold"``/``"release"`` in call order (only state changes are recorded).
     awake_log: list[str] = field(default_factory=list)
+    #: ``run_confined`` calls (kwargs plus argv); FakeHost runs them unconfined.
+    confined_runs: list[dict] = field(default_factory=list)
 
     def keychain_get(self, service: str, account: str) -> str | None:
         self.keychain_reads.append((service, account))
@@ -351,3 +389,51 @@ class FakeHost:
 
     def awake_held(self) -> bool:
         return self.awake
+
+    def run_confined(self, argv, *, cwd, writable, readable, private_roots, env=None,
+                     timeout=120) -> ConfinedRun:
+        self.confined_runs.append({"argv": list(argv), "cwd": Path(cwd), "writable": list(writable),
+                                   "readable": list(readable),
+                                   "private_roots": list(private_roots)})
+        return _run_capture(list(argv), cwd=cwd, env=env, timeout=timeout)
+
+
+def _sb_quote(path: Path) -> str:
+    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def sandbox_profile(*, writable: list[Path], readable: list[Path],
+                    private_roots: list[Path]) -> str:
+    """A Seatbelt profile: no network; reads under ``private_roots`` only in
+    ``readable``/``writable``; writes only to ``writable`` and the per-user temp dir (/private/var/folders).
+    Paths are resolved, since Seatbelt matches real paths (/tmp is
+    /private/tmp)."""
+    def real(paths):
+        return [Path(p).expanduser().resolve() for p in paths]
+
+    lines = ["(version 1)", "(allow default)", "(deny network*)"]
+    for root in real(private_roots):
+        lines.append(f"(deny file-read* (subpath {_sb_quote(root)}))")
+    allowed = real(readable) + real(writable)
+    if allowed:
+        lines.append("(allow file-read* " + " ".join(f"(subpath {_sb_quote(p)})" for p in allowed) + ")")
+    lines.append("(deny file-write*)")
+    targets = [f"(subpath {_sb_quote(p)})" for p in real(writable)]
+    targets += ['(subpath "/private/var/folders")',
+                '(literal "/dev/null")', '(literal "/dev/tty")']
+    lines.append("(allow file-write* " + " ".join(targets) + ")")
+    return "\n".join(lines) + "\n"
+
+
+def _run_capture(argv: list[str], *, cwd: Path, env: dict[str, str] | None,
+                 timeout: float) -> ConfinedRun:
+    try:
+        proc = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        return ConfinedRun(exit_code=None, output=out, timed_out=True)
+    except OSError as exc:
+        return ConfinedRun(exit_code=None, output=f"could not start {argv[0]}: {exc}")
+    return ConfinedRun(exit_code=proc.returncode, output=proc.stdout)
