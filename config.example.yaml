@@ -1,0 +1,60 @@
+# Nightshift configuration.
+#
+# Copy to ~/.config/nightshift/config.yaml and edit. Every key is optional:
+# anything you leave out falls back to the value shown here. The machine,
+# plan and credit values below are PLACEHOLDERS, not facts; `orch doctor`
+# reads the real values from the machine.
+#
+# Secrets (API keys, Telegram bot token, calendar iCal URLs) never go in this
+# file. Put them in ~/.config/nightshift/.env (mode 0600) or in the macOS
+# Keychain under the service named in `secrets.keychain_service`.
+
+timezone: America/Los_Angeles
+
+paths:
+  # Task data only (no code). Task folders live under <agents_root>/tasks/.
+  agents_root: ~/agents
+
+machine:
+  model: 14-inch MacBook Pro
+  chip: Apple M3
+  ram_gb: 16
+  free_disk_gb: 150
+  macos_version: "26"
+
+plans:
+  claude:
+    tier: pro          # pro | max5x
+  codex:
+    tier: chatgpt-work
+  gemini:
+    tier: google-ai-pro
+    api_credit_balance_usd: 0
+    api_credit_expiry: null
+
+agents:
+  claude:
+    binary: claude
+    # null uses the CLI's own default model.
+    model: null
+    extra_args: []
+
+defaults:
+  agent: claude
+  task_type: general
+  priority: normal
+  max_runtime_minutes: 120
+
+task_types:
+  # internet: default for --internet when the Task doesn't set it (§1.4).
+  general: {internet: "off"}
+  coding: {internet: "off"}
+  comedy: {internet: "off"}
+  research: {internet: "on"}
+  scraping: {internet: "on"}
+  job: {internet: "on"}
+  resume: {internet: "on"}
+  study: {internet: "on"}
+
+secrets:
+  keychain_service: nightshift

@@ -1,0 +1,15 @@
+# Local environments (project-local Python and virtualenvs)
+.venv/
+.bootstrap/
+.python/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Never commit personal config or secrets
+.env
+config.yaml
+.DS_Store
