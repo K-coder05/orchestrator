@@ -301,8 +301,8 @@ def test_orch_usage_shows_windows_and_baselines(config_dir, cfg, db, env, monkey
     r = CliRunner().invoke(cli.main, ["--config-dir", str(config_dir), "usage"])
     assert r.exit_code == 0, r.output
     assert "five_hour" in r.output and "seven_day" in r.output
-    # claude and codex, two Windows each
-    assert r.output.count("none yet (0 observations)") == 4
+    # claude and codex, two Windows each; gemini, one
+    assert r.output.count("none yet (0 observations)") == 5
     assert "Interactive use" in r.output
 
     clock = Clock()

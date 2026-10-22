@@ -54,6 +54,18 @@ agents:
     # Extra flags for `codex exec`. Flags that change the sandbox, approvals
     # or config (-c, --sandbox, --add-dir, --profile, ...) are refused.
     extra_args: []
+  # Gemini CLI (`gemini`, headless with stream-json), signed in with the
+  # Google AI Pro plan (run `gemini` once and pick "Sign in with Google").
+  gemini:
+    binary: gemini
+    # null uses the CLI's own default model.
+    model: null
+    # Model for planning calls when planning.agent is gemini; null uses `model`.
+    planning_model: null
+    # Extra flags for `gemini`. Flags that change approvals, the sandbox, the
+    # workspace or policies (--yolo, --approval-mode, --sandbox, --policy,
+    # --include-directories, -e, ...) are refused.
+    extra_args: []
 
 defaults:
   agent: claude
@@ -98,6 +110,9 @@ usage:
     # Codex (ChatGPT plan): a 5-hour Window plus a weekly cap. Its limit
     # messages don't name the Window, so a hit counts as the shortest one.
     codex: {five_hour: 5, seven_day: 168}
+    # Gemini (Google AI Pro): a daily Window per model. A hit that doesn't
+    # say "daily" also counts as this Window.
+    gemini: {daily: 24}
 
 planning:
   # Free-form `orch add` asks an agent for an estimate and a Task type (§2.4).

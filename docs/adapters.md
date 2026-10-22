@@ -4,8 +4,9 @@ All agents sit behind `nightshift.adapters.base.AgentAdapter` (§2.9):
 `build_command`, `parse_stream`, `detect_rate_limit`, `session_id`,
 `resume_command`, `usage_from_run`, `write_permissions`, plus
 `planning_command`/`parse_planning_output` and
-`probe_command`/`parse_probe_output`. Registered: `claude` (verified) and
-`codex` (verified on codex-cli 0.163.0). One adapter instance
+`probe_command`/`parse_probe_output`. Registered: `claude` (verified),
+`codex` (verified on codex-cli 0.163.0) and `gemini` (written from the
+gemini-cli 0.65.0 source; real runs pending). One adapter instance
 is created per Attempt, so `session_id()` and `usage_from_run()` report what
 that Attempt's stream contained. Adapters are looked up by name in
 `nightshift.adapters.REGISTRY`; core code never names an agent.
@@ -567,3 +568,232 @@ with the single word OK."; a `turn.completed` -> available, a limit message
 5. Usage-limit message: **not observed** (the plan wasn't exhausted).
    When one happens, save the stream and compare with the formats above.
 6. Acceptance Test 3 on the real CLIs: passed (docs/decisions.md, #15).
+
+## Gemini CLI
+
+> **Written from the gemini-cli 0.65.0 source (2026-10-22), not yet run
+> against a signed-in CLI.** The CLI is not installed on this Mac yet. The
+> npm package (`@google/gemini-cli@0.65.0`, the bundle keeps
+> `// packages/...` source markers) was read for: `gemini --help` (the
+> yargs options in `packages/cli/src/config/config.ts`), the stream-json
+> events (`nonInteractiveCli.ts`, `output/stream-json-formatter.js`),
+> resume (`utils/sessions.ts`, `sessionUtils.ts`), the settings layers and
+> merge rules (`config/settings.ts`), folder trust, the policy engine
+> (`policy/toml-loader.js`, `policy-engine.js`), the per-command shell
+> sandbox (`sandbox/macos/*`, `services/sandboxManager.js`) and quota
+> errors (`utils/googleQuotaErrors.js`, `errorParsing.js`). `--version`
+> and `--help` ran from the unpacked package (0.65.0); no model call was
+> made. Everything marked *(source)* below is still to be checked for
+> real (see "Still to verify").
+
+### Invocation Nightshift uses
+
+```
+gemini --output-format stream-json --approval-mode default \
+  --admin-policy <agents_root>/data/permissions/<task-id>/gemini-policy.toml \
+  -e none --allowed-mcp-server-names nightshift-none \
+  [--include-directories <read-only dir> ...] [-m <agents.gemini.model>]
+# env: GEMINI_CLI_SYSTEM_SETTINGS_PATH=<same dir>/gemini-settings.json
+#      GEMINI_CLI_TRUST_WORKSPACE=false  GEMINI_SANDBOX=false
+#      TMPDIR=<task folder>/.tmp  PATH=<filtered, see below>
+# stdin: <agent protocol> \n\n---\n\n <prompt>        cwd = Task folder
+# resume: the same, plus --resume <session_id>
+```
+
+- **Headless and the prompt.** With stdin not a TTY the CLI runs headless;
+  the input is stdin (`-p` text would be appended after it). Nightshift
+  passes no `-p`, so the prompt is only on stdin. Gemini has no flag that
+  appends to the system prompt (`GEMINI_SYSTEM_MD` *replaces* it), so the
+  agent protocol goes in front of the prompt on every Attempt, resumes
+  included.
+- **Settings.** `GEMINI_CLI_SYSTEM_SETTINGS_PATH` makes the per-Task file
+  the *system* layer, which wins over user (`~/.gemini/settings.json`) and
+  workspace settings key by key (`mergeSettings`: defaults < system
+  defaults < user < workspace < system). Some keys merge instead of
+  replacing: `context.includeDirectories` and `hooks.*` concatenate,
+  `mcpServers` shallow-merges, `tools.exclude` and policy paths union.
+  Hence the flags and switches below, and the refusal described in
+  docs/safety.md (user `context.includeDirectories`).
+- **Workspace settings never load.** `GEMINI_CLI_TRUST_WORKSPACE=false`
+  makes `checkPathTrust` return untrusted, so `.gemini/settings.json` in
+  the Task folder (agent-writable) is ignored, and approval mode can't
+  leave `default`. `--skip-trust` (which sets it to `true`) is never
+  passed and is refused in `extra_args`.
+- **Approvals.** `--approval-mode default` in headless mode: the policy
+  engine turns every "ask user" into **deny** (`nonInteractive`). The
+  admin-tier policy file allows exactly the Task's tools.
+- **No extensions, MCP servers, hooks, skills or subagents.** `-e none`;
+  `--allowed-mcp-server-names nightshift-none` (an allow-list no server
+  matches: `isBlockedBySettings`); `hooksConfig.enabled`, `skills.enabled`,
+  `experimental.enableAgents` false; `tools.discoveryCommand`,
+  `tools.callCommand`, `mcp.serverCommand` empty.
+- **Sessions** are stored per project (working directory) under
+  `~/.gemini/tmp/<project>/chats/`. `--resume <uuid>` resolves the session
+  by id and **keeps the same session id** (`resolveSessionId`). A resume of
+  an unknown id fails before the session starts ("Invalid session
+  identifier"), which Nightshift treats as a failed resume (fresh session).
+  Planning calls and probes also leave a session behind (there is no
+  ephemeral flag); they run in `<agents_root>/data/planning` and `.../probe`.
+- `agents.gemini.extra_args` may not contain `--yolo`/`-y`,
+  `--approval-mode`, `--sandbox`, `--policy`, `--admin-policy`,
+  `--include-directories`, `--allowed-tools`, `--allowed-mcp-server-names`,
+  `-e/--extensions`, `--skip-trust`, `--worktree`, `--resume`,
+  `--session-id`, `-p`, `-i`, `-o`, `--raw-output`, `--fake-responses`.
+
+### Per-Task settings and policy
+
+`GeminiAdapter.write_permissions` writes both files to
+`<agents_root>/data/permissions/<task-id>/` (agent-inaccessible), fresh each
+Attempt. Settings (system layer):
+
+```json
+{"security": {"toolSandboxing": true, "folderTrust": {"enabled": true},
+              "disableYoloMode": true, "disableAlwaysAllow": true,
+              "enablePermanentToolApproval": false, "autoAddToPolicyByDefault": false,
+              "environmentVariableRedaction": {"enabled": true}},
+ "tools": {"core": ["read_file", "read_many_files", "write_file", "replace", "glob",
+                    "grep_search", "list_directory", "run_shell_command"],
+           "sandbox": false, "sandboxNetworkAccess": false,
+           "discoveryCommand": "", "callCommand": "",
+           "shell": {"enableInteractiveShell": false}},
+ "mcp": {"serverCommand": ""}, "hooksConfig": {"enabled": false},
+ "skills": {"enabled": false},
+ "experimental": {"enableAgents": false, "worktrees": false, "extensionReloading": false},
+ "general": {"checkpointing": {"enabled": false}, "enableAutoUpdate": false,
+             "enableAutoUpdateNotification": false, "defaultApprovalMode": "default"},
+ "ide": {"enabled": false}}
+```
+
+`tools.core` is the list of built-in tools that exist at all; internet-on
+Tasks add `web_fetch` and `google_web_search`. The policy file (TOML,
+loaded as **admin** tier, which beats user and workspace policies; within a
+tier the higher `priority` wins):
+
+| Rule | Priority |
+|---|---|
+| `toolName = "*"`, deny | 0 |
+| the Task tools, allow | 500 |
+| `write_file`/`replace` whose `file_path` contains `..`, deny | 900 |
+| `write_file`/`replace` into a read-only or no-access dir (absolute, `~/`, `$HOME/`), deny | 900 |
+| `run_shell_command` whose command names such a dir, deny | 900 |
+| `web_fetch`/`google_web_search` whose arguments mention a denied domain (any case), deny | 900 |
+
+`argsPattern` is a JS regex matched against the arguments as compact JSON
+with sorted keys (`stableStringify`: `"file_path":"/abs/path"`);
+`commandRegex` is matched as `"command":"<regex>` (anchored at the start of
+the command). The tests pin the patterns.
+
+**Shell sandbox** (`security.toolSandboxing`): on macOS every
+`run_shell_command` (and, with it on, file-tool reads/writes through
+`SandboxedFileSystemService`) runs under `sandbox-exec` with a profile
+built per command (`buildSeatbeltProfile`): `(deny default)`, read of
+system paths (`/System`, `/usr`, `/bin`, `/opt/homebrew`, `/Library`, ...),
+read of the Task folder, the include dirs and each `PATH` entry (the
+*parent* of a `.../bin` entry), read+write of the Task folder (default
+mode), the include dirs, `/tmp`, `$TMPDIR` and `~/.gemini/tmp`, `.env`
+files denied, **no network** unless the mode or a per-command grant allows
+it (`sandbox-default.toml`: `network = false` in every mode but yolo).
+Nightshift sets `TMPDIR` inside the Task folder and filters `PATH`
+(`safe_path`): entries whose readable folder would contain your home or
+`agents_root` (e.g. `~/bin` opens all of `~`) are dropped, and entries
+under home are kept only inside `permissions.tool_dirs`.
+
+The whole-CLI sandbox (`--sandbox`, `tools.sandbox`, `GEMINI_SANDBOX`:
+relaunch of the CLI in Docker/Seatbelt) is switched off: it would put the
+CLI's own network access and the shell's in the same box.
+
+### stream-json output format *(source)*
+
+One JSON object per line (`StreamJsonFormatter`), each with `timestamp`:
+
+| `type` | Fields | Normalized to |
+|---|---|---|
+| `init` | `session_id`, `model` | `session` |
+| `message` | `role` (`user` echoes the input; `assistant`), `content`, `delta: true` (assistant text arrives in chunks) | `text` (assistant) / `other` |
+| `tool_use` | `tool_name`, `tool_id`, `parameters` | `tool_call` (one Step) |
+| `tool_result` | `tool_id`, `status` `success`/`error`, `output`, `error: {type, message}` | `tool_result`; `error` (tool error) on failure; `file_change` for a successful `write_file`/`replace` (`file_path`) |
+| `error` | `severity` `warning`/`error`, `message` (loop detected, max turns, invalid stream, blocked by hook) | `error` if severity is error, else `other` |
+| `result` | `status` `success`/`error`, `error: {type, message}` on error, `stats` | `usage`, `result`, `error` |
+
+`stats`: `total_tokens`, `input_tokens` (prompt, cached included),
+`output_tokens` (candidates), `cached`, `input` (prompt minus cached),
+`duration_ms`, `tool_calls`, `models: {<model>: {total_tokens,
+input_tokens, output_tokens, cached, input}}`. A fatal error (auth, quota,
+config) goes through `handleError`: one `result` line with `status:
+"error"`, `error.type` = the error's class name (e.g. `TerminalQuotaError`,
+`FatalAuthenticationError`), `error.message` formatted by
+`parseAndFormatApiError` (`[API Error: <message>]`, plus a "Please wait
+and try again later..." suffix for a 429), then `process.exit(<code>)`
+where the code is the error's `exitCode`, else its `code`/`status`, else
+1 (a quota error's status 429 exits as **173**, 429 & 0xff).
+
+`tests/fixtures/gemini_stream.jsonl` is shaped from the source, **not a
+recording**; `tests/fixtures/fake_gemini.py` replays it. Replace it with a
+recorded stream once the CLI is signed in.
+
+### Usage mapping
+
+Per model from `result.stats.models`: input = `input` (uncached prompt
+tokens), cache read = `cached`, output = `output_tokens`; no cache-write
+count, no request count, **no cost** (`cost_usd` NULL, so Gemini Limit
+observations carry tokens but no cost-equivalent, and Baselines can't form
+yet, as for Codex). Thinking tokens are in `total_tokens` but not
+`output_tokens`; `raw` keeps the whole per-model object. The stats come
+from the process's own telemetry (`uiTelemetryService`), so a resumed
+Attempt should report only its own tokens *(to verify)*. An Attempt stopped
+before its `result` line records no usage.
+
+### Rate limits *(source; no real hit seen)*
+
+The CLI classifies Google API errors (`classifyGoogleError`):
+
+- **`TerminalQuotaError`**: a daily quota (`QuotaFailure` with a
+  `PerDay`/`Daily` quota id -> "You have exhausted your daily quota on this
+  model."), `QUOTA_EXHAUSTED`, `MODEL_CAPACITY_EXHAUSTED`, insufficient
+  credits, "exhausted your capacity", or any retry delay over 300 s. Ends
+  the run.
+- **`RetryableQuotaError`**: per-minute quotas and short retry delays; the
+  CLI retries these itself (backoff) before giving up.
+
+`detect_rate_limit` counts an agent error (never a tool's) as a hit when
+its `error.type` is `TerminalQuotaError`, or its text says a quota or
+capacity is exhausted ("exhausted your (daily) quota", "exhausted your
+capacity", "quota exceeded", "usage limit reached", ...).
+`RetryableQuotaError` is **not** a Window hit (per-minute throttling): the
+Attempt fails and is retried. The reset time is read from the text:
+"Please retry in 34.5s"/"500ms" (Google's message), "Suggested retry after
+3600s." (the CLI's, from `RetryInfo`), "reset after 2h31m10s". A daily
+quota usually has none: Nightshift probes. Window: `daily` when the text
+says so, else the shortest configured Gemini Window (`usage.windows.gemini:
+{daily: 24}`; AI Pro quotas are per model per day).
+
+**Model fallback.** On a quota or capacity error the CLI may switch to a
+fallback model (`handleFallback`). With action `silent` it does so without
+asking and **rotates the session id** (`config.rotateSessionId`), so the
+`init` session id would no longer name the session that holds the later
+turns. Whether this happens headless on the AI Pro plan is to be verified;
+until then a resume after such a fallback may miss the last turns.
+
+### Planning calls and probes
+
+The same base flags with an empty `tools.core` and a policy that denies
+`*`, written to a fresh temp folder; no include dirs, no `TMPDIR` change.
+Gemini has no JSON-schema flag, so the planner instructions and the schema
+go in the prompt and the answer is the reply text parsed as JSON (a ```json
+fence is stripped). The probe sends "Answer with the single word OK." /
+"OK?" on the Task model.
+
+### Still to verify (needs the CLI installed and signed in)
+
+1. `gemini --version` / `--help` from the installed CLI (0.65.0 read here).
+2. A recorded stream of a real Task (replace `gemini_stream.jsonl`).
+3. Settings and policy accepted (no warnings), tools limited to
+   `tools.core`, MCP/extensions/hooks off; that an untrusted folder still
+   runs tools headless.
+4. The shell sandbox: writes outside the Task folder, reads of `~`, of
+   `agents_root/data`, and network from the shell all refused; read-only
+   dirs readable.
+5. Resume by id after a SIGTERM; usage of a resumed Attempt.
+6. A real quota hit: save the stream and compare with the format above;
+   whether the model fallback happens headless.
+7. `orch add ... --agent gemini` to `done` on the real CLI.

@@ -107,7 +107,7 @@ def test_usage_report_per_agent_and_window(cfg, db):
 
     report = {a.agent: a for a in queries.usage_report(cfg, db, NOW)}
 
-    assert list(report) == ["claude", "codex"]  # configured agents, in config order
+    assert list(report) == ["claude", "codex", "gemini"]  # configured agents, in config order
     claude = report["claude"]
     five, week = claude.windows
     assert (five.window, week.window) == ("five_hour", "seven_day")

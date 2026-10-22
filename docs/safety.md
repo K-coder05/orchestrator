@@ -83,6 +83,38 @@ Planning calls and probes on Codex use `--ephemeral`, the built-in
 `:read-only` profile, `features.shell_tool = false` (no shell tool),
 `web_search = "disabled"` and no hooks.
 
+## How Gemini Tasks are confined
+
+> **From the gemini-cli 0.65.0 source, not yet verified on this Mac** (the
+> CLI isn't installed and signed in yet). "Enforced (source)" means the
+> 0.65.0 code enforces it with the settings Nightshift writes; the real-CLI
+> checks in docs/adapters.md ("Still to verify") must pass before relying
+> on it. Re-check after every Gemini CLI upgrade.
+
+`GeminiAdapter.write_permissions` maps the same `PermissionPolicy` to a
+system-layer settings file, an admin-tier policy file and a few env vars
+and flags (exact shape in docs/adapters.md):
+
+| Limit | Status | How |
+|---|---|---|
+| No blanket skip-permissions | **Enforced by Nightshift** | Never `--yolo`/`--approval-mode yolo`; `security.disableYoloMode`; the adapter refuses to build a command without a policy and refuses `agents.gemini.extra_args` with `--yolo`, `--approval-mode`, `--sandbox`, `--policy`, `--include-directories`, `--skip-trust`, `-e`, ... |
+| Only the Task's tools exist; anything else is denied | **Enforced (source)** | `tools.core` lists the only built-in tools; the admin policy denies `*` and allows those; headless, every "ask" becomes deny. |
+| Your Gemini settings, policies and the Task folder's own settings can't widen this | **Enforced (source)**, with one refusal | The per-Task file is the top (system) settings layer; the policy is admin tier (beats user/workspace policies); `GEMINI_CLI_TRUST_WORKSPACE=false` keeps the agent-writable `.gemini/settings.json` in the Task folder from loading. Keys that *merge* instead of override are handled by flags: `-e none` (no extensions), `--allowed-mcp-server-names nightshift-none` (no MCP server starts), `hooksConfig.enabled: false`. Nightshift **refuses to run** a Gemini Attempt if `~/.gemini/settings.json` sets `context.includeDirectories` (it would be added, readable and writable) or `~/.gemini/policies/sandbox.toml` exists (persistent shell-sandbox grants, including network). |
+| Writes only in the Task folder | **Enforced (source)** for file tools and shell | File tools only reach the workspace (Task folder + include dirs); shell commands run under a per-command Seatbelt profile with `(deny default)` and writes allowed only to the Task folder, include dirs, temp dirs and `~/.gemini/tmp`. |
+| Read-only folders readable, never written | **Enforced (source)** for file tools; **best effort** for shell | Added with `--include-directories` (readable). Admin rules deny `write_file`/`replace` into them and any write path with `..`. **Gap:** Gemini's sandbox makes include dirs writable to shell commands, so shell commands that *name* a read-only folder are denied (absolute, `~/`, `$HOME/` forms); a command reaching it another way (a variable, `cd` then a relative path, a script) is not stopped. Use `read_file` to read them. |
+| `~/agents/data/`, no-access dirs, the rest of home and `~/agents/` unreadable | **Enforced (source)** | Not in the workspace (file tools refuse them); the shell profile is deny-by-default and opens only the Task folder, include dirs, system paths and `PATH` folders. `PATH` is filtered so no entry opens home or `agents_root` (`~/bin` would open all of `~`); entries under home are kept only inside `permissions.tool_dirs`. Shell commands naming a no-access dir are also denied by policy. |
+| Shell can read/write `/tmp`, `$TMPDIR` and `~/.gemini/tmp` | **Gap** | The profile always allows them. `TMPDIR` points into the Task folder, but `/tmp` stays shared, and `~/.gemini/tmp` holds every Gemini session transcript (other Tasks' and your interactive ones). |
+| No network from shell commands | **Enforced (source)** | Per-command profile without network (`network = false` in Gemini's default sandbox modes; `tools.sandboxNetworkAccess: false`; no yolo). The CLI process itself keeps network (the API, `web_fetch`). |
+| Internet-off Tasks have no web access | **Enforced (source)** | `web_fetch`/`google_web_search` aren't in `tools.core` and are denied by policy. |
+| `web_fetch` never fetches LinkedIn | **Enforced (source)** | Admin rule denies `web_fetch`/`google_web_search` whose arguments mention `linkedin.com`, `lnkd.in`, `licdn.com` (any case, any subdomain). Mentioning one in a search query is denied too. Search results may still list LinkedIn links (gap, as for Claude). |
+| Bash network-command deny-list (`curl`, `wget`, ...) | **Not mapped** | The shell has no network at all; the deny-list adds nothing there. |
+| Secrets in the environment | **Best effort** | `security.environmentVariableRedaction.enabled` and Gemini's own sanitizing of the shell environment; Nightshift does not reduce the CLI's environment itself. |
+| Model fallback rotates the session | **Gap (to verify)** | On a quota/capacity error the CLI may switch model silently and start a new session id; a later resume would miss the last turns. |
+
+Planning calls and probes on Gemini have an empty `tools.core`, a policy
+that denies `*`, no extensions, MCP servers or hooks, and run in
+`<agents_root>/data/planning` / `.../probe`.
+
 ## Planning calls
 
 Free-form `orch add` makes up to two quick planning calls (estimate, plan)
@@ -222,6 +254,7 @@ dedupes and appends them (`nightshift.tracker`).
   declined to try some escapes (it skipped a write outside the folder
   rather than run it), so those rows rest on the sandbox check. Codex
   sessions are still saved under `~/.codex/sessions` (needed for resume).
-  Shell commands run as `/bin/zsh -lc`. Re-check after Codex upgrades. Each
-  new adapter (Gemini) must map the same `PermissionPolicy` and add its own
-  rows.
+  Shell commands run as `/bin/zsh -lc`. Re-check after Codex upgrades.
+- **Gemini is mapped from source only** (gemini-cli 0.65.0, not yet signed
+  in on this Mac). Its rows above stay "(source)" until the checks in
+  docs/adapters.md pass on the real CLI.

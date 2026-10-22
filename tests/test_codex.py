@@ -691,7 +691,7 @@ def test_failover_config_is_validated(tmp_path):
     from nightshift.config import ConfigError, load_config
     d = tmp_path / "c"
     d.mkdir()
-    for bad in ({"agents": ["claude", "gemini"]}, {"agents": "codex"},
+    for bad in ({"agents": ["claude", "nope"]}, {"agents": "codex"},
                 {"agents": ["claude", "codex"], "when": "sometimes"}):
         (d / "config.yaml").write_text(yaml.safe_dump(
             {"paths": {"agents_root": str(tmp_path / "a")},
