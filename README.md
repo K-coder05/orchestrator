@@ -43,7 +43,11 @@ failed), dark and phone-sized, refreshing every 30 seconds. Tap a Task to
 read its `report.md` rendered as Markdown (`/tasks/<id>/report`; raw HTML in
 a report shows as text). **Live log** (`/live`) tails the running Task's
 logs as they happen, the same lines as `orch logs -f`, and says "Nothing is
-running." when it's idle. Open
+running." when it's idle. **Schedules** (`/schedules`) previews tonight's
+queue (what should run between midnight and 7am, in queue order, each with
+a rough usage estimate from its `estimated_minutes` and past cost per
+minute, totalled per agent against its Baseline), then lists each Schedule
+with its timing, enabled state, last run and next fire. Open
 `http://127.0.0.1:8765/` on the Mac, or the Mac's Tailscale address (or its
 full `*.ts.net` MagicDNS name) on your phone. It never listens on the LAN or
 a public address: with Tailscale not connected it refuses to start, and

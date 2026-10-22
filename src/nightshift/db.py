@@ -709,6 +709,18 @@ class Database:
             "SELECT * FROM usage_events WHERE task_id = ? ORDER BY id", (task_id,)
         ).fetchall()
 
+    def attempt_costs(self) -> list[sqlite3.Row]:
+        """Each finished Attempt with a reported cost: its agent, its Task's
+        template and Task type, when it started and ended, and the reported
+        cost-equivalent it used (for the tonight's-queue estimate)."""
+        return self.conn.execute(
+            "SELECT r.agent, t.template, t.task_type, r.started_at, r.ended_at, "
+            "SUM(u.cost_usd) AS cost_usd FROM runs r "
+            "JOIN tasks t ON t.id = r.task_id JOIN usage_events u ON u.run_id = r.id "
+            "WHERE r.ended_at IS NOT NULL AND u.cost_usd IS NOT NULL "
+            "GROUP BY r.id ORDER BY r.id"
+        ).fetchall()
+
     # -- Windows, Limit observations, probes (§1.5) -----------------------------
     def agent_usage(self, agent: str) -> list[sqlite3.Row]:
         """Every usage row of ``agent``: Attempts (``usage_events``) and

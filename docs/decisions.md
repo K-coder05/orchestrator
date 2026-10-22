@@ -1715,3 +1715,46 @@ lasting consequences go in `docs/adr/` instead.
   TestClient the stream after a real fake-agent run equals `orch logs`, the
   idle stream and page, escaping, no reload, and event forging. Smoke-run
   under uvicorn with curl: lines arrived as they were written.
+
+## Phase 2, issue #30: dashboard schedule list and tonight's queue preview
+
+- **One page, `/schedules`, linked from the home page header:** tonight's
+  queue first (what you check before bed), then the Schedule list. The
+  list is `queries.schedule_list`, the data behind `orch schedule list`:
+  cron rule (in the configured timezone), Catch-up and Overlap rules,
+  enabled or disabled, next fire, last decision (with its Occurrence's
+  state) and open Occurrences, linked to their reports. View only until
+  Phase 3's controls. The page reloads every 60 s.
+- **"Tonight" is the long-task window** (`queue.long_window_start/end`,
+  midnight to 7am by default): the one under way when it is now inside
+  it, else the next one, so at 9am it is tonight, not last night.
+- **A replay, not a list** (`tonight.preview`). The queue is replayed on a
+  simulated clock from now to the window's end, one Task at a time, each
+  taking its `estimated_minutes` (30 assumed when it has none), the next
+  pick always `priority.order`'s first startable Task at the simulated
+  time. So the order is the queue's own: Effective priority (a deadline
+  turns urgent as the night goes on), long-Task gating and `--at`; short
+  Tasks queued in the evening run before midnight and aren't listed. The
+  candidates are queued Tasks, `retry_wait` from its `retry_at`, Tasks
+  paused on a usage limit or the daily spend cap from their `resume_at`
+  (not ones paused by hand), the running Task until its estimate runs out,
+  and the Occurrences enabled Schedules will create at each fire before
+  7am (a fire already due counts as now; with Overlap rule `skip`, a fire
+  while the previous Occurrence is unfinished in the replay, or stuck
+  waiting on you, adds nothing). Listed: every Task running inside the
+  window; Tasks still waiting at 7am are counted.
+- **Not predicted:** usage holds (thresholds, the daytime reserve, an agent
+  out of usage), failovers, failures and retries, Tasks ending early or
+  late. The page says it is a rough guide.
+- **Usage estimate:** minutes x past cost per minute, where cost per minute
+  is finished Attempts' reported cost-equivalent over their wall-clock
+  minutes (`Database.attempt_costs`), on the same agent and template, else
+  agent and Task type, else the agent; with no history the entry says so.
+  Per agent, the total is also shown as a percent of its shortest Window's
+  Baseline when one exists. Better forecasting is Phase 4 (§6 item 3).
+- **Tests:** `tests/test_tonight.py` (window bounds, queue order, deadline
+  promotion, `--at`, leftovers, the running Task, retry and pause
+  resumption, Schedule fires and Overlap skip, the rate fallbacks, totals
+  against the Baseline) and through TestClient the Schedule list, the
+  preview's order, times and estimate, escaping and read-only
+  (`tests/test_dashboard.py`).

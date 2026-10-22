@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block head %}<meta http-equiv="refresh" content="60">{% endblock %}
+{% block title %}Schedules · Nightshift{% endblock %}
+{% block style %}
+  nav { font-size: 14px; margin-bottom: 10px; }
+  section { margin-top: 18px; }
+  .group { display: flex; align-items: baseline; gap: 8px; border-bottom: 1px solid var(--line);
+           padding-bottom: 4px; }
+  h2 { font-size: 15px; margin: 0; }
+  .count { color: var(--muted); font-size: 13px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { background: var(--panel); border-radius: 8px; padding: 10px 12px; margin-top: 8px;
+       border-left: 3px solid var(--accent, var(--queued)); }
+  .title { overflow-wrap: anywhere; display: flex; justify-content: space-between; gap: 10px; }
+  .title a { color: inherit; text-decoration: none; }
+  .when { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px;
+          display: flex; flex-wrap: wrap; gap: 4px 10px; }
+  .meta .urgent { color: var(--needs); }
+  .cost { font-size: 13px; margin-top: 4px; }
+  .note, .empty, .more { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  .totals li { --accent: var(--running); }
+  .on { --accent: var(--done); } .off { --accent: var(--line); }
+  .state-on { color: var(--done); } .state-off { color: var(--muted); }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 6px 0 0;
+       font-size: 13px; }
+  dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
+{% endblock %}
+{% block body %}
+  <nav><a href="/">&larr; Nightshift</a></nav>
+  <header>
+    <h1>Schedules</h1>
+    <span class="asof">{{ now.strftime("%a %b %-d, %H:%M") }}</span>
+  </header>
+
+  <section id="tonight">
+    <div class="group">
+      <h2>Tonight's queue</h2>
+      <span class="count">{{ preview.start.strftime("%a %b %-d") }}, {{ preview.start|clock }}&ndash;{{ preview.end|clock }}</span>
+    </div>
+    {% if preview.entries %}
+    <ul>
+      {% for e in preview.entries %}
+      <li class="entry">
+        <div class="title">
+          <span>{% if e.task_id %}<a href="/tasks/{{ e.task_id }}/report">{{ e.title }}</a>{% else %}{{ e.title }}{% endif %}</span>
+          <span class="when">{{ e.start|clock }}&ndash;{{ e.end|clock }}</span>
+        </div>
+        <div class="meta">
+          {% if e.task_id %}<code>{{ e.task_id }}</code>{% else %}<span>new Occurrence of {{ e.schedule }}</span>{% endif %}
+          <span>{{ e.task_type }} · {{ e.agent }}</span>
+          <span{% if e.effective_priority == "urgent" %} class="urgent"{% endif %}>{{ e.effective_priority }}{% if e.effective_priority != e.priority %} (assigned {{ e.priority }}){% endif %}</span>
+          <span>{{ e.minutes|minutes }}</span>
+          {% for n in e.notes %}<span>{{ n }}</span>{% endfor %}
+        </div>
+        <div class="cost">
+          {% if e.estimate %}~{{ e.estimate.cost_usd|usd }} usage <span class="count">({{ e.estimate.rate.usd_per_minute|usd }}/min, from {{ e.estimate.rate.basis }})</span>
+          {% else %}<span class="count">no cost history for {{ e.agent }} yet</span>{% endif %}
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    <ul class="totals">
+      {% for t in preview.totals %}
+      <li>
+        <div class="title"><span>{{ t.agent }}</span><span class="when">{{ t.minutes|minutes }}</span></div>
+        <div class="cost">
+          {% if t.estimated %}~{{ t.cost_usd|usd }} usage{% if t.percent_of_baseline is not none %}, about {{ "%.0f"|format(t.percent_of_baseline) }}% of its {{ t.window }} Baseline{% endif %}{% endif %}
+          {% if t.unestimated %}<span class="count">{{ t.unestimated }} with no cost history</span>{% endif %}
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">Nothing expected to run tonight</p>
+    {% endif %}
+    {% if preview.left_over %}
+    <p class="more">{{ preview.left_over }} more still waiting at {{ preview.end|clock }}</p>
+    {% endif %}
+    <p class="note">A rough guide: queue order (Effective priority, long-Task gating, <code>--at</code>) and each Task's <code>estimated_minutes</code> times past cost per minute. Usage holds, failures and Tasks ending early or late are not predicted.</p>
+  </section>
+
+  <section id="schedules">
+    <div class="group"><h2>Schedules</h2><span class="count">{{ schedules|length }}</span></div>
+    {% if schedules %}
+    <ul>
+      {% for v in schedules %}
+      {% set s = v.schedule %}
+      <li class="{{ 'on' if s.enabled else 'off' }}">
+        <div class="title">
+          <span>{{ s.name }}</span>
+          <span class="{{ 'state-on' if s.enabled else 'state-off' }}">{{ "enabled" if s.enabled else "disabled" }}</span>
+        </div>
+        <dl>
+          <dt>timing</dt><dd><code>{{ s.cron.expr }}</code> ({{ tz }})</dd>
+          <dt>catch-up</dt><dd>{{ s.catch_up }}</dd>
+          <dt>overlap</dt><dd>{{ s.overlap }}</dd>
+          <dt>template</dt><dd>{{ s.template }}{% if s.priority %} · {{ s.priority }}{% endif %}{% if s.agent %} · {{ s.agent }}{% endif %}</dd>
+          <dt>next fire</dt><dd>{% if v.next_fire %}{{ v.next_fire.strftime("%a %b %-d, %H:%M") }}{% else %}&ndash;{% endif %}</dd>
+          <dt>last run</dt><dd>{% if v.last %}{{ v.last.decided_at|short_time }}: {{ v.last.decision.describe().split(": ", 1)[1] }}{% if v.last.task_state %} ({{ v.last.task_state|replace('_', ' ') }}){% endif %}{% else %}never fired{% endif %}</dd>
+          {% if v.open_occurrences %}<dt>open</dt><dd>{% for o in v.open_occurrences %}<a href="/tasks/{{ o.task_id }}/report">{{ o.task_id }}</a> ({{ o.state|replace('_', ' ') }}){% if not loop.last %}, {% endif %}{% endfor %}</dd>{% endif %}
+        </dl>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No Schedules. Add one with <code>orch schedule add</code>.</p>
+    {% endif %}
+  </section>
+{% endblock %}

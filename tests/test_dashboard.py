@@ -458,6 +458,110 @@ def test_live_routes_are_read_only(cfg):
 
 
 # --------------------------------------------------------------------------
+# Schedule list and tonight's queue
+# --------------------------------------------------------------------------
+
+
+def _with_template(config_dir):
+    tdir = config_dir.parent / "templates"
+    tdir.mkdir()
+    (tdir / "rescrape.yaml").write_text(yaml.safe_dump({
+        "task_type": "scraping", "agent": "gemini", "estimated_minutes": 40,
+        "max_runtime_minutes": 60, "long": True, "internet": "on",
+        "prompt": "Re-scrape. {{request}}",
+    }))
+    data = yaml.safe_load((config_dir / "config.yaml").read_text())
+    data["templates"] = {"dir": str(tdir)}
+    (config_dir / "config.yaml").write_text(yaml.safe_dump(data))
+    return load_config(config_dir, host=FakeHost())
+
+
+def test_schedule_list_shows_timing_enabled_state_last_run_and_next_fire(config_dir):
+    from nightshift import schedules
+    from nightshift.db import Database
+
+    cfg = _with_template(config_dir)
+    db = Database(cfg.db_path, tz=cfg.timezone)
+    try:
+        la = ZoneInfo("America/Los_Angeles")
+        schedules.add(cfg, db, "rescrape", template="rescrape", cron_rule="0 2 */2 * *",
+                      catch_up="next-wake", at=datetime(2026, 10, 20, 12, 0, tzinfo=la))
+        schedules.add(cfg, db, "paused-one", template="rescrape", cron_rule="30 6 * * *",
+                      catch_up="within 12h", enabled=False,
+                      at=datetime(2026, 10, 20, 12, 0, tzinfo=la))
+        [d] = schedules.apply_catch_up(cfg, db, datetime(2026, 10, 21, 2, 0, 5, tzinfo=la))
+    finally:
+        db.close()
+
+    html = _client(cfg).get("/schedules").text
+
+    listed = html[html.index('id="schedules"'):]
+    blocks = listed.split("<li")[1:]
+    [rescrape] = [b for b in blocks if "<span>rescrape</span>" in b]
+    [paused] = [b for b in blocks if "<span>paused-one</span>" in b]
+    assert "0 2 */2 * *" in rescrape and "America/Los_Angeles" in rescrape
+    assert "enabled" in rescrape and "run on next wake" in rescrape
+    assert "Fri Oct 23, 02:00" in rescrape  # next fire
+    assert "Oct 21, 02:00" in rescrape and f"created Occurrence {d.task_id}" in rescrape
+    assert f'href="/tasks/{d.task_id}/report"' in rescrape  # its open Occurrence
+    assert "disabled" in paused and "never fired" in paused
+
+
+def test_schedule_page_without_schedules(cfg):
+    html = _client(cfg).get("/schedules").text
+    assert "No Schedules" in html and "Nothing expected to run tonight" in html
+
+
+def test_tonight_preview_lists_tasks_in_queue_order_with_a_usage_estimate(config_dir):
+    from nightshift import schedules
+    from nightshift.db import Database
+
+    cfg = _with_template(config_dir)
+    db = Database(cfg.db_path, tz=cfg.timezone)
+    try:
+        la = ZoneInfo("America/Los_Angeles")
+        old = create_task(cfg, db, "old work", agent="claude", task_type="research").spec.id
+        run = db.start_attempt(old, "claude", ["x"], "log")
+        db.finish_attempt(run, exit_code=0, outcome="done", end_reason="done", session_id=None)
+        db.conn.execute("UPDATE runs SET started_at = ?, ended_at = ? WHERE id = ?",
+                        ("2026-10-20T02:00:00-07:00", "2026-10-20T02:10:00-07:00", run))
+        db.conn.commit()
+        db.record_usage(run, old, "claude", [{"cost_usd": 0.5}])  # $0.05/min
+        db.transition(old, TaskState.RUNNING, "picked")
+        db.transition(old, TaskState.DONE, "finished")
+        bg = create_task(cfg, db, "Background <b>digest</b>", long=True, priority="background",
+                         estimated_minutes=30, agent="claude", task_type="research").spec.id
+        first = create_task(cfg, db, "Refactor the parser", long=True, estimated_minutes=60,
+                            agent="claude", task_type="research").spec.id
+        schedules.add(cfg, db, "rescrape", template="rescrape", cron_rule="0 2 * * *",
+                      catch_up="next-wake", at=datetime(2026, 10, 21, 21, 0, tzinfo=la))
+    finally:
+        db.close()
+
+    html = _client(cfg).get("/schedules").text
+
+    section = html[html.index('id="tonight"'):html.index('id="schedules"')]
+    assert "Thu Oct 22, 00:00&ndash;07:00" in section
+    # Normal first; background while nothing else waits; then the 2am Occurrence.
+    order = [section.index(x) for x in (first, bg, "rescrape 2026-10-22")]
+    assert order == sorted(order)
+    assert "00:00&ndash;01:00" in section and "01:00&ndash;01:30" in section
+    assert "02:00&ndash;02:40" in section
+    assert "new Occurrence of rescrape" in section and "fires 02:00" in section
+    assert "~$3.00 usage" in section  # 60 min x $0.05/min
+    assert "no cost history for gemini" in section
+    assert "<b>digest</b>" not in section and "&lt;b&gt;digest" in section
+
+
+def test_home_links_to_the_schedule_page(cfg):
+    assert 'href="/schedules"' in _client(cfg).get("/").text
+
+
+def test_schedule_page_is_read_only(cfg):
+    assert _client(cfg).post("/schedules").status_code == 405
+
+
+# --------------------------------------------------------------------------
 # orch dashboard
 # --------------------------------------------------------------------------
 

@@ -7,9 +7,10 @@ daemon. It has no route that changes anything; opening the database (as
 every `orch` command does) may still migrate it.
 
 Routes: ``/`` (the "needs you" inbox, then Tasks grouped by status),
-``/tasks/<id>/report`` (the Task's ``report.md`` rendered as Markdown) and
+``/tasks/<id>/report`` (the Task's ``report.md`` rendered as Markdown),
 ``/live`` (a live tail of the running Task's logs, streamed from
-``/live/events`` as server-sent events).
+``/live/events`` as server-sent events) and ``/schedules`` (tonight's queue
+preview, then the Schedule list).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from markdown_it import MarkdownIt
 from markupsafe import Markup
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import daemon, queries, views
+from . import daemon, queries, tonight, views
 from .config import Config
 from .db import Database
 from .host import Host
@@ -140,9 +141,25 @@ def _short_time(value: str) -> str:
     return parse_iso(value).strftime("%b %-d, %H:%M")
 
 
+def _clock_time(value: datetime) -> str:
+    return value.strftime("%H:%M")
+
+
+def _usd(value: float) -> str:
+    return f"${value:.2f}" if value >= 0.01 or value == 0 else "<$0.01"
+
+
+def _minutes(value: float) -> str:
+    m = int(round(value))
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m} min"
+
+
 def _environment() -> Environment:
     env = Environment(loader=FileSystemLoader(TEMPLATES), autoescape=select_autoescape())
     env.filters["short_time"] = _short_time
+    env.filters["clock"] = _clock_time
+    env.filters["usd"] = _usd
+    env.filters["minutes"] = _minutes
     return env
 
 
@@ -273,6 +290,18 @@ def create_app(
         finally:
             db.close()
         return env.get_template("tasks.html").render(inbox=inbox, groups=groups, now=at)
+
+    @app.get("/schedules", response_class=HTMLResponse)
+    def schedule_page() -> str:
+        at = now()
+        db = Database(cfg.db_path, tz=cfg.timezone)
+        try:
+            preview = tonight.preview(cfg, db, at)
+            items = queries.schedule_list(cfg, db, at)
+        finally:
+            db.close()
+        return env.get_template("schedules.html").render(
+            preview=preview, schedules=items, now=at, tz=cfg.timezone)
 
     @app.get("/tasks/{task_id}/report", response_class=HTMLResponse)
     def report(task_id: str) -> str:
