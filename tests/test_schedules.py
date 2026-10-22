@@ -11,7 +11,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from nightshift import cli, cron, schedules
+from nightshift import cli, cron, queries, schedules
 from nightshift.config import load_config
 from nightshift.daemon import QueueRunner
 from nightshift.db import Database
@@ -403,6 +403,33 @@ def test_claimed_fires_are_never_handled_twice(cfg, db):
                                    through="2026-10-22T06:30:00-07:00", checked_at="x")
     assert not db.claim_schedule_fires("scan", expect_last=s.last_fire_at,
                                        through="2026-10-22T06:30:00-07:00", checked_at="x")
+
+
+# --------------------------------------------------------------------------
+# The schedule list as data
+# --------------------------------------------------------------------------
+
+
+def test_schedule_list_gives_next_fire_last_decision_and_open_occurrences(cfg, db):
+    add(cfg, db, la(2026, 10, 21, 7, 0))
+    add(cfg, db, la(2026, 10, 21, 7, 0), name="off", enabled=False)
+    [d] = schedules.apply_catch_up(cfg, db, la(2026, 10, 22, 6, 30, 4))
+
+    items = {v.schedule.name: v for v in queries.schedule_list(cfg, db, la(2026, 10, 22, 7, 0))}
+
+    scan = items["scan"]
+    assert scan.schedule.cron.expr == "30 6 * * *"
+    assert scan.next_fire == la(2026, 10, 23, 6, 30)
+    assert scan.last.decision.outcome == "created" and scan.last.decision.task_id == d.task_id
+    assert scan.last.decision.fire_at == "2026-10-22T06:30:00-07:00"
+    assert scan.last.task_state == TaskState.QUEUED
+    assert [(o.task_id, o.state) for o in scan.open_occurrences] == [(d.task_id, TaskState.QUEUED)]
+    off = items["off"]
+    assert off.next_fire is None and off.last is None and off.open_occurrences == []
+
+
+def test_schedule_list_is_empty_without_schedules(cfg, db):
+    assert queries.schedule_list(cfg, db, la(2026, 10, 22, 7, 0)) == []
 
 
 # --------------------------------------------------------------------------

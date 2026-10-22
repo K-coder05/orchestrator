@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from . import daemon, failures, pauses, planning, schedules, templates, views
+from . import daemon, failures, pauses, planning, queries, schedules, templates, views
 from . import usage as usage_mod
 from . import priority as prio
 from .adapters import get_adapter
@@ -468,8 +468,8 @@ def list_tasks(ctx, statuses):
     """List Tasks, newest first."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        rows = db.list_tasks([TaskState(s) for s in statuses])
-        click.echo(views.format_list(rows, cfg=cfg, now=_clock(cfg)))
+        tasks = queries.task_list(cfg, db, _clock(cfg), [TaskState(s) for s in statuses])
+        click.echo(views.format_list(tasks))
     finally:
         db.close()
 
@@ -481,7 +481,11 @@ def show(ctx, task_id):
     """Show a Task's settings, Attempts and state history."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        click.echo(views.format_show(db, _task_row(db, task_id), cfg=cfg, now=_clock(cfg)))
+        try:
+            detail = queries.task_detail(cfg, db, task_id, _clock(cfg))
+        except KeyError:
+            raise click.ClickException(f"no Task {task_id!r}") from None
+        click.echo(views.format_show(detail))
     finally:
         db.close()
 
@@ -550,7 +554,7 @@ def usage_cmd(ctx, probe_agents):
                 click.echo(f"probe {agent}: failed: {found.error}")
         if probe_agents:
             click.echo()
-        click.echo(views.format_usage(cfg, db, _clock(cfg)))
+        click.echo(views.format_usage(queries.usage_report(cfg, db, _clock(cfg)), cfg.timezone))
     finally:
         db.close()
 
@@ -626,7 +630,8 @@ def schedule_list(ctx):
     """List Schedules with their rules, next fire and last decision."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        click.echo(views.format_schedules(cfg, db, _clock(cfg)))
+        click.echo(views.format_schedules(queries.schedule_list(cfg, db, _clock(cfg)),
+                                          cfg.timezone))
     finally:
         db.close()
 

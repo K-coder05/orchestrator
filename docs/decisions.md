@@ -1207,3 +1207,22 @@ lasting consequences go in `docs/adr/` instead.
   kept Claude's `fizzbuzz.py`, wrote the test and README, recorded both in
   progress.md and ended `done`. Each run was about 35s; both agents are
   on subscriptions (no dollars spent); no processes left.
+
+## Phase 2, issue #16: views split into data queries and CLI rendering
+
+- **`nightshift.queries` returns the data, `nightshift.views` renders it.**
+  `task_list`, `task_detail` (with Attempts, approvals, Failovers and
+  history), `usage_report` (per agent and Window) and `schedule_list`
+  return frozen dataclasses; the CLI passes them to `views.format_*`. The
+  dashboard (§4 item 8) is meant to call the same queries.
+- **Effective priority and `blocked` are None when they don't apply.**
+  `effective_priority` is None for a finished Task, and `blocked` is None
+  unless the Task is queued, so a client can't show a stale "Waiting".
+- **`TaskDetail.task` stays a dict of every stored column.** `orch show`
+  prints the columns generically (`SHOW_FIELDS`), and a typed copy of
+  ~30 columns would need updating with every migration. If the dashboard
+  needs typed settings, they can be added then.
+- **Output is unchanged, checked against the old code.** A throwaway pytest
+  plugin rendered every test's database with the old `views.py` and the
+  new query + render path, at three different times: 2016 comparisons
+  over 153 tests, no differences.

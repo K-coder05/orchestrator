@@ -1,15 +1,16 @@
-"""Read-only views of Tasks for the CLI: ``orch list|show|logs|report``."""
+"""Text rendering for the CLI: ``orch list|show|logs|usage`` and ``orch schedule list``.
+
+The data comes from ``queries``; ``task_logs`` reads the log files itself."""
 
 from __future__ import annotations
 
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
-from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import priority, usage
+from . import queries
 from .adapters import get_adapter
 from .adapters.base import Event, EventKind
 from .config import Config
@@ -33,32 +34,27 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def _priority_cell(r: sqlite3.Row, cfg: Config | None, now: datetime | None) -> str:
+def _priority_cell(assigned: str, effective: str | None) -> str:
     """The assigned Priority, plus the Effective one when a deadline raised it."""
-    if cfg is None or now is None or TaskState(r["state"]) in TERMINAL:
-        return r["priority"]
-    eff = priority.evaluate(cfg, r, now).effective
-    return r["priority"] if eff == r["priority"] else f"{r['priority']}>{eff}"
+    return assigned if effective in (None, assigned) else f"{assigned}>{effective}"
 
 
-def format_list(
-    rows: list[sqlite3.Row], *, cfg: Config | None = None, now: datetime | None = None
-) -> str:
-    if not rows:
+def format_list(tasks: list[queries.TaskSummary]) -> str:
+    if not tasks:
         return "No Tasks."
     return _table(
         ["ID", "STATE", "PRIORITY", "TYPE", "AGENT", "CREATED", "TITLE"],
         [
             [
-                r["id"],
-                r["state"],
-                _priority_cell(r, cfg, now),
-                r["task_type"],
-                r["agent"],
-                _short_time(r["created_at"]),
-                r["title"][:60],
+                t.id,
+                str(t.state),
+                _priority_cell(t.priority, t.effective_priority),
+                t.task_type,
+                t.agent,
+                _short_time(t.created_at),
+                t.title[:60],
             ]
-            for r in rows
+            for t in tasks
         ],
     )
 
@@ -71,14 +67,11 @@ SHOW_FIELDS = (
 ).split()
 
 
-def format_show(
-    db: Database, row: sqlite3.Row, *, cfg: Config | None = None, now: datetime | None = None
-) -> str:
-    out = [f"Task {row['id']}"]
+def format_show(d: queries.TaskDetail) -> str:
+    row = d.task
+    out = [f"Task {d.id}"]
     width = max(len(f) for f in [*SHOW_FIELDS, "effective_priority"])
-    ev = None
-    if cfg is not None and now is not None and TaskState(row["state"]) not in TERMINAL:
-        ev = priority.evaluate(cfg, row, now)
+    open_ = d.state not in TERMINAL
     for f in SHOW_FIELDS:
         value = row[f]
         if f in ("agent_override", "long", "approved"):
@@ -86,72 +79,69 @@ def format_show(
         if f == "retries_used":
             if not value:
                 continue
-            value = f"{value} of {cfg.max_retries}" if cfg is not None else value
+            value = f"{value} of {d.max_retries}"
         if value is None:
             continue
         out.append(f"  {f.ljust(width)}  {value}")
-        if f == "priority" and ev is not None:
-            out.append(f"  {'effective_priority'.ljust(width)}  {ev.effective}")
-    if ev is not None and ev.blocked and row["state"] == str(TaskState.QUEUED):
-        out += ["", f"Waiting: {ev.blocked}"]
-    if row["state"] == str(TaskState.RETRY_WAIT) and row["retry_at"]:
+        if f == "priority" and d.effective_priority is not None:
+            out.append(f"  {'effective_priority'.ljust(width)}  {d.effective_priority}")
+    if d.blocked:
+        out += ["", f"Waiting: {d.blocked}"]
+    if d.state == TaskState.RETRY_WAIT and row["retry_at"]:
         out += ["", f"Waiting: retry {row['retries_used']} at {row['retry_at']} "
-                f"(`orch retry {row['id']}` starts it now)"]
-    if row["state"] == str(TaskState.PAUSED_USAGE):
+                f"(`orch retry {d.id}` starts it now)"]
+    if d.state == TaskState.PAUSED_USAGE:
         if row["resume_at"]:
             out += ["", f"Waiting: paused ({row['pause_kind']}), queued again at "
-                    f"{row['resume_at']} (`orch resume {row['id']}` queues it now)"]
+                    f"{row['resume_at']} (`orch resume {d.id}` queues it now)"]
         else:
-            out += ["", f"Waiting: paused by hand until `orch resume {row['id']}`"]
-    if row["resume_pending"] and TaskState(row["state"]) not in TERMINAL:
+            out += ["", f"Waiting: paused by hand until `orch resume {d.id}`"]
+    if row["resume_pending"] and open_:
         out += ["", "Next Attempt continues paused work (same session if under "
-                f"{cfg.usage('resume_session_max_hours') if cfg else 24:g}h old)"]
-    if row["pause_requested_at"] and row["state"] == str(TaskState.RUNNING):
+                f"{d.resume_session_max_hours:g}h old)"]
+    if row["pause_requested_at"] and d.state == TaskState.RUNNING:
         out += ["", f"Pause requested at {row['pause_requested_at']}"]
-    if row["cancel_requested_at"] and TaskState(row["state"]) not in TERMINAL:
+    if row["cancel_requested_at"] and open_:
         out += ["", f"Cancel requested at {row['cancel_requested_at']}"]
     out += ["", "Prompt:", *(f"  {line}" for line in row["prompt"].splitlines() or [""])]
 
-    attempts = db.attempts(row["id"])
     out += ["", "Attempts:"]
-    if attempts:
+    if d.attempts:
         table = _table(
             ["#", "AGENT", "STARTED", "ENDED", "EXIT", "OUTCOME", "REASON"],
             [
                 [
-                    str(a["attempt_no"]),
-                    a["agent"],
-                    _short_time(a["started_at"]),
-                    _short_time(a["ended_at"]),
-                    "-" if a["exit_code"] is None else str(a["exit_code"]),
-                    a["outcome"] or ("running" if a["ended_at"] is None else "-"),
-                    (a["end_reason"] or "")[:80],
+                    str(a.attempt_no),
+                    a.agent,
+                    _short_time(a.started_at),
+                    _short_time(a.ended_at),
+                    "-" if a.exit_code is None else str(a.exit_code),
+                    a.outcome or ("running" if a.running else "-"),
+                    (a.end_reason or "")[:80],
                 ]
-                for a in attempts
+                for a in d.attempts
             ],
         )
         out += [f"  {line}" for line in table.splitlines()]
     else:
         out.append("  none yet")
 
-    approvals = db.approvals(row["id"])
-    if approvals:
+    if d.approvals:
         out += ["", "Approvals:"]
-        for a in approvals:
-            out.append(f"  {_short_time(a['at'])}  {a['decision']} via {a['via']}")
+        for a in d.approvals:
+            out.append(f"  {_short_time(a.at)}  {a.decision} via {a.via}")
 
-    switches = db.failovers(row["id"])
-    if switches:
+    if d.failovers:
         out += ["", "Failovers:"]
-        for f in switches:
-            out.append(f"  {_short_time(f['at'])}  {f['from_agent']} -> {f['to_agent']} "
-                       f"({f['trigger']}" + (", deadline-driven" if f["deadline_driven"] else "")
+        for fo in d.failovers:
+            out.append(f"  {_short_time(fo.at)}  {fo.from_agent} -> {fo.to_agent} "
+                       f"({fo.trigger}" + (", deadline-driven" if fo.deadline_driven else "")
                        + ")")
 
     out += ["", "History:"]
-    for t in db.transitions(row["id"]):
-        frm = t["from_state"] or "(new)"
-        out.append(f"  {_short_time(t['at'])}  {frm} -> {t['to_state']}: {t['reason']}")
+    for t in d.transitions:
+        frm = t.from_state or "(new)"
+        out.append(f"  {_short_time(t.at)}  {frm} -> {t.to_state}: {t.reason}")
     return "\n".join(out)
 
 
@@ -280,86 +270,63 @@ def _cost(value: float | None) -> str:
     return "not reported" if value is None else f"${value:.4f}"
 
 
-def usage_agents(cfg: Config, db: Database) -> list[str]:
-    """Configured agents first, then any other agent with recorded usage."""
-    names = list((cfg.data.get("agents") or {}).keys())
-    return names + sorted(a for a in db.usage_agents() if a not in names)
-
-
-def format_usage(cfg: Config, db: Database, now: datetime) -> str:
+def format_usage(report: list[queries.AgentUsage], tz: str) -> str:
     """Usage per agent and Window, and whether each Window has a Baseline."""
-    tz = cfg.timezone
     out: list[str] = []
-    for agent in usage_agents(cfg, db):
-        statuses = db.window_status(agent)
-        observed = {o["window"] for o in db.limit_observations(agent)}
-        windows = list(cfg.windows(agent))
-        windows += sorted((set(statuses) | observed) - set(windows))
+    for agent in report:
         rows = []
-        for w in windows:
-            start, reset = usage.current_window(cfg, db, agent, w, now)
-            used = usage.usage_between(db, agent, start, now)
-            period = (f"{_local(iso(start), tz)} to {_local(iso(reset), tz)}"
-                      if reset else f"last {cfg.window_hours(agent, w):g}h (reset not known)")
-            st = statuses.get(w)
-            said = "-"
-            if st is not None and st["utilization"] is not None:
-                said = f"{st['utilization'] * 100:.0f}% used"
-            if st is not None and st["status"] == "rejected" and reset:
+        for w in agent.windows:
+            used = w.used
+            period = (f"{_local(iso(w.start), tz)} to {_local(iso(w.resets_at), tz)}"
+                      if w.resets_at else f"last {w.hours:g}h (reset not known)")
+            said = "-" if w.utilization is None else f"{w.utilization * 100:.0f}% used"
+            if w.out_of_usage:
                 said = "out of usage" + (f", {said}" if said != "-" else "")
-            n = len(db.limit_observations(agent, w))
-            base = usage.baseline(db, agent, w)
+            n = w.observation_count
+            base = w.baseline
             base_cell = (f"{_cost(base.cost_usd)} (lowest of last {base.observations})"
                          if base else f"none yet ({n} observation{'s' if n != 1 else ''})")
             cost = ("$0.0000" if used.events == 0 else _cost(used.cost_usd)) + (f" +{used.events_without_cost} w/o cost"
                                            if used.events_without_cost else "")
-            rows.append([w, period, cost, f"{used.input_tokens:,}", f"{used.output_tokens:,}",
+            rows.append([w.window, period, cost, f"{used.input_tokens:,}", f"{used.output_tokens:,}",
                          f"{used.cache_creation_tokens:,}", f"{used.cache_read_tokens:,}",
                          f"{used.requests:,}", said, base_cell])
-        out.append(f"{agent}")
+        out.append(f"{agent.agent}")
         out.append(_table(["  WINDOW", "CURRENT PERIOD", "COST-EQUIVALENT", "INPUT", "OUTPUT",
                            "CACHE WRITE", "CACHE READ", "REQUESTS", "AGENT REPORTS", "BASELINE"],
                           [["  " + r[0], *r[1:]] for r in rows]))
-        obs = db.limit_observations(agent)[-5:]
-        if obs:
+        if agent.recent_observations:
             out.append("  Limit observations (latest last):")
-            for o in obs:
-                extra = (f", {o['events_without_cost']} usage rows without cost"
-                         if o["events_without_cost"] else "")
-                where = f" Task {o['task_id']}" if o["task_id"] else ""
-                out.append(f"    {_local(o['hit_at'], tz)}  {o['window']}  {_cost(o['cost_usd'])}"
-                           f"{extra} since {_local(o['window_start'], tz)}; resets "
-                           f"{_local(o['resets_at'], tz)}; from {o['source']}{where}")
-        probes = db.probes(agent)
-        if probes:
-            p = probes[-1]
-            out.append(f"  Last probe: {_local(p['at'], tz)} {p['outcome']}"
-                       + (f" ({p['detail']})" if p["detail"] else ""))
-        paused = [r for r in db.tasks_in_state(TaskState.PAUSED_USAGE)
-                  if r["agent"] == agent and r["pause_kind"] == "usage_limit"]
-        for r in paused:
-            when = (f"resets {_local(r['resume_at'], tz)}" if r["pause_reset_at"]
-                    else f"next probe {_local(r['resume_at'], tz)}")
-            out.append(f"  Paused on its limit: Task {r['id']} ({when})")
+            for o in agent.recent_observations:
+                extra = (f", {o.events_without_cost} usage rows without cost"
+                         if o.events_without_cost else "")
+                where = f" Task {o.task_id}" if o.task_id else ""
+                out.append(f"    {_local(o.hit_at, tz)}  {o.window}  {_cost(o.cost_usd)}"
+                           f"{extra} since {_local(o.window_start, tz)}; resets "
+                           f"{_local(o.resets_at, tz)}; from {o.source}{where}")
+        p = agent.last_probe
+        if p is not None:
+            out.append(f"  Last probe: {_local(p.at, tz)} {p.outcome}"
+                       + (f" ({p.detail})" if p.detail else ""))
+        for t in agent.paused:
+            when = (f"resets {_local(t.resume_at, tz)}" if t.reset_known
+                    else f"next probe {_local(t.resume_at, tz)}")
+            out.append(f"  Paused on its limit: Task {t.task_id} ({when})")
         out.append("")
     out.append(USAGE_NOTE)
     return "\n".join(out)
 
 
-def format_schedules(cfg: Config, db: Database, now: datetime) -> str:
+def format_schedules(items: list[queries.ScheduleView], tz: str) -> str:
     """`orch schedule list`: each Schedule, its rules, next fire and last decision."""
-    from . import schedules  # late: schedules imports the runner
-
-    items = schedules.all_schedules(db)
     if not items:
         return "No Schedules. Add one with `orch schedule add`."
     blocks = []
-    for s in items:
-        nxt = schedules.next_fire(cfg, s, now) if s.enabled else None
-        last = schedules.last_run(db, s)
+    for v in items:
+        s = v.schedule
         lines = [
             f"{s.name}  {'enabled' if s.enabled else 'disabled'}",
-            f"  rule       {s.cron.expr}  ({cfg.timezone})",
+            f"  rule       {s.cron.expr}  ({tz})",
             f"  template   {s.template}" + (f"  request: {s.request}" if s.request else ""),
             f"  catch-up   {s.catch_up}",
             f"  overlap    {s.overlap}",
@@ -368,21 +335,15 @@ def format_schedules(cfg: Config, db: Database, now: datetime) -> str:
             lines.append("  settings   " + ", ".join(
                 x for x in (s.priority and f"priority {s.priority}", s.agent and f"agent {s.agent}")
                 if x))
-        lines.append(f"  next fire  {_local(iso(nxt), cfg.timezone) if nxt else '-'}")
-        if last is not None:
-            state = ""
-            if last["task_id"]:
-                row = db.get_task(last["task_id"])
-                state = f" ({row['state']})" if row is not None else ""
-            what = schedules.Decision(
-                schedule=s.name, trigger=last["trigger"], fire_at=last["fire_at"],
-                fires=last["fires"], outcome=last["outcome"], task_id=last["task_id"],
-            ).describe().split(": ", 1)[1]
-            lines.append(f"  last       {_local(last['decided_at'], cfg.timezone)}  {what}{state}")
+        lines.append(f"  next fire  {_local(iso(v.next_fire), tz) if v.next_fire else '-'}")
+        if v.last is not None:
+            state = f" ({v.last.task_state})" if v.last.task_state is not None else ""
+            what = v.last.decision.describe().split(": ", 1)[1]
+            lines.append(f"  last       {_local(v.last.decided_at, tz)}  {what}{state}")
         else:
             lines.append("  last       never fired")
-        open_ = schedules.unfinished_occurrences(db, s.name)
-        lines.append("  open       " + (", ".join(f"{r['id']} ({r['state']})" for r in open_)
-                                        if open_ else "none"))
+        lines.append("  open       " + (", ".join(f"{o.task_id} ({o.state})"
+                                                  for o in v.open_occurrences)
+                                        if v.open_occurrences else "none"))
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
