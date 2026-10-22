@@ -18,6 +18,8 @@ afterwards: a Telegram outage only leaves alerts pending (retried until
 
 Comedy Tasks get status lines only: never the title, the Result, the
 reason or the request, which may carry script or idea content (§1.6).
+
+The same loop makes and sends the 8am digest (``nightshift.digest``).
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import report, spend
+from . import digest, report, spend
 from .config import Config
 from .db import Database
 from .states import TaskState
@@ -61,7 +63,7 @@ def alert_kind(from_state: str | None, to_state: str, reason: str = "") -> str |
     return None
 
 
-def _one_line(text: str) -> str:
+def one_line(text: str) -> str:
     line = " ".join(text.split())
     return line if len(line) <= MAX_LINE else line[: MAX_LINE - 1].rstrip() + "…"
 
@@ -78,7 +80,7 @@ def result_line(folder: Path) -> str | None:
     agent = next((p[len("Agent:"):] for p in paras if p.startswith("Agent:")), None)
     line = agent if agent and agent.strip() else (paras[0] if paras else "")
     line = line.strip().splitlines()[0] if line.strip() else ""
-    return _one_line(line.replace("**", "")) or None
+    return one_line(line.replace("**", "")) or None
 
 
 def needs_you_line(folder: Path) -> str | None:
@@ -89,7 +91,7 @@ def needs_you_line(folder: Path) -> str | None:
     _, sections = report.parse_sections(path.read_text())
     lines = [ln.strip().lstrip("- ").replace("**", "") for ln in sections.get(2, "").splitlines()]
     first = next((ln for ln in lines if ln and ln != "Nothing."), None)
-    return _one_line(first) if first else None
+    return one_line(first) if first else None
 
 
 def alert_text(task, kind: str, reason: str) -> str:
@@ -101,16 +103,16 @@ def alert_text(task, kind: str, reason: str) -> str:
     if status_only:
         head = f"Nightshift: {task['task_type']} Task {tid} {state}."
         return f"{head}\nDetails: orch report {tid}"
-    head = f"Nightshift: Task {tid} {state}: {_one_line(task['title'])}"
+    head = f"Nightshift: Task {tid} {state}: {one_line(task['title'])}"
     folder = Path(task["folder"])
     if kind == "finished":
         detail = result_line(folder)
     elif kind == "failed":
-        detail = _one_line(reason)
+        detail = one_line(reason)
     elif kind == "needs_you":
-        detail = needs_you_line(folder) or _one_line(reason)
+        detail = needs_you_line(folder) or one_line(reason)
     elif kind == "spend_cap":
-        detail = _one_line(reason)
+        detail = one_line(reason)
     else:
         detail = f"Paused too long; approve it again with orch approve {tid}"
     return "\n".join(filter(None, [head, detail, f"Details: orch report {tid}"]))
@@ -145,6 +147,7 @@ class Notifier:
         if db.get_meta(CURSOR_KEY) is None:
             # First start: alert on what happens from now on, not on history.
             db.set_meta(CURSOR_KEY, str(db.last_transition_id()))
+        digest.start(db, self.clock(), cfg.telegram_digest_time)
 
     def log(self, msg: str) -> None:
         self._log(self.cfg.secrets.redact(msg))
@@ -167,9 +170,35 @@ class Notifier:
         self.db.set_meta(CURSOR_KEY, str(last))
         return made
 
+    def collect_digest(self) -> bool:
+        """Make the morning digest if it is due (8am, or the first tick after
+        it); True if one was made."""
+        return digest.make_due(self.cfg, self.db, self.clock())
+
     def deliver(self) -> bool:
-        """Send pending alerts, oldest first. False if Telegram failed (the
-        rest wait for the next try)."""
+        """Send pending alerts, oldest first, then a pending digest. False if
+        Telegram failed (the rest wait for the next try)."""
+        return self._deliver_alerts() and self._deliver_digests()
+
+    def _deliver_digests(self) -> bool:
+        oldest = self.clock() - self.max_age
+        for d in self.db.pending_digests():
+            if parse_iso(d["created_at"]) < oldest:
+                self.db.mark_digest(d["id"], dropped_at=iso(self.clock()))
+                self.log(f"Telegram digest for {d['digest_date']} dropped: never delivered "
+                         f"({d['tries']} tries, last error: {d['last_error']})")
+                continue
+            try:
+                self.api.send_message(self.user_id, d["text"])
+            except TelegramError as exc:
+                err = self.cfg.secrets.redact(str(exc))
+                self.db.mark_digest(d["id"], error=err)
+                self.log(f"Telegram digest for {d['digest_date']} not sent yet: {err}")
+                return False
+            self.db.mark_digest(d["id"], sent_at=iso(self.clock()))
+        return True
+
+    def _deliver_alerts(self) -> bool:
         oldest = self.clock() - self.max_age
         for a in self.db.pending_alerts():
             if parse_iso(a["created_at"]) < oldest:
@@ -211,8 +240,9 @@ class Notifier:
         return True
 
     def tick(self) -> bool:
-        """Collect then deliver; False if Telegram failed."""
+        """Collect alerts and a due digest, then deliver; False if Telegram failed."""
         self.collect()
+        self.collect_digest()
         return self.deliver()
 
 
@@ -228,9 +258,10 @@ class AlertService:
     """
 
     def __init__(self, cfg: Config, api: BotAPI, *, log: Callable[[str], None] | None = None,
-                 interval: float = 5.0):
+                 interval: float = 5.0, clock: Callable[[], datetime] | None = None):
         self.cfg = cfg
         self.api = api
+        self.clock = clock
         self._log = log or (lambda msg: None)
         self.interval = interval
         self._stop = threading.Event()
@@ -265,7 +296,7 @@ class AlertService:
                 f"Telegram {name} could not start: {type(exc).__name__}: {exc}"))
             return
         try:
-            loop(Notifier(self.cfg, db, self.api, log=self._log))
+            loop(Notifier(self.cfg, db, self.api, log=self._log, clock=self.clock))
         except Exception as exc:  # never let alerts take the daemon down
             self._log(self.cfg.secrets.redact(
                 f"Telegram {name} could not start: {type(exc).__name__}: {exc}"))

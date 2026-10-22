@@ -1612,3 +1612,39 @@ lasting consequences go in `docs/adr/` instead.
   Claude to an out Gemini, a limit hit mid-run continuing on paid credits
   (with the report), the daily cap, no API key, `--agent`, and the move
   back from queued and `paused_spend`.
+
+## Phase 2, issue #27: Telegram 8am digest
+
+- **Made from the `transitions` table, like alerts.** The digest lists
+  every transition since the previous digest that is an outcome: needs you
+  (incl. re-approval after a long usage pause), failed, finished (with the
+  one-line Result), paused for usage, paused for spend, retrying and
+  cancelled. Usage pauses never alert, so this is where they show up. A
+  closing "Now:" line counts what is still running or waiting. The Task's
+  events are listed, not just its latest state, so a Task paused at 1am
+  and finished at 4am shows both.
+- **One digest per local date, decided by the date, not by a timer.** The
+  digest for a date is due from that date's `telegram.digest_time` (08:00,
+  in `timezone`) and made by the first tick of the alert sender at or
+  after it: at 8am when the laptop is awake, otherwise on wake (the sender
+  ticks every few seconds, so no separate wake hook is needed). The
+  `digests` table (migration 12) has a unique `digest_date`, so a restart,
+  a second tick or a crash between making and sending can't make it twice.
+  Asleep through several 8ams makes one digest on wake, for the latest
+  date, covering everything since the last one.
+- **Covers "since the previous digest", not a fixed 8pm–8am window.**
+  Each digest records the last transition it covered; the next starts
+  after it, so nothing falls between two digests or is repeated. On the
+  first start (Telegram just enabled) it begins at the newest transition
+  and skips the digest already due, as alerts don't replay history.
+- **Same outbox and delivery as alerts.** Sent after pending alerts,
+  retried with the same backoff during an outage, and dropped (logged)
+  once older than `telegram.alert_max_age_hours`. Text is redacted before
+  it is stored and cut at a line boundary to fit one Telegram message.
+- **Comedy Tasks are status lines only** (`- 4:12am comedy Task ab12
+  done`): no title, Result or reason, as in alerts.
+- **Tests** (`tests/test_digest.py`, fake clock and fake Bot API): 7:59
+  vs 8:00, once per day, asleep at 8am then woken (with a restart),
+  several missed 8ams, first start, the next digest covering only what
+  happened since, comedy, an outage, a dropped digest, redaction, length,
+  config, and the daemon's alert thread sending it.

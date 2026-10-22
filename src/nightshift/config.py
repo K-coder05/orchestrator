@@ -12,7 +12,7 @@ tests and dry runs); the Task data root with ``paths.agents_root``.
 from __future__ import annotations
 
 import copy
-from datetime import date
+from datetime import date, time
 import os
 import re
 import stat
@@ -298,6 +298,13 @@ class Config:
         return float(self.TELEGRAM_DEFAULTS[key] if value is None else value)
 
     @property
+    def telegram_digest_time(self) -> time:
+        """``telegram.digest_time``: local time of the morning digest (08:00)."""
+        h, m = (int(x) for x in str(
+            (self.data.get("telegram") or {}).get("digest_time") or "08:00").split(":"))
+        return time(h, m)
+
+    @property
     def telegram_user_id(self) -> int | None:
         """The only Telegram user Nightshift writes to and listens to; None: alerts off."""
         return _telegram_user_id(self.data)
@@ -478,6 +485,8 @@ def _validate(data: dict[str, Any]) -> None:
     if telegram.get("user_id") is not None and not _positive_int(telegram["user_id"]):
         # The value itself is never echoed: it must not reach logs.
         raise ConfigError("telegram.user_id must be your numeric Telegram user ID (or null)")
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(telegram.get("digest_time", "08:00"))):
+        raise ConfigError("telegram.digest_time must be HH:MM (24-hour), e.g. 08:00")
     for key in Config.TELEGRAM_DEFAULTS:
         num = telegram.get(key, Config.TELEGRAM_DEFAULTS[key])
         if isinstance(num, bool) or not isinstance(num, (int, float)) or num <= 0:

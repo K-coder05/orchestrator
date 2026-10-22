@@ -192,7 +192,8 @@ def test_alert_never_delivered_is_dropped_when_too_old(tg_cfg, tg_db, api):
 
     from nightshift.timeutil import now
 
-    clock = [now(tg_cfg.timezone)]
+    # 10am to 11pm today: no 8am digest in between.
+    clock = [now(tg_cfg.timezone).replace(hour=10, minute=0)]
     logs: list[str] = []
     n = Notifier(tg_cfg, tg_db, api, log=logs.append, clock=lambda: clock[0])
     tid = finish(tg_cfg, tg_db, "Stale")

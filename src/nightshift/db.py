@@ -355,6 +355,25 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX paid_credit_decisions_task ON paid_credit_decisions(task_id, id);
     """,
+    # 12: the 8am Telegram digest (§2.12).
+    """
+    -- One row per morning digest; digest_date (the local date of the 8am it
+    -- belongs to) is unique, so a digest is never made twice. It covers the
+    -- transitions after the previous digest's through_transition_id up to
+    -- its own. Delivery columns as in alerts; `text` is already redacted.
+    CREATE TABLE digests (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        digest_date            TEXT NOT NULL UNIQUE,
+        since                  TEXT NOT NULL,
+        through_transition_id  INTEGER NOT NULL,
+        text                   TEXT NOT NULL,
+        created_at             TEXT NOT NULL,
+        sent_at                TEXT,
+        tries                  INTEGER NOT NULL DEFAULT 0,
+        last_error             TEXT,
+        dropped_at             TEXT
+    );
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -960,3 +979,34 @@ class Database:
                       "last_error = COALESCE(?, last_error), "
                       "dropped_at = COALESCE(?, dropped_at) WHERE id = ?",
                       (0 if dropped_at else 1, sent_at, error, dropped_at, alert_id))
+
+    # -- Telegram digest (§2.12) ---------------------------------------------------
+    def insert_digest(self, *, digest_date: str, since: str, through_transition_id: int,
+                      text: str, at: str) -> bool:
+        """Store the digest for ``digest_date``; False if it already exists."""
+        with self.tx() as c:
+            cur = c.execute("INSERT OR IGNORE INTO digests (digest_date, since, "
+                            "through_transition_id, text, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (digest_date, since, through_transition_id, text, at))
+            return cur.rowcount == 1
+
+    def last_digest(self) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM digests ORDER BY digest_date DESC LIMIT 1").fetchone()
+
+    def digests(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM digests ORDER BY digest_date").fetchall()
+
+    def pending_digests(self) -> list[sqlite3.Row]:
+        """Digests not yet sent or dropped, oldest first."""
+        return self.conn.execute("SELECT * FROM digests WHERE sent_at IS NULL AND dropped_at "
+                                 "IS NULL ORDER BY digest_date").fetchall()
+
+    def mark_digest(self, digest_id: int, *, sent_at: str | None = None,
+                    error: str | None = None, dropped_at: str | None = None) -> None:
+        """Record one delivery try: sent, failed with ``error``, or dropped."""
+        with self.tx() as c:
+            c.execute("UPDATE digests SET tries = tries + ?, sent_at = COALESCE(?, sent_at), "
+                      "last_error = COALESCE(?, last_error), "
+                      "dropped_at = COALESCE(?, dropped_at) WHERE id = ?",
+                      (0 if dropped_at else 1, sent_at, error, dropped_at, digest_id))

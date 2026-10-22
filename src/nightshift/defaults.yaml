@@ -374,6 +374,10 @@ telegram:
   # An alert Telegram could not take (an outage) is retried until it is this
   # old, then dropped; the Task itself is never held up.
   alert_max_age_hours: 12
+  # One digest of everything since the previous one (finished, failed, needs
+  # you, usage and spend pauses, retries, cancels) at this local time
+  # (`timezone`). Asleep then: sent once on wake, never twice.
+  digest_time: "08:00"
 
 secrets:
   keychain_service: nightshift
