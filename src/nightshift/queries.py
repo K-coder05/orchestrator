@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from . import priority, schedules, usage
@@ -186,6 +186,11 @@ class WindowView:
     out_of_usage: bool
     baseline: usage.Baseline | None
     observation_count: int
+    #: Cost-equivalent used in the current period, as a percent of the
+    #: Baseline; None with no Baseline (thresholds don't apply yet).
+    percent_of_baseline: float | None
+    #: Time left until ``resets_at``; None when the reset is not known.
+    resets_in: timedelta | None
 
 
 @dataclass(frozen=True)
@@ -225,6 +230,10 @@ class AgentUsage:
     recent_observations: list[LimitObservationView]
     last_probe: ProbeView | None
     paused: list[PausedOnLimit]
+    #: Why new Tasks (or background ones, in the daytime reserve) can't start
+    #: on it now under the proactive thresholds (§1.5).
+    held: str | None = None
+    held_background: str | None = None
 
 
 def usage_agents(cfg: Config, db: Database) -> list[str]:
@@ -237,6 +246,7 @@ def usage_agents(cfg: Config, db: Database) -> list[str]:
 def _window(cfg: Config, db: Database, agent: str, w: str, status: sqlite3.Row | None,
             observations: int, now: datetime) -> WindowView:
     start, reset = usage.current_window(cfg, db, agent, w, now)
+    load = usage.window_load(cfg, db, agent, w, now)
     return WindowView(
         window=w, start=start, resets_at=reset, hours=cfg.window_hours(agent, w),
         used=usage.usage_between(db, agent, start, now),
@@ -245,6 +255,8 @@ def _window(cfg: Config, db: Database, agent: str, w: str, status: sqlite3.Row |
                       and reset is not None),
         baseline=usage.baseline(db, agent, w),
         observation_count=observations,
+        percent_of_baseline=load.percent if load is not None else None,
+        resets_in=reset - now if reset is not None else None,
     )
 
 
@@ -252,12 +264,12 @@ def usage_report(cfg: Config, db: Database, now: datetime) -> list[AgentUsage]:
     """Usage per agent and Window, with Baselines, recent Limit observations,
     the last probe and Tasks paused on a limit."""
     paused_all = db.tasks_in_state(TaskState.PAUSED_USAGE)
+    holds = usage.threshold_holds(cfg, db, now)
     out = []
     for agent in usage_agents(cfg, db):
         statuses = db.window_status(agent)
         observations = db.limit_observations(agent)
-        windows = list(cfg.windows(agent))
-        windows += sorted((set(statuses) | {o["window"] for o in observations}) - set(windows))
+        windows = usage.windows_of(cfg, db, agent)
         probes = db.probes(agent)
         out.append(AgentUsage(
             agent=agent,
@@ -280,6 +292,8 @@ def usage_report(cfg: Config, db: Database, now: datetime) -> list[AgentUsage]:
                 for r in paused_all
                 if r["agent"] == agent and r["pause_kind"] == "usage_limit"
             ],
+            held=holds.all.get(agent),
+            held_background=holds.background.get(agent),
         ))
     return out
 

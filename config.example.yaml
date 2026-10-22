@@ -119,6 +119,19 @@ usage:
   # On a real limit hit the agent CLI usually ends the session itself; it
   # gets this long to do so (and report its usage) before it is stopped.
   limit_exit_wait_seconds: 10
+  # Proactive thresholds (§1.5). They apply only to a Window that has a
+  # Baseline; until then only actual limit errors pause. At this percent of
+  # a Window's Baseline no new Task starts on that agent (running Tasks
+  # continue).
+  stop_starting_percent: 80
+  # Daytime reserve: inside these hours (HH:MM, end exclusive, `timezone`)
+  # background Tasks on these agents may use at most this percent of each
+  # Window's Baseline; the rest is kept for interactive use.
+  daytime_reserve:
+    start: "08:00"
+    end: "23:00"
+    agents: [claude]
+    background_max_percent: 75
   # Each agent's usage Windows and their length in hours (§1.5). Limit
   # observations and Baselines are kept per Window; `orch usage` lists these.
   # Claude: a rolling 5-hour Window plus a weekly cap.

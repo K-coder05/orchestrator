@@ -1094,7 +1094,7 @@ lasting consequences go in `docs/adr/` instead.
   per-run Codex equivalent (execpolicy rules are files) and is a
   documented gap; the network block is what matters.
 - **Codex reports no cost.** Usage rows get tokens, cost NULL, so Codex
-  Baselines can't form yet (thresholds are Phase 2 anyway). Codex's limit
+  Baselines can't form (and the issue #21 thresholds never apply to it). Codex's limit
   messages don't name a Window: a hit counts as its shortest configured
   Window (`usage.windows.codex`, assumed 5h + weekly like Claude).
 - **Failover is per Task type, in config.** `task_types.<type>.failover:
@@ -1355,3 +1355,35 @@ lasting consequences go in `docs/adr/` instead.
   `gemini` writes telemetry records shaped from the source. To check: a real
   `--agent gemini-api` Task records one row per call, and the costs match
   AI Studio's billing page.
+
+## Phase 2, issue #21: proactive usage thresholds and reset countdowns
+
+- **Rules** (`usage.threshold_holds`, recalculated before every pick with
+  the daemon's clock). For each configured agent and each Window that has a
+  Baseline: percent = cost-equivalent recorded in the Window's current
+  period (`usage.current_window`) / Baseline. At
+  `usage.stop_starting_percent` (80) or more, no new Task starts on that
+  agent. Inside `usage.daytime_reserve` (`08:00`-`23:00` in `timezone`,
+  start inclusive, end exclusive) agents listed there (`[claude]`) start
+  no Task whose **Effective** priority is background at
+  `background_max_percent` (75) or more. A background Task whose deadline
+  made it urgent is not held. A Window with no Baseline never holds
+  anything: only actual limit errors pause, as before.
+- **Holds only gate starts.** They are checked in `pick_next`, never while
+  an Attempt runs, so a running Task finishes even if its own usage
+  crosses a threshold.
+- **No failover on a threshold.** Queued Tasks on a held agent wait; they
+  don't fail over the way they do when the agent is actually out (§2.8).
+  The agent still has usage left (that's what the reserve is for), and the
+  wait ends when usage ages out of the Window or it resets. An actual
+  limit hit still fails over as before.
+- **`orch usage`** adds two columns per Window: OF BASELINE (the percent
+  above, `-` with no Baseline) and RESETS IN (countdown to the reset the
+  agent last reported, `not known` when none is ahead; a Window with an
+  unknown reset is measured as the trailing `usage.windows` length), and a
+  line saying why new (or background) Tasks are held, if they are.
+- **Codex and Gemini report no cost**, so they never form a Baseline and
+  the thresholds never apply to them (documented in `docs/adapters.md`).
+- Tested with fixed datetimes for the rules and the view, and with the fake
+  clock through the daemon (a running Task crossing 80% finishes, the next
+  waits; a background Task waits at 10am and runs at 11pm).

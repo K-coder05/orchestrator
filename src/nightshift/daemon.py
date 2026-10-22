@@ -394,8 +394,12 @@ class QueueRunner:
             # Tasks waiting on an agent that is out move to one that isn't (§2.8).
             for tid, src, dst in failover.reassign_held(self.cfg, self.db, held, self.clock()):
                 self.log(f"Task {tid}: {src} is out of usage; failed over to {dst}")
+        # Proactive thresholds (§1.5) hold back new Tasks only; nothing fails
+        # over, since the agent is not out yet.
+        thresholds = usage.threshold_holds(self.cfg, self.db, self.clock())
         row = pick_next(self.cfg, self.db.tasks_in_state(TaskState.QUEUED), self.clock(),
-                        held_agents=held)
+                        held_agents=thresholds.all | held,
+                        held_background=thresholds.background)
         if row is None:
             return None
         task_id = row["id"]

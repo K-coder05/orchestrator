@@ -7,6 +7,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
+from datetime import timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -281,6 +282,18 @@ def format_credits(c: spend.CreditView, per_task_cap: float) -> list[str]:
             f"  per-Task cap ${per_task_cap:.2f}", ""]
 
 
+def _countdown(left: timedelta) -> str:
+    """Time to a reset: ``3d 04h``, ``2h 05m`` or ``12m``."""
+    minutes = max(0, int(left.total_seconds() // 60))
+    days, rest = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(rest, 60)
+    if days:
+        return f"{days}d {hours:02d}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
 def format_usage(report: list[queries.AgentUsage], tz: str,
                  credits: tuple[spend.CreditView, float] | None = None) -> str:
     """Usage per agent and Window, and whether each Window has a Baseline;
@@ -301,13 +314,21 @@ def format_usage(report: list[queries.AgentUsage], tz: str,
                          if base else f"none yet ({n} observation{'s' if n != 1 else ''})")
             cost = ("$0.0000" if used.events == 0 else _cost(used.cost_usd)) + (f" +{used.events_without_cost} w/o cost"
                                            if used.events_without_cost else "")
+            pct = "-" if w.percent_of_baseline is None else f"{w.percent_of_baseline:.0f}%"
+            resets = "not known" if w.resets_in is None else _countdown(w.resets_in)
             rows.append([w.window, period, cost, f"{used.input_tokens:,}", f"{used.output_tokens:,}",
                          f"{used.cache_creation_tokens:,}", f"{used.cache_read_tokens:,}",
-                         f"{used.requests:,}", said, base_cell])
+                         f"{used.requests:,}", said, base_cell, pct, resets])
         out.append(f"{agent.agent}")
         out.append(_table(["  WINDOW", "CURRENT PERIOD", "COST-EQUIVALENT", "INPUT", "OUTPUT",
-                           "CACHE WRITE", "CACHE READ", "REQUESTS", "AGENT REPORTS", "BASELINE"],
+                           "CACHE WRITE", "CACHE READ", "REQUESTS", "AGENT REPORTS", "BASELINE",
+                           "OF BASELINE", "RESETS IN"],
                           [["  " + r[0], *r[1:]] for r in rows]))
+        if agent.held:
+            out.append(f"  No new Task starts on {agent.agent}: {agent.held}")
+        elif agent.held_background:
+            out.append(f"  No new background Task starts on {agent.agent}: "
+                       f"{agent.held_background}")
         if agent.recent_observations:
             out.append("  Limit observations (latest last):")
             for o in agent.recent_observations:

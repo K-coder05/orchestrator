@@ -267,6 +267,7 @@ class Config:
         "simulated_reset_minutes": 5,
         "probe_timeout_seconds": 120,
         "limit_exit_wait_seconds": 10,
+        "stop_starting_percent": 80,
     }
 
     def windows(self, agent: str) -> dict[str, float]:
@@ -305,6 +306,15 @@ class Config:
         """A ``usage:`` setting (pauses and resume, §2.6)."""
         value = (self.data.get("usage") or {}).get(key)
         return float(self.USAGE_DEFAULTS[key] if value is None else value)
+
+    DAYTIME_RESERVE_DEFAULTS = {"start": "08:00", "end": "23:00", "agents": ["claude"],
+                                "background_max_percent": 75}
+
+    def daytime_reserve(self, key: str) -> Any:
+        """A ``usage.daytime_reserve`` setting (§1.5): ``start`` and ``end``
+        (HH:MM), ``agents`` (list) or ``background_max_percent``."""
+        value = ((self.data.get("usage") or {}).get("daytime_reserve") or {}).get(key)
+        return self.DAYTIME_RESERVE_DEFAULTS[key] if value is None else value
 
 
     # -- Spend (§1.5) ------------------------------------------------------------
@@ -388,6 +398,25 @@ def _validate(data: dict[str, Any]) -> None:
         for t in windows.values()
     ):
         raise ConfigError("usage.windows must map agent -> {window name: hours > 0}")
+    reserve = usage.get("daytime_reserve") or {}
+    if not isinstance(reserve, dict):
+        raise ConfigError("usage.daytime_reserve must be a mapping")
+    for key in ("start", "end"):
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d",
+                            str(reserve.get(key, Config.DAYTIME_RESERVE_DEFAULTS[key]))):
+            raise ConfigError(f"usage.daytime_reserve.{key} must be HH:MM (24-hour), e.g. 08:00")
+    agents = reserve.get("agents", [])
+    if not isinstance(agents, list) or not all(isinstance(a, str) for a in agents):
+        raise ConfigError("usage.daytime_reserve.agents must be a list of agent names")
+    for key, value in (
+        ("usage.stop_starting_percent",
+         usage.get("stop_starting_percent", Config.USAGE_DEFAULTS["stop_starting_percent"])),
+        ("usage.daytime_reserve.background_max_percent",
+         reserve.get("background_max_percent",
+                     Config.DAYTIME_RESERVE_DEFAULTS["background_max_percent"])),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 100:
+            raise ConfigError(f"{key} must be a percent above 0 and at most 100")
     queue = data.get("queue") or {}
     if not isinstance(queue, dict):
         raise ConfigError("config section 'queue' must be a mapping")

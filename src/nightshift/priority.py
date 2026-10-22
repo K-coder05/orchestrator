@@ -104,16 +104,21 @@ def resuming(row: Row) -> bool:
 
 
 def evaluate(
-    cfg: Config, row: Row, now: datetime, *, held_agents: Mapping[str, str] | None = None
+    cfg: Config, row: Row, now: datetime, *, held_agents: Mapping[str, str] | None = None,
+    held_background: Mapping[str, str] | None = None,
 ) -> Evaluation:
     """``held_agents`` maps an agent to why it may not start Tasks now (its
-    usage Window is known to be out until a reset)."""
+    usage Window is out until a reset, or at a proactive threshold);
+    ``held_background`` likewise for Tasks whose Effective priority is
+    background (the daytime reserve)."""
     eff = effective_priority(
         row["priority"], row["deadline"], now, urgent_within_hours=deadline_urgent_hours(cfg)
     )
     blocked = None
     if held_agents and row["agent"] in held_agents:
         blocked = held_agents[row["agent"]]
+    elif held_background and eff == "background" and row["agent"] in held_background:
+        blocked = held_background[row["agent"]]
     elif row["run_at"] and parse_iso(row["run_at"]) > now:
         blocked = f"waiting until {row['run_at']} (--at)"
     elif row["long"] and eff != "urgent" and not in_long_window(cfg, now):
@@ -140,11 +145,13 @@ def _order_key(ev: Evaluation) -> tuple:
 def order(
     cfg: Config, rows: Iterable[Row], now: datetime, *,
     held_agents: Mapping[str, str] | None = None,
+    held_background: Mapping[str, str] | None = None,
 ) -> list[Evaluation]:
     """Queued Tasks in queue order (startable or not), Effective priority
     first. ``rows`` must already be oldest-first so equal keys keep order."""
     return sorted(
-        (evaluate(cfg, r, now, held_agents=held_agents) for r in rows), key=_order_key
+        (evaluate(cfg, r, now, held_agents=held_agents, held_background=held_background)
+         for r in rows), key=_order_key
     )
 
 
@@ -162,6 +169,7 @@ def resume_order(cfg: Config, rows: Iterable[Row], now: datetime) -> list[Row]:
 def pick_next(
     cfg: Config, rows: Iterable[Row], now: datetime, *,
     held_agents: Mapping[str, str] | None = None,
+    held_background: Mapping[str, str] | None = None,
 ) -> Row | None:
     """The queued Task to start now, or None if none may start.
 
@@ -171,7 +179,7 @@ def pick_next(
     by ``--at`` or the long-task window isn't waiting to run yet, so it
     doesn't block the queue.
     """
-    for ev in order(cfg, rows, now, held_agents=held_agents):
+    for ev in order(cfg, rows, now, held_agents=held_agents, held_background=held_background):
         if ev.blocked is None:
             return ev.row
     return None

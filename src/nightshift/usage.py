@@ -18,7 +18,13 @@ plan, such as Claude's rolling 5 hours or its weekly cap.
 - **Baselines.** The lowest cost-equivalent of a Window's last 3 Limit
   observations. Nightshift sees only its own usage, never interactive use,
   so recorded usage at a hit undercounts the Window and the Baseline errs
-  low (conservative). Thresholds that act on Baselines are Phase 2.
+  low (conservative).
+- **Thresholds** (:func:`threshold_holds`). Once a Window has a Baseline:
+  at ``usage.stop_starting_percent`` (80%) of it no new Task starts on the
+  agent; inside the daytime reserve (8am-11pm) background Tasks on Claude
+  may use at most 75%. Running Tasks continue. Agents that report no cost
+  (Codex, Gemini) never get a Baseline, so only actual limit errors pause
+  them.
 - **Probing.** A Task paused on a limit with no parseable reset time is not
   simply retried: at the probe interval the daemon sends the agent a
   minimal probe request (:func:`probe`) and requeues its paused Tasks only
@@ -32,8 +38,9 @@ from __future__ import annotations
 import os
 import subprocess
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from .adapters import get_adapter
 from .adapters.base import AgentAdapter, ProbeReply, RateLimit, WindowInfo
@@ -229,6 +236,96 @@ def baseline(db: Database, agent: str, window: str) -> Baseline | None:
     if not costs:
         return None
     return Baseline(cost_usd=min(costs), observations=len(costs))
+
+
+# --------------------------------------------------------------------------
+# Proactive thresholds
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class WindowLoad:
+    """How much of a Window's Baseline Nightshift has used in its current period."""
+
+    window: str
+    used_usd: float
+    baseline_usd: float
+    resets_at: datetime | None
+
+    @property
+    def percent(self) -> float:
+        return self.used_usd / self.baseline_usd * 100
+
+
+def window_load(cfg: Config, db: Database, agent: str, window: str,
+                at: datetime) -> WindowLoad | None:
+    """``window``'s current usage against its Baseline; None with no Baseline."""
+    base = baseline(db, agent, window)
+    if base is None:
+        return None
+    start, reset = current_window(cfg, db, agent, window, at)
+    used = usage_between(db, agent, start, at).cost_usd or 0.0
+    return WindowLoad(window=window, used_usd=used, baseline_usd=base.cost_usd, resets_at=reset)
+
+
+def in_daytime_reserve(cfg: Config, at: datetime) -> bool:
+    """Whether ``at`` (in the configured timezone) is inside the daytime
+    reserve, by default 8am to 11pm. Start inclusive, end exclusive."""
+    start, end = (time.fromisoformat(cfg.daytime_reserve(k)) for k in ("start", "end"))
+    local = at.astimezone(ZoneInfo(cfg.timezone)).time()
+    if start <= end:
+        return start <= local < end
+    return local >= start or local < end  # a reserve that wraps midnight
+
+
+@dataclass
+class Holds:
+    """Agents that may not start Tasks now, each with the reason why."""
+
+    #: No new Task starts on these (a Window at ``usage.stop_starting_percent``).
+    all: dict[str, str] = field(default_factory=dict)
+    #: No new background Task starts on these (the daytime reserve).
+    background: dict[str, str] = field(default_factory=dict)
+
+
+def windows_of(cfg: Config, db: Database, agent: str) -> list[str]:
+    """``agent``'s configured Windows, then any other it reported or hit a limit in."""
+    names = list(cfg.windows(agent))
+    seen = set(db.window_status(agent)) | {o["window"] for o in db.limit_observations(agent)}
+    return names + sorted(seen - set(names))
+
+
+def _until(load: WindowLoad) -> str:
+    return f"until it resets at {iso(load.resets_at)}" if load.resets_at else "until usage ages out"
+
+
+def threshold_holds(cfg: Config, db: Database, at: datetime) -> Holds:
+    """The proactive thresholds (§1.5) at ``at``. They act only on Windows
+    with a Baseline; with none, only actual limit errors pause. Tasks
+    already running are never stopped by them."""
+    holds = Holds()
+    stop = cfg.usage("stop_starting_percent")
+    reserve = float(cfg.daytime_reserve("background_max_percent"))
+    daytime = in_daytime_reserve(cfg, at)
+    reserved = set(cfg.daytime_reserve("agents")) if daytime else set()
+    for agent in cfg.data.get("agents") or {}:
+        for window in windows_of(cfg, db, agent):
+            load = window_load(cfg, db, agent, window, at)
+            if load is None:
+                continue
+            share = (f"{load.percent:.0f}% of its {window} Baseline "
+                     f"(${load.used_usd:.2f} of ${load.baseline_usd:.2f})")
+            if load.percent >= stop and agent not in holds.all:
+                holds.all[agent] = (f"{agent} is at {share}: no new Task starts on it at "
+                                    f"{stop:g}% or more, {_until(load)}")
+            if agent in reserved and load.percent >= reserve and agent not in holds.background:
+                holds.background[agent] = (
+                    f"{agent} is at {share}: daytime reserve, background Tasks may use at most "
+                    f"{reserve:g}% from {cfg.daytime_reserve('start')} to "
+                    f"{cfg.daytime_reserve('end')}")
+    for agent in holds.all:
+        holds.background.pop(agent, None)
+    return holds
 
 
 # --------------------------------------------------------------------------

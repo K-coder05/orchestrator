@@ -83,6 +83,14 @@ call is priced (`spend.gemini_api_prices`) and recorded; a Task that reaches
 $2 (`spend.per_task_usd`) is stopped and moved to `needs_you`. `orch usage`
 shows the spend so far and the credit left (`plans.gemini.api_credit_*`).
 
+`orch usage` lists each agent's Windows with the percent of the Window's
+Baseline used and the time to its next reset. Once a Window has a Baseline
+(learned from real limit hits), no new Task starts on that agent at 80% of it
+(`usage.stop_starting_percent`), and from 8am to 11pm background Tasks on
+Claude stop at 75% (`usage.daytime_reserve`), keeping the rest for your
+interactive use. Running Tasks always continue. Codex reports no cost, so it
+never gets a Baseline and only pauses on an actual limit error.
+
 A Schedule creates pre-approved Occurrences of a template on a cron-style
 rule (local time), each an ordinary Task in
 `~/agents/recurring/<name>/YYYY-MM-DD/`. Fires missed while the Mac slept (or

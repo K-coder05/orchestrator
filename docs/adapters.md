@@ -335,7 +335,10 @@ probes), never from interactive use of the same plan (the Claude app,
   Baseline;
 - the plan-wide `utilization` in `rate_limit_event` does include
   interactive use; `orch usage` shows it next to Nightshift's own numbers,
-  but Baselines don't use it (yet).
+  but Baselines and thresholds don't use it (yet);
+- the thresholds (80% of a Baseline, the daytime 75% reserve) compare
+  Nightshift's own usage in the current Window with that Baseline, so
+  interactive use earlier in the same Window is not counted against them.
 
 ## Codex CLI
 
@@ -500,7 +503,10 @@ From the last `turn.completed`: input = `input_tokens - cached_input_tokens`
 `output_tokens` (includes reasoning tokens), requests = turns seen, the raw
 object stored. **Codex reports no cost**, so `cost_usd` is NULL: Codex
 Limit observations get no cost and Baselines (cost-equivalent, §1.5) can't
-form for Codex yet; tokens are recorded. `requests` is the number of turns
+form for Codex; tokens are recorded. **Known gap:** with no Baseline the
+proactive thresholds (stop starting at 80% of a Window, the daytime
+reserve) never apply to Codex; it runs until an actual limit error pauses
+it, and `orch usage` shows `-` under OF BASELINE. `requests` is the number of turns
 (one per Attempt), not model requests.
 
 **`turn.completed` carries the thread's running total** (verified: a turn
@@ -736,8 +742,9 @@ recorded stream once the CLI is signed in.
 Per model from `result.stats.models`: input = `input` (uncached prompt
 tokens), cache read = `cached`, output = `output_tokens`; no cache-write
 count, no request count, **no cost** (`cost_usd` NULL, so Gemini Limit
-observations carry tokens but no cost-equivalent, and Baselines can't form
-yet, as for Codex). Thinking tokens are in `total_tokens` but not
+observations carry tokens but no cost-equivalent, and Baselines can't form,
+as for Codex: the proactive thresholds never apply to Gemini either; only an
+actual limit error pauses it). Thinking tokens are in `total_tokens` but not
 `output_tokens`; `raw` keeps the whole per-model object. The stats come
 from the process's own telemetry (`uiTelemetryService`), so a resumed
 Attempt should report only its own tokens *(to verify)*. An Attempt stopped

@@ -188,6 +188,89 @@ def test_same_window_is_observed_once_and_baseline_is_lowest_of_last_3(cfg, db):
 
 
 # --------------------------------------------------------------------------
+# Thresholds (fake clock)
+# --------------------------------------------------------------------------
+
+
+def _spend(db, agent, at, cost):
+    """Usage outside Attempts, so no Task is needed."""
+    db.record_planning_usage(None, "probe", agent, [{"model": "m", "cost_usd": cost}], at=iso(at))
+
+
+def _learn_baseline(cfg, db, agent, at, cost, window="five_hour"):
+    _spend(db, agent, at - timedelta(minutes=5), cost)
+    usage.record_limit_hit(cfg, db, agent, RateLimit(window, iso(at + timedelta(minutes=30))),
+                           at=at, source="probe")
+
+
+def test_no_baseline_means_no_threshold(cfg, db):
+    at = datetime(2026, 10, 21, 2, 0, tzinfo=LA)
+    _spend(db, "claude", at - timedelta(minutes=1), 100.0)
+    holds = usage.threshold_holds(cfg, db, at)
+    assert holds.all == {} and holds.background == {}
+
+
+def test_80_percent_of_a_baseline_stops_new_tasks_on_that_agent(cfg, db):
+    night = datetime(2026, 10, 21, 2, 0, tzinfo=LA)
+    _learn_baseline(cfg, db, "claude", night - timedelta(days=1), 10.0)
+    _spend(db, "claude", night - timedelta(hours=1), 7.9)
+    assert usage.threshold_holds(cfg, db, night).all == {}
+    _spend(db, "claude", night - timedelta(minutes=30), 0.1)  # 8.0 of 10.0
+    holds = usage.threshold_holds(cfg, db, night)
+    assert "five_hour" in holds.all["claude"] and "80%" in holds.all["claude"]
+    assert set(holds.all) == {"claude"}
+    # Once the usage is out of the Window it no longer counts.
+    assert usage.threshold_holds(cfg, db, night + timedelta(hours=5)).all == {}
+
+
+def test_daytime_reserve_holds_background_tasks_on_claude_only(cfg, db):
+    first = datetime(2026, 10, 21, 7, 59, tzinfo=LA)
+    _learn_baseline(cfg, db, "claude", first - timedelta(days=1), 10.0)
+    _learn_baseline(cfg, db, "codex", first - timedelta(days=1), 10.0)
+    _spend(db, "claude", first - timedelta(minutes=10), 7.5)  # 75%
+    _spend(db, "codex", first - timedelta(minutes=10), 7.5)
+    assert usage.threshold_holds(cfg, db, first).background == {}  # 7:59am: night
+    holds = usage.threshold_holds(cfg, db, first + timedelta(minutes=1))  # 8am
+    assert set(holds.background) == {"claude"}
+    assert "75%" in holds.background["claude"] and holds.all == {}
+
+    eleven = datetime(2026, 10, 21, 23, 0, tzinfo=LA)
+    _spend(db, "claude", eleven - timedelta(minutes=10), 7.5)
+    assert usage.threshold_holds(cfg, db, eleven).background == {}  # 11pm: night
+    assert set(usage.threshold_holds(cfg, db, eleven - timedelta(minutes=1)).background) == {"claude"}
+
+
+def test_daemon_starts_nothing_new_at_80_percent_but_lets_a_running_task_finish(cfg, db, env):  # noqa: F811
+    clock = Clock()
+    qr = QueueRunner(cfg, db, FakeHost(), adapter_provider=fake_provider, clock=clock)
+    _learn_baseline(cfg, db, "claude", clock() - timedelta(days=1), 1.0)
+    _spend(db, "claude", clock() - timedelta(minutes=1), 0.795)  # 79.5%
+    first = create_task(cfg, db, "first").spec.id
+    second = create_task(cfg, db, "second").spec.id
+    # The first starts below 80%; its own usage (about $0.007) crosses it,
+    # and it still finishes.
+    assert qr.run_next() == first and db.task_state(first) == TaskState.DONE
+    assert qr.run_next() is None and db.task_state(second) == TaskState.QUEUED
+    clock.advance(hours=5, minutes=1)  # the usage leaves the Window
+    assert qr.run_next() == second
+
+
+def test_daemon_keeps_the_daytime_reserve_for_background_tasks(cfg, db, env):  # noqa: F811
+    clock = Clock()
+    clock.t = clock.t.replace(hour=10, minute=0, second=0) - timedelta(days=1)
+    qr = QueueRunner(cfg, db, FakeHost(), adapter_provider=fake_provider, clock=clock)
+    _learn_baseline(cfg, db, "claude", clock() - timedelta(days=1), 1.0)
+    _spend(db, "claude", clock() - timedelta(minutes=1), 0.75)
+    bg = create_task(cfg, db, "background", priority="background").spec.id
+    normal = create_task(cfg, db, "normal").spec.id
+    assert qr.run_next() == normal  # under 80%: normal Tasks still start
+    assert qr.run_next() is None and db.task_state(bg) == TaskState.QUEUED
+    clock.t = clock.t.replace(hour=23, minute=0)  # 11pm: the reserve is over
+    _spend(db, "claude", clock() - timedelta(minutes=1), 0.75)
+    assert qr.run_next() == bg
+
+
+# --------------------------------------------------------------------------
 # Probing
 # --------------------------------------------------------------------------
 
@@ -327,6 +410,26 @@ def test_orch_usage_shows_windows_and_baselines(config_dir, cfg, db, env, monkey
     assert r.exit_code != 0 and "unknown agent" in r.output
 
 
+def test_usage_view_shows_percent_of_baseline_and_reset_countdowns(cfg, db):
+    from nightshift import queries, views
+    at = datetime(2026, 10, 21, 10, 0, tzinfo=LA)
+    _learn_baseline(cfg, db, "claude", at - timedelta(days=1), 10.0)
+    db.set_window_status("claude", "five_hour", resets_at=iso(at + timedelta(hours=2, minutes=5)),
+                         utilization=0.5, status="allowed", seen_at=iso(at))
+    db.set_window_status("claude", "seven_day", resets_at=iso(at + timedelta(days=3, hours=4)),
+                         utilization=0.2, status="allowed", seen_at=iso(at))
+    _spend(db, "claude", at - timedelta(minutes=10), 8.0)
+    text = views.format_usage(queries.usage_report(cfg, db, at), cfg.timezone)
+    assert "OF BASELINE" in text and "RESETS IN" in text
+    five = next(line for line in text.splitlines() if line.strip().startswith("five_hour"))
+    assert "80%" in five and "2h 05m" in five
+    seven = next(line for line in text.splitlines() if line.strip().startswith("seven_day"))
+    assert "3d 04h" in seven
+    codex = text.split("\ncodex")[1].split("\n\n")[0]
+    assert "not known" in codex  # no reset reported yet
+    assert "No new Task starts on claude" in text
+
+
 def test_window_config_is_validated(config_dir):
     import yaml
     from nightshift.config import ConfigError, load_config
@@ -335,6 +438,13 @@ def test_window_config_is_validated(config_dir):
         {"paths": {"agents_root": "/tmp/x"}, "usage": {"windows": {"claude": {"five_hour": 0}}}}))
     with pytest.raises(ConfigError):
         load_config(config_dir, host=FakeHost())
+    for bad in ({"stop_starting_percent": 120}, {"daytime_reserve": {"start": "8am"}},
+                {"daytime_reserve": {"agents": "claude"}},
+                {"daytime_reserve": {"background_max_percent": 0}}):
+        (config_dir / "config.yaml").write_text(yaml.safe_dump(
+            {"paths": {"agents_root": "/tmp/x"}, "usage": bad}))
+        with pytest.raises(ConfigError):
+            load_config(config_dir, host=FakeHost())
 
 
 def test_events_json_roundtrip_of_fixture_is_valid():
