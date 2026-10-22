@@ -100,6 +100,16 @@ and Telegram asks you to raise the cap: `orch raise-cap 25` raises it for
 this month only, and the Tasks resume. Subscription work is never paused by
 spend.
 
+Paid credits are used only when the subscription can't do the work in time
+(the paid-credit rule): a Task on Gemini while Gemini is out of usage moves to
+`gemini-api` only if it is urgent, or Gemini's next reset falls after the end
+of its Catch-up window (an Occurrence of a `within N hours` Schedule).
+Otherwise it waits for the reset. A Task the rule moved goes back to Gemini
+once Gemini resets, unless it has started again. A Task that failed over to
+Gemini, or has `--agent`, never uses paid credits, and a spend cap holds them
+like any paid call. Each decision is in the Task's `logs/nightshift.log` and
+in section 8 of its report.
+
 `orch usage` lists each agent's Windows with the percent of the Window's
 Baseline used and the time to its next reset. Once a Window has a Baseline
 (learned from real limit hits), no new Task starts on that agent at 80% of it

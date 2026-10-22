@@ -72,8 +72,10 @@ agents:
     # --include-directories, -e, ...) are refused.
     extra_args: []
   # The paid Gemini API path (AI Studio credits, §1.5): the same Gemini CLI,
-  # signed in with an API key instead of the plan. Only runs Tasks given
-  # `--agent gemini-api`. Every model call is recorded as spend and counts
+  # signed in with an API key instead of the plan. Runs Tasks given
+  # `--agent gemini-api`, and Tasks on `gemini` the paid-credit rule moves
+  # here while Gemini is out of usage (only if urgent, or the reset falls
+  # after their Catch-up window). Every model call is recorded as spend and counts
   # toward spend.per_task_usd. The key is a secret: put it in .env or the
   # Keychain under the name below, never here.
   gemini-api:

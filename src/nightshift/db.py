@@ -334,6 +334,27 @@ MIGRATIONS: list[str] = [
     CREATE INDEX spend_events_task ON spend_events(task_id, id);
     CREATE INDEX spend_events_at ON spend_events(at);
     """,
+    # 11: paid-credit decisions (§1.5).
+    """
+    -- One row per decision of the paid-credit rule about a Task whose own
+    -- subscription (agent) is out of usage: use_paid 1 moved it to the paid
+    -- path (to_agent), 0 kept it waiting. rule: a short slug of why
+    -- (urgent, after_window, failed_over, ...). task_changed_at: the Task's
+    -- state_changed_at then; a waiting Task's decision is recorded again
+    -- only when its verdict or rule changes, or the Task changed state.
+    CREATE TABLE paid_credit_decisions (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id    TEXT NOT NULL REFERENCES tasks(id),
+        at         TEXT NOT NULL,
+        agent      TEXT NOT NULL,
+        to_agent   TEXT,
+        use_paid   INTEGER NOT NULL,
+        rule       TEXT NOT NULL,
+        reason     TEXT NOT NULL,
+        task_changed_at TEXT NOT NULL
+    );
+    CREATE INDEX paid_credit_decisions_task ON paid_credit_decisions(task_id, id);
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -792,6 +813,13 @@ class Database:
                 (schedule_name, trigger, fire_at, fires, decided_at, outcome, task_id, detail))
             return int(cur.lastrowid)
 
+    def occurrence_fire_at(self, task_id: str) -> str | None:
+        """The fire time of the Schedule decision that created this Occurrence."""
+        row = self.conn.execute(
+            "SELECT fire_at FROM schedule_runs WHERE task_id = ? AND outcome IN "
+            "('created', 'replaced') ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        return row["fire_at"] if row else None
+
     def schedule_runs(self, name: str | None = None) -> list[sqlite3.Row]:
         if name is None:
             return self.conn.execute("SELECT * FROM schedule_runs ORDER BY id").fetchall()
@@ -842,6 +870,22 @@ class Database:
         return self.conn.execute("SELECT * FROM failovers WHERE task_id = ? ORDER BY id",
                                  (task_id,)).fetchall()
 
+    def record_paid_credit_decision(self, task_id: str, *, at: str, agent: str,
+                                    to_agent: str | None, use_paid: bool, rule: str,
+                                    reason: str, task_changed_at: str) -> int:
+        with self.tx() as c:
+            cur = c.execute(
+                "INSERT INTO paid_credit_decisions (task_id, at, agent, to_agent, use_paid, "
+                "rule, reason, task_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, at, agent, to_agent, int(use_paid), rule, reason, task_changed_at))
+            return int(cur.lastrowid)
+
+    def paid_credit_decisions(self, task_id: str) -> list[sqlite3.Row]:
+        """A Task's paid-credit decisions (§1.5), oldest first."""
+        return self.conn.execute(
+            "SELECT * FROM paid_credit_decisions WHERE task_id = ? ORDER BY id",
+            (task_id,)).fetchall()
+
     # -- Spend (§1.5) -------------------------------------------------------------
     def record_spend(self, task_id: str, *, run_id: int | None, agent: str, model: str | None,
                      at: str, input_tokens: int, cached_tokens: int, output_tokens: int,
@@ -865,6 +909,12 @@ class Database:
         return float(self.conn.execute(
             "SELECT COALESCE(SUM(cost_usd), 0) FROM spend_events WHERE task_id = ?",
             (task_id,)).fetchone()[0])
+
+    def task_spend_by_agent(self, task_id: str) -> dict[str, float]:
+        """Dollars a Task has spent on paid calls, per paid agent."""
+        return {r[0]: float(r[1]) for r in self.conn.execute(
+            "SELECT agent, SUM(cost_usd) FROM spend_events WHERE task_id = ? GROUP BY agent",
+            (task_id,))}
 
     # -- Telegram alerts (§2.12) --------------------------------------------------
     def get_meta(self, key: str) -> str | None:

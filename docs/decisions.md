@@ -1559,3 +1559,56 @@ lasting consequences go in `docs/adr/` instead.
   if the cap still holds. A cap that holds when `run_attempt` starts
   records an Attempt that launched nothing, as the per-Task cap does; the
   daemon's pre-pick pause makes that a race only.
+
+## Phase 2, issue #26: paid-credit rule (subscription first)
+
+- **Which subscription.** A paid path names the subscription it stands in
+  for (`AgentAdapter.subscription`; `gemini-api` → `gemini`). The rule
+  (`nightshift.paid`) only looks at Tasks whose *own* agent is such a
+  subscription; Claude and Codex have no paid path, so their Tasks fail
+  over or wait as before.
+- **"The subscription quota is gone"** means the agent is out of usage:
+  its Window status (`usage.agent_out_until`), a Task paused on its limit,
+  or the Task's own usage pause (a simulated limit counts for that Task
+  only, as for failover). A proactive threshold (80%, daytime reserve) is
+  not "gone": nothing moves to paid credits for it.
+- **"The next reset"** is the latest known end of that outage. With no
+  reset time given it is the next probe: the earliest the agent can be
+  back. So a Task with an unknown reset keeps waiting while the probe time
+  stays inside its Catch-up window, and moves to paid credits once it no
+  longer does. It still starts inside the window.
+- **"The end of the Catch-up window"** exists only for an Occurrence of a
+  `within N hours` Schedule: the fire time of the Schedule decision that
+  created it plus N. `run on next wake`, a removed Schedule and a
+  free-form Task have no window, so for them only urgency (Effective
+  priority, so a deadline within 24 hours counts) qualifies.
+- **Subscription first.** The daemon applies the rule before every pick,
+  after `failover.reassign_held`, so another subscription that isn't out
+  always gets the Task first. A Task that has failed over (any `failovers`
+  row other than the rule's own) never uses paid credits: it waits, like
+  any Task whose agents are all out (SPEC §7, resolved). A Task with
+  `--agent` never moves, as for failover.
+- **Spend caps apply.** The rule doesn't move a Task while a daily or
+  monthly cap holds, once it is at its per-Task cap, or when the paid path
+  has no API key. It waits on its subscription instead of sitting in
+  `paused_spend`, and comes back on whichever happens first: the reset or
+  the cap lifting.
+- **The move** is a failover row (trigger `paid_credit`). A queued Task
+  stays queued; a Task paused on usage is queued at once, and its next
+  Attempt starts a fresh session from `plan.md` + `progress.md`, like any
+  switch of agent. **Back to the subscription:** once the subscription is no
+  longer out, a Task the rule moved goes back (trigger
+  `subscription_reset`) if it is queued or `paused_spend`. A running one
+  finishes on paid credits.
+- **Logged and reported.** Every decision is a `paid_credit_decisions` row
+  (migration 11). A waiting decision is recorded again only when its
+  verdict or rule changes, not on every pick. It is also a line in the
+  Task's `logs/nightshift.log` and in report section 8, under the usage
+  table, which now shows each paid agent's real dollars instead of
+  "$0.00 (subscription)".
+- **Tests** (`tests/test_paid_credits.py`, fake clock and the fake `gemini`
+  CLI): urgent and can-wait Tasks, an Occurrence whose reset falls before
+  or after its window, `run on next wake`, a Task that failed over from
+  Claude to an out Gemini, a limit hit mid-run continuing on paid credits
+  (with the report), the daily cap, no API key, `--agent`, and the move
+  back from queued and `paused_spend`.

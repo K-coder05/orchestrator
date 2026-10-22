@@ -56,9 +56,20 @@ def finalize(cfg: Config, db: Database, row: Mapping[str, Any], state: TaskState
             usage_rows=db.usage_for_task(row["id"]),
             redact=cfg.secrets.redact,
             appendix=_appendix(cfg, row),
-            needs_you=needs_you_extra(cfg, db, row["id"]),
+            **report_extras(cfg, db, row["id"]),
         )
         log_line(folder, f"{iso(at)} {reason}", cfg.secrets.redact)
+
+
+def report_extras(cfg: Config, db: Database, task_id: str) -> dict[str, Any]:
+    """What Nightshift adds to a Task's report from its own records: Needs
+    you entries, and for section 8 the dollars spent per paid agent and the
+    paid-credit decisions (§1.5)."""
+    from . import paid  # paid imports this module
+
+    return {"needs_you": needs_you_extra(cfg, db, task_id),
+            "spent": db.task_spend_by_agent(task_id),
+            "paid_credits": paid.report_lines(db, task_id)}
 
 
 def needs_you_extra(cfg: Config, db: Database, task_id: str) -> list[str]:

@@ -28,7 +28,7 @@ from typing import IO, Any
 
 import nightshift
 
-from . import failover, failures, pauses, schedules, spend, usage
+from . import failover, failures, paid, pauses, schedules, spend, usage
 from .alerts import AlertService
 from .adapters import get_adapter
 from .config import Config
@@ -411,6 +411,10 @@ class QueueRunner:
             # Tasks waiting on an agent that is out move to one that isn't (§2.8).
             for tid, src, dst in failover.reassign_held(self.cfg, self.db, held, self.clock()):
                 self.log(f"Task {tid}: {src} is out of usage; failed over to {dst}")
+        # Then the paid-credit rule (§1.5): a Task whose subscription is out
+        # uses paid credits only if it can't wait for the reset.
+        for d in paid.apply(self.cfg, self.db, self.clock()):
+            self.log(f"Task {d.task_id}: paid-credit rule: {d.verdict.reason}")
         # Proactive thresholds (§1.5) hold back new Tasks only; nothing fails
         # over, since the agent is not out yet.
         thresholds = usage.threshold_holds(self.cfg, self.db, self.clock())

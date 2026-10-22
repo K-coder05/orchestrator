@@ -90,21 +90,17 @@ def available(cfg: Config, db: Database, agents: list[str], now: datetime,
     return [a for a in agents if a != exclude and usage.agent_out_until(cfg, db, a, now) is None]
 
 
-def _switch(cfg: Config, db: Database, row: Mapping[str, Any], to_agent: str, *,
-            to_state: TaskState, trigger: str, deadline_driven: bool, reason: str,
-            at: datetime, run_id: int | None, set_fields: dict[str, Any] | None = None,
-            expect: TaskState | None = None) -> None:
+def switch(cfg: Config, db: Database, row: Mapping[str, Any], to_agent: str, *,
+           to_state: TaskState, trigger: str, deadline_driven: bool, reason: str,
+           at: datetime, run_id: int | None, set_fields: dict[str, Any] | None = None,
+           expect: TaskState | None = None) -> None:
     fields = {"agent": to_agent} | (set_fields or {})
     db.transition(row["id"], to_state, reason, run_id=run_id, expect=expect, set_fields=fields)
     db.record_failover(row["id"], run_id=run_id, at=iso(at), from_agent=row["agent"],
                        to_agent=to_agent, trigger=trigger, deadline_driven=deadline_driven,
                        reason=reason)
-    folder = Path(row["folder"])
-    if (folder / "task.yaml").exists():
-        spec = read_task_yaml(folder)
-        spec.agent = to_agent
-        write_task_yaml(folder, spec)
-    failures.log_line(folder, f"{iso(at)} {reason}", cfg.secrets.redact)
+    _sync_yaml_agent(Path(row["folder"]), to_agent)
+    failures.log_line(Path(row["folder"]), f"{iso(at)} {reason}", cfg.secrets.redact)
 
 
 def _why(row: Mapping[str, Any], to_agent: str, r: Rule) -> str:
@@ -132,10 +128,10 @@ def after_usage_limit(
             fields: dict[str, Any] = {"resume_pending": 1, "pause_requested_at": None}
             if kind == pauses.KIND_SIMULATED:
                 fields["simulated_limit_at"] = iso(at)  # fires once per Task
-            _switch(cfg, db, row, to, to_state=TaskState.QUEUED,
-                    trigger=TRIGGER_SIMULATED if kind == pauses.KIND_SIMULATED else TRIGGER_LIMIT,
-                    deadline_driven=r.deadline_driven, at=at, run_id=run_id, set_fields=fields,
-                    reason=f"{reason}; {_why(row, to, r)}: fresh session on {to} from "
+            switch(cfg, db, row, to, to_state=TaskState.QUEUED,
+                   trigger=TRIGGER_SIMULATED if kind == pauses.KIND_SIMULATED else TRIGGER_LIMIT,
+                   deadline_driven=r.deadline_driven, at=at, run_id=run_id, set_fields=fields,
+                   reason=f"{reason}; {_why(row, to, r)}: fresh session on {to} from "
                            "plan.md + progress.md")
             return TaskState.QUEUED
     pauses.pause_after_attempt(cfg, db, task_id, kind=kind, limit=limit, reason=reason, at=at,
@@ -184,10 +180,10 @@ def agent_on_resume(cfg: Config, db: Database, row: Mapping[str, Any], now: date
 def resume_on(cfg: Config, db: Database, row: Mapping[str, Any], to_agent: str, r: Rule,
               now: datetime, set_fields: dict[str, Any]) -> None:
     """Requeue a paused Task on ``to_agent``, which reset first."""
-    _switch(cfg, db, row, to_agent, to_state=TaskState.QUEUED, trigger=TRIGGER_RESET,
-            deadline_driven=r.deadline_driven, at=now, run_id=None, set_fields=set_fields,
-            expect=TaskState.PAUSED_USAGE,
-            reason=f"usage pause over: {to_agent} has reset while {row['agent']} is still out; "
+    switch(cfg, db, row, to_agent, to_state=TaskState.QUEUED, trigger=TRIGGER_RESET,
+           deadline_driven=r.deadline_driven, at=now, run_id=None, set_fields=set_fields,
+           expect=TaskState.PAUSED_USAGE,
+           reason=f"usage pause over: {to_agent} has reset while {row['agent']} is still out; "
                    f"{_why(row, to_agent, r)}: fresh session on {to_agent} from plan.md + "
                    "progress.md")
 
@@ -205,21 +201,35 @@ def reassign_held(cfg: Config, db: Database, held: Mapping[str, str],
             continue
         free = [a for a in available(cfg, db, r.agents, now, exclude=row["agent"])
                 if a not in held]
-        if not free or not db.set_agent(row["id"], free[0], expect=TaskState.QUEUED):
+        if not free:
             continue
         to = free[0]
         reason = f"{held[row['agent']]}; {_why(row, to, r)} before the Task started"
-        db.record_failover(row["id"], run_id=None, at=iso(now), from_agent=row["agent"],
-                           to_agent=to, trigger=TRIGGER_LIMIT, deadline_driven=r.deadline_driven,
-                           reason=reason)
-        folder = Path(row["folder"])
-        if (folder / "task.yaml").exists():
-            spec = read_task_yaml(folder)
-            spec.agent = to
-            write_task_yaml(folder, spec)
-        failures.log_line(folder, f"{iso(now)} {reason}", cfg.secrets.redact)
-        moved.append((row["id"], row["agent"], to))
+        if move_queued(cfg, db, row, to, trigger=TRIGGER_LIMIT,
+                       deadline_driven=r.deadline_driven, reason=reason, at=now):
+            moved.append((row["id"], row["agent"], to))
     return moved
+
+
+def move_queued(cfg: Config, db: Database, row: Mapping[str, Any], to_agent: str, *,
+                trigger: str, deadline_driven: bool, reason: str, at: datetime) -> bool:
+    """Move a queued Task to ``to_agent`` (it stays queued); False if it left
+    ``queued`` meanwhile."""
+    if not db.set_agent(row["id"], to_agent, expect=TaskState.QUEUED):
+        return False
+    db.record_failover(row["id"], run_id=None, at=iso(at), from_agent=row["agent"],
+                       to_agent=to_agent, trigger=trigger, deadline_driven=deadline_driven,
+                       reason=reason)
+    _sync_yaml_agent(Path(row["folder"]), to_agent)
+    failures.log_line(Path(row["folder"]), f"{iso(at)} {reason}", cfg.secrets.redact)
+    return True
+
+
+def _sync_yaml_agent(folder: Path, agent: str) -> None:
+    if (folder / "task.yaml").exists():
+        spec = read_task_yaml(folder)
+        spec.agent = agent
+        write_task_yaml(folder, spec)
 
 
 def retry_agent(cfg: Config, db: Database, row: Mapping[str, Any], retry_no: int,
@@ -238,9 +248,9 @@ def retry_agent(cfg: Config, db: Database, row: Mapping[str, Any], retry_no: int
 def record_retry_switch(cfg: Config, db: Database, row: Mapping[str, Any], to_agent: str,
                         r: Rule, *, at: datetime, run_id: int | None, reason: str,
                         set_fields: dict[str, Any]) -> None:
-    _switch(cfg, db, row, to_agent, to_state=TaskState.RETRY_WAIT, trigger=TRIGGER_RETRY,
-            deadline_driven=r.deadline_driven, at=at, run_id=run_id, set_fields=set_fields,
-            reason=reason)
+    switch(cfg, db, row, to_agent, to_state=TaskState.RETRY_WAIT, trigger=TRIGGER_RETRY,
+           deadline_driven=r.deadline_driven, at=at, run_id=run_id, set_fields=set_fields,
+           reason=reason)
 
 
 def needs_you_lines(db: Database, task_id: str) -> list[str]:

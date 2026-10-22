@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -116,7 +117,11 @@ def summarize_usage(attempts: list, usage_rows: list) -> list[AgentUsage]:
     return list(by_agent.values())
 
 
-def usage_section(rows: list[AgentUsage]) -> str:
+def usage_section(rows: list[AgentUsage], spent: Mapping[str, float] | None = None,
+                  paid_credits: list[str] | None = None) -> str:
+    """The usage table; ``spent``: dollars per paid agent (§1.5);
+    ``paid_credits``: the paid-credit decisions, listed under it."""
+    spent = spent or {}
     if not rows:
         return "No Attempts were recorded."
     lines = [
@@ -125,13 +130,17 @@ def usage_section(rows: list[AgentUsage]) -> str:
     ]
     for u in rows:
         cost = f"${u.cost_usd:.4f}" if u.cost_reported else "not reported"
+        dollars = (f"${spent[u.agent]:.4f} (paid credits)" if u.agent in spent
+                   else "$0.00 (subscription)")
         lines.append(
             f"| {u.agent} | {u.attempts} | {format_duration(u.seconds)} | {u.input_tokens:,} | "
             f"{u.output_tokens:,} | {u.cache_creation_tokens:,} | {u.cache_read_tokens:,} | "
-            f"{u.requests:,} | {cost} | $0.00 (subscription) |"
+            f"{u.requests:,} | {cost} | {dollars} |"
         )
     total = sum(u.seconds for u in rows)
     lines += ["", f"Total time: {format_duration(total)}."]
+    if paid_credits:
+        lines += ["", "Paid credits (subscription first, §1.5):", *paid_credits]
     return "\n".join(lines)
 
 
@@ -191,11 +200,14 @@ def finalize(
     redact=lambda s: s,
     appendix: str | None = None,
     needs_you: list[str] | None = None,
+    spent: Mapping[str, float] | None = None,
+    paid_credits: list[str] | None = None,
 ) -> str:
     """Rewrite ``report.md`` from the agent's draft plus Nightshift's data.
 
     ``needs_you`` are entries Nightshift itself adds to section 2 (e.g. a
-    deadline-driven failover); they lead the section."""
+    deadline-driven failover); they lead the section. ``spent`` and
+    ``paid_credits`` go to section 8 (:func:`usage_section`)."""
     path = folder / "report.md"
     draft = path.read_text() if path.exists() else ""
     head, sections = parse_sections(draft)
@@ -229,7 +241,7 @@ def finalize(
         if _is_empty(body[i]):
             body[i] = "_(the agent did not fill this in)_"
 
-    body[8] = usage_section(summarize_usage(attempts, usage_rows))
+    body[8] = usage_section(summarize_usage(attempts, usage_rows), spent, paid_credits)
     body[9] = logs_section(folder)
 
     parts = [head, ""]

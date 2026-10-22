@@ -178,6 +178,9 @@ class AgentAdapter(ABC):
     #: A paid path (§1.5): every call it makes is recorded as spend. The
     #: runner sets ``api_key`` from the secret named ``api_key_secret``.
     paid: bool = False
+    #: A paid path's subscription agent: the paid-credit rule moves a Task
+    #: here only when that subscription is out of usage (§1.5).
+    subscription: str | None = None
     api_key_secret: str | None = None
     api_key: str | None = None
 

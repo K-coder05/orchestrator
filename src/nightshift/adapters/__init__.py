@@ -26,6 +26,13 @@ def is_paid(name: str) -> bool:
     return bool(getattr(REGISTRY.get(name), "paid", False))
 
 
+def paid_path(agent: str) -> str | None:
+    """The paid path that stands in for subscription agent ``agent`` (§1.5)."""
+    return next((name for name, f in REGISTRY.items()
+                 if getattr(f, "paid", False) and getattr(f, "subscription", None) == agent),
+                None)
+
+
 def get_adapter(name: str, settings: dict[str, Any] | None = None) -> AgentAdapter:
     try:
         factory = REGISTRY[name]

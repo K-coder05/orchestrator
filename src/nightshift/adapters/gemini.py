@@ -598,6 +598,7 @@ class GeminiApiAdapter(GeminiAdapter):
 
     name = "gemini-api"
     paid = True
+    subscription = "gemini"
     auth_type = "gemini-api-key"
     TELEMETRY_FILE = "gemini-api-calls.json"
 

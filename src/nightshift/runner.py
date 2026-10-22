@@ -709,7 +709,7 @@ def run_attempt(
         usage_rows=db.usage_for_task(task_id),
         redact=redact,
         appendix=templates.report_appendix(cfg, row) if row["template"] else None,
-        needs_you=failures.needs_you_extra(cfg, db, task_id),
+        **failures.report_extras(cfg, db, task_id),
     )
     db.transition(task_id, state, end_reason, run_id=run_id)
     return AttemptResult(run_id=run_id, state=state, session_id=adapter.session_id(), exit_code=exit_code)
