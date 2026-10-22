@@ -90,14 +90,14 @@ class SpendPause:
     reason: str
 
 
-def _local(at: str, now: datetime) -> datetime:
+def local_time(at: str, now: datetime) -> datetime:
     """A ``spend_events.at`` in ``now``'s time zone (a bare date: its midnight)."""
     t = datetime.fromisoformat(at)
     return t.replace(tzinfo=now.tzinfo) if t.tzinfo is None else t.astimezone(now.tzinfo)
 
 
 def _spent_since(db: Database, start: datetime, now: datetime) -> float:
-    return sum(r["cost_usd"] for r in db.spend_events() if _local(r["at"], now) >= start)
+    return sum(r["cost_usd"] for r in db.spend_events() if local_time(r["at"], now) >= start)
 
 
 #: ``meta`` key of a month's raised cap (``orch raise-cap``), + ``YYYY-MM``.

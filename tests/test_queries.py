@@ -295,3 +295,33 @@ def test_task_detail_blocked_is_only_for_queued_tasks(cfg, db):
     tid = create_task(cfg, db, "later", run_at=iso(NOW + timedelta(hours=2))).spec.id
     db.transition(tid, TaskState.RUNNING, "started by hand")
     assert queries.task_detail(cfg, db, tid, NOW).blocked is None
+
+
+# --------------------------------------------------------------------------
+# Spend tracker
+# --------------------------------------------------------------------------
+
+
+def _paid_spend(db, task_id, usd, at):
+    db.record_spend(task_id, run_id=None, agent="gemini-api", model="m", at=at,
+                    input_tokens=0, cached_tokens=0, output_tokens=0, thoughts_tokens=0,
+                    cost_usd=usd, raw=None)
+
+
+def test_spend_tracker_lists_tasks_that_spent_this_month_or_are_still_open(cfg, db):
+    open_old = create_task(cfg, db, "paused since September", agent="gemini-api").spec.id
+    _paid_spend(db, open_old, 0.5, "2026-09-29T10:00:00-07:00")
+    done_old = create_task(cfg, db, "done in September", agent="gemini-api").spec.id
+    _paid_spend(db, done_old, 0.7, "2026-09-29T11:00:00-07:00")
+    db.transition(done_old, TaskState.CANCELLED, "test")
+    recent = create_task(cfg, db, "this month", agent="gemini-api").spec.id
+    _paid_spend(db, recent, 0.25, "2026-10-21T20:00:00-07:00")
+    # Written with another offset: still the latest spend (21:30 local).
+    _paid_spend(db, recent, 0.75, "2026-10-22T04:30:00+00:00")
+
+    t = queries.spend_tracker(cfg, db, NOW)
+
+    assert [x.task_id for x in t.tasks] == [recent, open_old]
+    assert t.tasks[0].spent == 1.0 and t.tasks[0].percent == 50.0 and not t.tasks[0].at_cap
+    assert t.per_task_cap == cfg.per_task_spend_cap
+    assert t.credits.spent_today == 1.0 and t.credits.spent_this_month == 1.0

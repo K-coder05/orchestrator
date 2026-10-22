@@ -562,6 +562,141 @@ def test_schedule_page_is_read_only(cfg):
 
 
 # --------------------------------------------------------------------------
+# Usage meter and spend tracker
+# --------------------------------------------------------------------------
+
+
+def _usage_section(cfg, agent):
+    html = _client(cfg).get("/usage").text
+    start = html.index(f'id="agent-{agent}"')
+    end = html.find('class="agent-block"', start + 1)
+    return html, html[start:end if end != -1 else html.index('id="spend"')]
+
+
+def _window_item(block, window):
+    return next(b for b in block.split('<li class="window">')[1:]
+                if f"<span>{window}</span>" in b)
+
+
+def test_usage_meter_shows_percent_of_baseline_and_a_live_countdown(cfg, db):
+    from datetime import timedelta
+    from nightshift.timeutil import iso
+    from test_usage import _learn_baseline, _spend
+
+    _learn_baseline(cfg, db, "claude", NOW - timedelta(days=1), 10.0)
+    resets = NOW + timedelta(hours=2, minutes=5)
+    db.set_window_status("claude", "five_hour", resets_at=iso(resets), utilization=0.4,
+                         status="allowed", seen_at=iso(NOW))
+    _spend(db, "claude", NOW - timedelta(minutes=20), 6.5)
+
+    html, claude = _usage_section(cfg, "claude")
+
+    five = _window_item(claude, "five hour")
+    assert "65% of Baseline" in five and "$6.50 of $10.00" in five
+    assert 'aria-valuenow="65"' in five and "width: 65.0%" in five
+    assert "resets in" in five and ">2h 05m<" in five  # the server's countdown
+    assert f'data-resets="{int(resets.timestamp() * 1000)}"' in five  # the browser's
+    assert "setTimeout(tick, 1000)" in html  # counted down live
+    assert 'http-equiv="refresh"' in html
+
+
+def test_usage_meter_marks_windows_at_the_stop_threshold(cfg, db):
+    from datetime import timedelta
+    from test_usage import _learn_baseline, _spend
+
+    _learn_baseline(cfg, db, "claude", NOW - timedelta(days=1), 10.0)
+    _spend(db, "claude", NOW - timedelta(minutes=20), 8.5)
+
+    _, claude = _usage_section(cfg, "claude")
+
+    five = _window_item(claude, "five hour")
+    assert "85% of Baseline" in five and "m-warn" in five
+    assert "reset not known" in five
+    assert "No new Task starts on claude" in claude
+
+
+def test_agents_without_a_baseline_say_so_instead_of_a_percentage(cfg, db):
+    from datetime import timedelta
+    from test_usage import _spend
+
+    _spend(db, "claude", NOW - timedelta(minutes=20), 3.0)
+
+    html, claude = _usage_section(cfg, "claude")
+    _, codex = _usage_section(cfg, "codex")
+
+    for block in (claude, codex):
+        assert "No Baseline yet" in block
+        assert "% of Baseline" not in block and 'role="meter"' not in block
+    assert "$3.00 cost-equivalent recorded this period" in _window_item(claude, "five hour")
+    assert "0 Limit observations" in codex
+
+
+def _spent(db, task_id, usd, when):
+    db.record_spend(task_id, run_id=None, agent="gemini-api", model="gemini-3.1-pro",
+                    at=when.isoformat(timespec="seconds"), input_tokens=0, cached_tokens=0,
+                    output_tokens=0, thoughts_tokens=0, cost_usd=usd, raw=None)
+
+
+def test_spend_tracker_shows_today_and_this_month_against_the_caps(cfg, db):
+    la = ZoneInfo("America/Los_Angeles")
+    running = create_task(cfg, db, "Summarize <i>lecture</i> 3", agent="gemini-api",
+                          task_type="summary").spec.id
+    db.transition(running, TaskState.RUNNING, "picked")
+    _spent(db, running, 1.25, datetime(2026, 10, 21, 21, 0, tzinfo=la))
+    earlier = create_task(cfg, db, "Earlier paid Task", agent="gemini-api",
+                          task_type="summary").spec.id
+    _spent(db, earlier, 2.10, datetime(2026, 10, 3, 9, 0, tzinfo=la))
+    db.transition(earlier, TaskState.CANCELLED, "test")
+    old = create_task(cfg, db, "Last month's Task", agent="gemini-api",
+                      task_type="summary").spec.id
+    _spent(db, old, 4.0, datetime(2026, 9, 30, 9, 0, tzinfo=la))
+    db.transition(old, TaskState.CANCELLED, "test")
+
+    html = _client(cfg).get("/usage").text
+
+    section = html[html.index('id="spend"'):]
+    today = section[section.index('id="spend-today"'):section.index('id="spend-month"')]
+    assert "$1.25 of $5.00" in today and 'aria-valuenow="25"' in today
+    month = section[section.index('id="spend-month"'):section.index("Per Task")]
+    assert "$3.35 of $15.00" in month
+    per_task = section[section.index("Per Task"):]
+    assert "cap $2.00 each" in per_task
+    blocks = per_task.split('<li class="task-spend">')[1:]
+    assert [running in blocks[0], earlier in blocks[1]] == [True, True]  # latest first
+    assert "$1.25 of $2.00" in blocks[0] and "at its cap" not in blocks[0]
+    assert "$2.10 of $2.00" in blocks[1] and "at its cap" in blocks[1]
+    assert "m-full" in blocks[1] and "width: 100.0%" in blocks[1]
+    assert old not in per_task  # finished, and spent last month
+    assert "&lt;i&gt;lecture" in per_task and "<i>lecture" not in per_task
+
+
+def test_spend_tracker_shows_the_cap_holding_paid_calls(cfg, db):
+    tid = create_task(cfg, db, "Paid Task", agent="gemini-api", task_type="summary").spec.id
+    _spent(db, tid, 15.0, datetime(2026, 10, 21, 9, 0, tzinfo=ZoneInfo("America/Los_Angeles")))
+
+    section = _client(cfg).get("/usage").text.split('id="spend"')[1]
+
+    assert "Paid calls paused" in section and "monthly spend cap" in section
+
+
+def test_spend_tracker_with_no_spend(cfg):
+    section = _client(cfg).get("/usage").text.split('id="spend"')[1]
+    assert "$0.00 of $5.00" in section and "$0.00 of $15.00" in section
+    assert "No Task has spent anything this month" in section
+
+
+def test_home_links_to_the_usage_page(cfg):
+    assert 'href="/usage"' in _client(cfg).get("/").text
+
+
+def test_usage_page_is_read_only(cfg):
+    client = _client(cfg)
+    assert client.post("/usage").status_code == 405
+    html = client.get("/usage").text
+    assert "<form" not in html and "<button" not in html
+
+
+# --------------------------------------------------------------------------
 # orch dashboard
 # --------------------------------------------------------------------------
 

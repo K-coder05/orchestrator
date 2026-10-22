@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block head %}<meta http-equiv="refresh" content="60">{% endblock %}
+{% block title %}Usage · Nightshift{% endblock %}
+{% macro meter(percent, warn, full) -%}
+<div class="meter {% if percent >= full %}m-full{% elif percent >= warn %}m-warn{% else %}m-ok{% endif %}" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ '%.0f'|format(percent) }}"><span style="width: {{ '%.1f'|format([percent, 100]|min) }}%"></span></div>
+{%- endmacro %}
+{% block style %}
+  nav { font-size: 14px; margin-bottom: 10px; }
+  section { margin-top: 18px; }
+  .group { display: flex; align-items: baseline; gap: 8px; border-bottom: 1px solid var(--line);
+           padding-bottom: 4px; }
+  h2 { font-size: 15px; margin: 0; }
+  .count { color: var(--muted); font-size: 13px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { background: var(--panel); border-radius: 8px; padding: 10px 12px; margin-top: 8px;
+       border-left: 3px solid var(--accent, var(--queued)); }
+  .title { overflow-wrap: anywhere; display: flex; justify-content: space-between; gap: 10px; }
+  .title a { color: inherit; text-decoration: none; }
+  .when { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px;
+          display: flex; flex-wrap: wrap; gap: 4px 10px; }
+  .meter { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 6px; }
+  .meter span { display: block; height: 100%; background: var(--accent); }
+  .m-ok { --accent: var(--running); } .m-warn { --accent: var(--paused); } .m-full { --accent: var(--failed); }
+  .spend .m-ok { --accent: var(--done); }
+  .agent > li { --accent: var(--running); }
+  .nobase { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .out, .held { color: var(--needs); font-size: 13px; margin-top: 4px; }
+  .note, .empty { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  .countdown { font-variant-numeric: tabular-nums; }
+{% endblock %}
+{% block body %}
+  <nav><a href="/">&larr; Nightshift</a></nav>
+  <header>
+    <h1>Usage</h1>
+    <span class="asof">{{ now.strftime("%a %b %-d, %H:%M") }}</span>
+  </header>
+
+  <section id="usage">
+    <div class="group"><h2>Usage meter</h2><span class="count">stop starting at {{ "%.0f"|format(stop_percent) }}%</span></div>
+    {% for a in agents %}
+    <div class="agent-block" id="agent-{{ a.agent }}">
+      <h3 class="count">{{ a.agent }}</h3>
+      <ul class="agent">
+        {% for w in a.windows %}
+        <li class="window">
+          <div class="title">
+            <span>{{ w.window|replace('_', ' ') }}</span>
+            <span class="when">{% if w.resets_at %}resets in <span class="countdown" data-resets="{{ w.resets_at|epoch_ms }}">{{ w.resets_in|countdown }}</span>{% else %}reset not known{% endif %}</span>
+          </div>
+          {% if w.baseline and w.percent_of_baseline is not none %}
+          {{ meter(w.percent_of_baseline, stop_percent, 100) }}
+          <div class="meta">
+            <span class="pct">{{ "%.0f"|format(w.percent_of_baseline) }}% of Baseline</span>
+            <span>{{ (w.used.cost_usd or 0)|usd }} of {{ w.baseline.cost_usd|usd }} cost-equivalent</span>
+            <span>Baseline: lowest of last {{ w.baseline.observations }}</span>
+          </div>
+          {% else %}
+          <div class="nobase">No Baseline yet ({{ w.observation_count }} Limit observation{{ '' if w.observation_count == 1 else 's' }}), so no percentage: only an actual limit error pauses {{ a.agent }}.{% if w.used.cost_usd %} {{ w.used.cost_usd|usd }} cost-equivalent recorded this period{% if w.used.events_without_cost %}, plus {{ w.used.events_without_cost }} usage row{{ '' if w.used.events_without_cost == 1 else 's' }} without cost{% endif %}.{% endif %}</div>
+          {% endif %}
+          {% if w.out_of_usage %}<div class="out">Out of usage until the reset</div>{% endif %}
+        </li>
+        {% else %}
+        <li class="nobase">No usage Windows configured</li>
+        {% endfor %}
+      </ul>
+      {% if a.held %}<div class="held">No new Task starts on {{ a.agent }}: {{ a.held }}</div>
+      {% elif a.held_background %}<div class="held">No new background Task starts on {{ a.agent }}: {{ a.held_background }}</div>{% endif %}
+    </div>
+    {% else %}
+    <p class="empty">No agents configured</p>
+    {% endfor %}
+    <p class="note">Baselines count only Nightshift's own usage, not interactive use, so they err low.</p>
+  </section>
+
+  {% set c = spend.credits %}
+  <section id="spend" class="spend">
+    <div class="group"><h2>Spend</h2><span class="count">paid Gemini API calls</span></div>
+    <ul>
+      <li class="cap" id="spend-today">
+        <div class="title"><span>Today</span><span class="when">{{ c.spent_today|usd }} of {{ c.day_cap|usd }}</span></div>
+        {{ meter((c.spent_today / c.day_cap * 100) if c.day_cap else 100, 80, 100) }}
+      </li>
+      <li class="cap" id="spend-month">
+        <div class="title"><span>This month</span><span class="when">{{ c.spent_this_month|usd }} of {{ c.month_cap|usd }}</span></div>
+        {{ meter((c.spent_this_month / c.month_cap * 100) if c.month_cap else 100, 80, 100) }}
+      </li>
+    </ul>
+    {% if c.pause %}<div class="held">Paid calls paused: {{ c.pause.reason }}</div>{% endif %}
+    <div class="meta">
+      <span>{{ c.remaining|usd }} credit left of {{ c.balance|usd }}{% if c.balance_as_of %} (as of {{ c.balance_as_of }}){% endif %}</span>
+      {% if c.expiry %}<span>{{ 'expired' if c.expired else 'expires' }} {{ c.expiry }}</span>{% endif %}
+    </div>
+
+    <div class="group" style="margin-top: 14px"><h2>Per Task</h2><span class="count">cap {{ spend.per_task_cap|usd }} each</span></div>
+    {% if spend.tasks %}
+    <ul>
+      {% for t in spend.tasks %}
+      <li class="task-spend">
+        <div class="title"><a href="/tasks/{{ t.task_id }}/report">{{ t.title }}</a><span class="when">{{ t.spent|usd }} of {{ spend.per_task_cap|usd }}</span></div>
+        {{ meter(t.percent, 80, 100) }}
+        <div class="meta"><code>{{ t.task_id }}</code><span>{{ t.state|replace('_', ' ') }}</span>{% if t.at_cap %}<span class="held">at its cap</span>{% endif %}</div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No Task has spent anything this month</p>
+    {% endif %}
+  </section>
+<script>
+(() => {
+  // Counts each reset down in the browser; the page reloads every minute
+  // for fresh numbers, and as soon as a reset passes.
+  const fmt = (ms) => {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600);
+    const m = Math.floor(s % 3600 / 60), sec = s % 60;
+    const p = (n) => String(n).padStart(2, "0");
+    if (d) return d + "d " + p(h) + "h";
+    if (h) return h + "h " + p(m) + "m " + p(sec) + "s";
+    return m + "m " + p(sec) + "s";
+  };
+  const els = document.querySelectorAll(".countdown[data-resets]");
+  // Only a reset that passes while the page is open reloads it.
+  const ahead = new Set([...els].filter((el) => Number(el.dataset.resets) > Date.now()));
+  const tick = () => {
+    const now = Date.now();
+    let passed = false;
+    els.forEach((el) => {
+      const left = Number(el.dataset.resets) - now;
+      if (left <= 0 && ahead.has(el)) passed = true;
+      el.textContent = left <= 0 ? "now" : fmt(left);
+    });
+    if (passed) setTimeout(() => location.reload(), 5000);
+    else setTimeout(tick, 1000);
+  };
+  if (els.length) tick();
+})();
+</script>
+{% endblock %}

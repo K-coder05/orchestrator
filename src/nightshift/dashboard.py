@@ -9,8 +9,10 @@ every `orch` command does) may still migrate it.
 Routes: ``/`` (the "needs you" inbox, then Tasks grouped by status),
 ``/tasks/<id>/report`` (the Task's ``report.md`` rendered as Markdown),
 ``/live`` (a live tail of the running Task's logs, streamed from
-``/live/events`` as server-sent events) and ``/schedules`` (tonight's queue
-preview, then the Schedule list).
+``/live/events`` as server-sent events), ``/schedules`` (tonight's queue
+preview, then the Schedule list) and ``/usage`` (the usage meter per agent
+and Window, with live reset countdowns, and the spend tracker against the
+caps).
 """
 
 from __future__ import annotations
@@ -154,12 +156,19 @@ def _minutes(value: float) -> str:
     return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m} min"
 
 
+def _epoch_ms(value: datetime) -> int:
+    """For the page's script, which counts down to it in the browser."""
+    return int(value.timestamp() * 1000)
+
+
 def _environment() -> Environment:
     env = Environment(loader=FileSystemLoader(TEMPLATES), autoescape=select_autoescape())
     env.filters["short_time"] = _short_time
     env.filters["clock"] = _clock_time
     env.filters["usd"] = _usd
     env.filters["minutes"] = _minutes
+    env.filters["countdown"] = views.countdown
+    env.filters["epoch_ms"] = _epoch_ms
     return env
 
 
@@ -302,6 +311,19 @@ def create_app(
             db.close()
         return env.get_template("schedules.html").render(
             preview=preview, schedules=items, now=at, tz=cfg.timezone)
+
+    @app.get("/usage", response_class=HTMLResponse)
+    def usage_page() -> str:
+        at = now()
+        db = Database(cfg.db_path, tz=cfg.timezone)
+        try:
+            agents = queries.usage_report(cfg, db, at)
+            tracker = queries.spend_tracker(cfg, db, at)
+        finally:
+            db.close()
+        return env.get_template("usage.html").render(
+            agents=agents, spend=tracker, now=at,
+            stop_percent=float(cfg.usage("stop_starting_percent")))
 
     @app.get("/tasks/{task_id}/report", response_class=HTMLResponse)
     def report(task_id: str) -> str:

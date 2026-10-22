@@ -1,4 +1,5 @@
-"""Read-only queries behind `orch list|show|usage` and `orch schedule list`.
+"""Read-only queries behind `orch list|show|usage` and `orch schedule list`,
+and the dashboard's own views (inbox, status groups, spend tracker).
 
 Each returns plain data; ``views`` renders it as text for the CLI, and the
 dashboard can render the same data its own way.
@@ -434,6 +435,65 @@ def usage_report(cfg: Config, db: Database, now: datetime) -> list[AgentUsage]:
             held_background=holds.background.get(agent),
         ))
     return out
+
+
+# --------------------------------------------------------------------------
+# Spend
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TaskSpend:
+    """A Task's paid spend against the per-Task cap."""
+
+    task_id: str
+    title: str
+    state: str
+    spent: float
+    #: ``spent`` as a percent of the per-Task cap.
+    percent: float
+    at_cap: bool
+    last_spent_at: str
+
+
+@dataclass(frozen=True)
+class SpendTracker:
+    """Paid spend against the caps (§1.5): today and this month (in
+    ``credits``, with the cap holding paid calls now, if any) and per Task."""
+
+    credits: spend.CreditView
+    per_task_cap: float
+    #: Tasks that spent this month or are not finished, latest spend first.
+    tasks: list[TaskSpend]
+
+
+def _percent(spent: float, cap: float) -> float:
+    return spent / cap * 100 if cap > 0 else 100.0
+
+
+def spend_tracker(cfg: Config, db: Database, now: datetime) -> SpendTracker:
+    cap = cfg.per_task_spend_cap
+    month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    totals: dict[str, float] = {}
+    last: dict[str, str] = {}
+    for r in db.spend_events():
+        tid = r["task_id"]
+        totals[tid] = totals.get(tid, 0.0) + r["cost_usd"]
+        if tid not in last or spend.local_time(r["at"], now) > spend.local_time(last[tid], now):
+            last[tid] = r["at"]
+    tasks = []
+    for tid, spent in totals.items():
+        row = db.get_task(tid)
+        if row is None:
+            continue
+        recent = spend.local_time(last[tid], now) >= month
+        if not recent and TaskState(row["state"]) in TERMINAL:
+            continue
+        tasks.append(TaskSpend(task_id=tid, title=row["title"], state=row["state"],
+                               spent=spent, percent=_percent(spent, cap),
+                               at_cap=spent >= cap, last_spent_at=last[tid]))
+    tasks.sort(key=lambda t: spend.local_time(t.last_spent_at, now), reverse=True)
+    return SpendTracker(credits=spend.credits(cfg, db, now), per_task_cap=cap, tasks=tasks)
 
 
 # --------------------------------------------------------------------------

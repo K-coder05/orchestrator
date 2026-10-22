@@ -47,7 +47,13 @@ running." when it's idle. **Schedules** (`/schedules`) previews tonight's
 queue (what should run between midnight and 7am, in queue order, each with
 a rough usage estimate from its `estimated_minutes` and past cost per
 minute, totalled per agent against its Baseline), then lists each Schedule
-with its timing, enabled state, last run and next fire. Open
+with its timing, enabled state, last run and next fire. **Usage**
+(`/usage`) is the usage meter: each agent's Windows, as a percent of the
+Window's Baseline with a countdown to its reset that ticks live in the
+browser (a Window with no Baseline yet says so rather than guess a
+percentage), then the spend tracker: today against the $5 daily cap, this
+month against the $15 monthly cap (or what `orch raise-cap` raised it to),
+and each Task's paid spend against its $2 cap. Open
 `http://127.0.0.1:8765/` on the Mac, or the Mac's Tailscale address (or its
 full `*.ts.net` MagicDNS name) on your phone. It never listens on the LAN or
 a public address: with Tailscale not connected it refuses to start, and

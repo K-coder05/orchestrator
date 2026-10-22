@@ -321,7 +321,7 @@ def format_credits(c: spend.CreditView, per_task_cap: float) -> list[str]:
     return out + [""]
 
 
-def _countdown(left: timedelta) -> str:
+def countdown(left: timedelta) -> str:
     """Time to a reset: ``3d 04h``, ``2h 05m`` or ``12m``."""
     minutes = max(0, int(left.total_seconds() // 60))
     days, rest = divmod(minutes, 24 * 60)
@@ -354,7 +354,7 @@ def format_usage(report: list[queries.AgentUsage], tz: str,
             cost = ("$0.0000" if used.events == 0 else _cost(used.cost_usd)) + (f" +{used.events_without_cost} w/o cost"
                                            if used.events_without_cost else "")
             pct = "-" if w.percent_of_baseline is None else f"{w.percent_of_baseline:.0f}%"
-            resets = "not known" if w.resets_in is None else _countdown(w.resets_in)
+            resets = "not known" if w.resets_in is None else countdown(w.resets_in)
             rows.append([w.window, period, cost, f"{used.input_tokens:,}", f"{used.output_tokens:,}",
                          f"{used.cache_creation_tokens:,}", f"{used.cache_read_tokens:,}",
                          f"{used.requests:,}", said, base_cell, pct, resets])

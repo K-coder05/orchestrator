@@ -1758,3 +1758,38 @@ lasting consequences go in `docs/adr/` instead.
   against the Baseline) and through TestClient the Schedule list, the
   preview's order, times and estimate, escaping and read-only
   (`tests/test_dashboard.py`).
+
+## Phase 2, issue #31: dashboard usage meter and spend tracker
+
+- **One page, `/usage`, linked from the home page header:** the usage
+  meter, then the spend tracker. It reloads every 60 s for fresh numbers.
+- **The meter is `orch usage`'s data** (`queries.usage_report`): one entry
+  per agent and Window with the cost-equivalent recorded in the Window's
+  current period as a percent of its Baseline, a bar coloured by the
+  proactive thresholds (at `usage.stop_starting_percent` amber, at the
+  Baseline red) and the hold line (`No new Task starts on ...`) when one
+  applies. Paid paths have no Windows, as in `orch usage`.
+- **No Baseline, no percentage.** A Window without a Baseline (every Codex
+  and Gemini Window, since they report no cost) shows no bar or percent: it
+  says "No Baseline yet", how many Limit observations exist, that only an
+  actual limit error pauses the agent, and the cost-equivalent recorded so
+  far if any was reported.
+- **Live countdown.** The server renders the countdown (`views.countdown`,
+  shared with `orch usage`) and the reset as epoch milliseconds; a dozen
+  lines of inline script tick it every second (`2h 05m 07s`) and reload the
+  page shortly after a reset passes while it is open. A reset that isn't
+  known says "reset not known", as in `orch usage`. No script from a CDN.
+- **The spend tracker** (`queries.spend_tracker`): today against
+  `spend.per_day_usd` and this month against this month's cap
+  (`spend.month_cap`, so an `orch raise-cap` shows), from `spend.credits`,
+  with the cap holding paid calls now, if any, and the credit left. Per
+  Task: every Task that spent this month or isn't finished, latest spend
+  first, against `spend.per_task_usd`, marked "at its cap" once reached.
+  Days and months are local (America/Los_Angeles), as for the caps
+  themselves (`spend.local_time`, made public for this).
+- **Tests:** the query (which Tasks are listed, order across UTC offsets,
+  totals) in `tests/test_queries.py`; through TestClient the percent, bar,
+  server countdown and reset timestamp, the threshold colour and hold, no
+  percentage without a Baseline (Claude and Codex), today/month/per-Task
+  against the caps, a cap pause, no spend, escaping and read-only
+  (`tests/test_dashboard.py`).
