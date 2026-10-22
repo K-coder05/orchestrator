@@ -127,6 +127,25 @@ class Usage:
         return self.__dict__.copy()
 
 
+@dataclass(frozen=True)
+class PaidCall:
+    """One model call on a paid path (§1.5), with the token counts the API
+    reported; Nightshift prices it (``nightshift.spend``)."""
+
+    model: str | None
+    prompt_tokens: int  # the whole prompt, cached part included
+    cached_tokens: int
+    output_tokens: int  # candidates, thinking not included
+    thoughts_tokens: int
+    tool_prompt_tokens: int = 0
+    raw: dict[str, Any] | None = None
+
+    @property
+    def uncached_tokens(self) -> int:
+        """Tokens billed at the input price: the uncached prompt plus tool-use prompts."""
+        return max(self.prompt_tokens - self.cached_tokens, 0) + self.tool_prompt_tokens
+
+
 @dataclass
 class PlanningReply:
     """What a planning call returned (§2.4): no tools, one answer, no session."""
@@ -156,6 +175,11 @@ class ProbeReply:
 
 class AgentAdapter(ABC):
     name: str
+    #: A paid path (§1.5): every call it makes is recorded as spend. The
+    #: runner sets ``api_key`` from the secret named ``api_key_secret``.
+    paid: bool = False
+    api_key_secret: str | None = None
+    api_key: str | None = None
 
     @abstractmethod
     def build_command(
@@ -217,6 +241,10 @@ class AgentAdapter(ABC):
     @abstractmethod
     def parse_probe_output(self, stdout: str, exit_code: int) -> ProbeReply:
         """Turn a probe's output into a ``ProbeReply``."""
+
+    def paid_calls(self) -> list[PaidCall]:
+        """Paid model calls made since the last call (paid paths only)."""
+        return []
 
     def window_info(self, event: Event) -> list[WindowInfo]:
         """Usage-Window status carried by ``event`` (none by default)."""

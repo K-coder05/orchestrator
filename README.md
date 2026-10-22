@@ -77,6 +77,12 @@ a Task finishes (its one-line Result), fails, or needs you; usage pauses stay
 silent, and comedy Tasks get status lines only. It only long-polls the Bot
 API, so no port is opened, and it ignores (and logs) messages from anyone else.
 
+`--agent gemini-api` runs a Task on paid AI Studio credits (the Gemini CLI
+with the API key from `.env` or the Keychain as `GEMINI_API_KEY`). Every model
+call is priced (`spend.gemini_api_prices`) and recorded; a Task that reaches
+$2 (`spend.per_task_usd`) is stopped and moved to `needs_you`. `orch usage`
+shows the spend so far and the credit left (`plans.gemini.api_credit_*`).
+
 A Schedule creates pre-approved Occurrences of a template on a cron-style
 rule (local time), each an ordinary Task in
 `~/agents/recurring/<name>/YYYY-MM-DD/`. Fires missed while the Mac slept (or

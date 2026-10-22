@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 from . import priority, schedules, usage
+from .adapters import is_paid
 from .config import Config
 from .db import Database
 from .states import TERMINAL, TaskState
@@ -227,9 +228,10 @@ class AgentUsage:
 
 
 def usage_agents(cfg: Config, db: Database) -> list[str]:
-    """Configured agents first, then any other agent with recorded usage."""
-    names = list((cfg.data.get("agents") or {}).keys())
-    return names + sorted(a for a in db.usage_agents() if a not in names)
+    """Configured agents first, then any other agent with recorded usage.
+    Paid paths have no usage Windows: their spend is shown as credits."""
+    names = [a for a in (cfg.data.get("agents") or {}) if not is_paid(a)]
+    return names + sorted(a for a in db.usage_agents() if a not in names and not is_paid(a))
 
 
 def _window(cfg: Config, db: Database, agent: str, w: str, status: sqlite3.Row | None,

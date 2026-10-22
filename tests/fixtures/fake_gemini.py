@@ -10,7 +10,9 @@ FAKE_GEMINI_LIMIT=1 (a quota hit at the start; once per Task folder with
 FAKE_GEMINI_LIMIT_ONCE), FAKE_GEMINI_LIMIT_TEXT, FAKE_GEMINI_EXIT=<n> (a
 failed run), FAKE_GEMINI_RESUME_FAIL, FAKE_GEMINI_STEP_DELAY, FAKE_GEMINI_PROBE
 ok|limit|error, FAKE_GEMINI_PLAN (JSON answer of a planning call),
-FAKE_GEMINI_RESULT (the result word in report.md).
+FAKE_GEMINI_RESULT (the result word in report.md). On the paid path (an
+API key) every model call is also written to the telemetry file:
+FAKE_GEMINI_CALL_TOKENS (JSON usage of each call), FAKE_GEMINI_CALL_MODEL.
 """
 import json
 import os
@@ -80,11 +82,48 @@ if os.environ.get("FAKE_GEMINI_LIMIT") and not (
 seen = {n: Path(n).read_text() if Path(n).exists() else None for n in ("plan.md", "progress.md")}
 Path("logs/fake_gemini_saw.json").write_text(json.dumps(seen))
 
+CALL_TOKENS = {"promptTokenCount": 24100, "cachedContentTokenCount": 18000,
+               "candidatesTokenCount": 410, "thoughtsTokenCount": 0, "toolUsePromptTokenCount": 0}
+
+
+def api_call():
+    """One model API call as the CLI's local telemetry file shows it
+    (FileLogExporter: pretty-printed JSON, other records in between). Only
+    with GEMINI_TELEMETRY_OUTFILE set, which Nightshift does on the paid path."""
+    outfile = os.environ.get("GEMINI_TELEMETRY_OUTFILE")
+    if not outfile:
+        return
+    u = CALL_TOKENS | json.loads(os.environ.get("FAKE_GEMINI_CALL_TOKENS") or "{}")
+    total = u["promptTokenCount"] + u["candidatesTokenCount"] + u["thoughtsTokenCount"]
+    record = {"hrTime": [1761120000, 0], "resource": {"attributes": {"service.name": "gemini-cli"}},
+              "attributes": {
+                  "session.id": SID, "event.name": "gemini_cli.api_response",
+                  "event.timestamp": "2026-10-22T08:00:02.000Z",
+                  "model": os.environ.get("FAKE_GEMINI_CALL_MODEL", "gemini-3.1-pro"),
+                  "duration_ms": 1200,
+                  "input_token_count": u["promptTokenCount"],
+                  "output_token_count": u["candidatesTokenCount"],
+                  "cached_content_token_count": u["cachedContentTokenCount"],
+                  "thoughts_token_count": u["thoughtsTokenCount"],
+                  "tool_token_count": u["toolUsePromptTokenCount"],
+                  "total_token_count": total, "prompt_id": "p1",
+                  "auth_type": "gemini-api-key",
+                  "status_code": 200, "finish_reasons": ["STOP"]},
+              "_body": "API response from gemini-3.1-pro. Status: 200."}
+    request = {"hrTime": [1761120000, 0], "attributes": {
+        "event.name": "gemini_cli.api_request", "model": "gemini-3.1-pro"}}
+    with open(outfile, "a") as f:
+        f.write(json.dumps(request, indent=2) + "\n" + json.dumps(record, indent=2) + "\n")
+
+
 delay = float(os.environ.get("FAKE_GEMINI_STEP_DELAY") or 0)
 exit_code = int(os.environ.get("FAKE_GEMINI_EXIT") or 0)
 lines = (Path(__file__).parent / "gemini_stream.jsonl").read_text().splitlines()
 for line in lines[:-1]:  # the result line is written below
-    emit(json.loads(line))
+    msg = json.loads(line)
+    if msg["type"] == "tool_use" or (msg["type"] == "message" and msg["role"] == "user"):
+        api_call()  # the model call that asked for this tool / the first answer
+    emit(msg)
     if delay:
         time.sleep(delay)
 

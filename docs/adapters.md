@@ -783,7 +783,45 @@ go in the prompt and the answer is the reply text parsed as JSON (a ```json
 fence is stripped). The probe sends "Answer with the single word OK." /
 "OK?" on the Task model.
 
+### The paid API path (`gemini-api`, AI Studio credits)
+
+`GeminiApiAdapter`: the same invocation, settings and policy as above, plus
+
+```
+# settings: security.auth.selectedType = "gemini-api-key"   (plan path: "oauth-personal")
+# env:      GEMINI_API_KEY=<secret agents.gemini-api.api_key_secret>  GOOGLE_API_KEY=""
+#           GEMINI_TELEMETRY_ENABLED=true  GEMINI_TELEMETRY_TARGET=local
+#           GEMINI_TELEMETRY_OUTFILE=<settings dir>/gemini-api-calls.json
+#           GEMINI_TELEMETRY_LOG_PROMPTS=false  GEMINI_TELEMETRY_USE_COLLECTOR=false
+```
+
+- **Auth** *(source)*: `validateNonInteractiveAuth` uses the configured
+  `security.auth.selectedType` first, else the env (`getAuthTypeFromEnv`:
+  `GEMINI_API_KEY` -> `gemini-api-key`). With both `GOOGLE_API_KEY` and
+  `GEMINI_API_KEY` set the CLI uses `GOOGLE_API_KEY`, so it is blanked.
+  The plan path blanks both and pins `oauth-personal`.
+- **Per-call usage** *(source)*: 0.65.0 has no telemetry flags; settings
+  `telemetry.*` lose to the `GEMINI_TELEMETRY_*` env. With an outfile the
+  file exporters write (append) each span, log record and metric batch as
+  `JSON.stringify(x, null, 2)` + newline; logs go through a
+  `BatchLogRecordProcessor` (5 s delay) and are flushed at shutdown. Each
+  model call is a log record whose `attributes` hold `event.name:
+  "gemini_cli.api_response"`, `model`, `input_token_count`
+  (promptTokenCount, cached included), `output_token_count`
+  (candidatesTokenCount), `cached_content_token_count`,
+  `thoughts_token_count`, `tool_token_count`, `total_token_count`,
+  `auth_type`, `status_code`. Every call counts, including the CLI's own
+  utility calls (loop detection, next-speaker checks).
+- **Pricing** is Nightshift's (`spend.gemini_api_prices`), see
+  docs/decisions.md (#20).
+- **No planning calls, no probes**; `detect_rate_limit` is always None (a
+  quota or credit error is a Failed Attempt).
+
 ### Still to verify (needs the CLI installed and signed in)
+
+Paid path (`gemini-api`): that the key signs in headless, that the
+telemetry file gets one `api_response` record per call with the counts
+above, and that the recorded costs match AI Studio's billing.
 
 `tests/test_gemini_real.py` (opt-in: `NIGHTSHIFT_REAL_AGENT=1 .venv/bin/python
 -m pytest tests/test_gemini_real.py`, model from `NIGHTSHIFT_GEMINI_MODEL`)

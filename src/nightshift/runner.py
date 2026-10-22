@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from . import failover, failures, pauses, report, templates, usage
+from . import failover, failures, pauses, report, spend, templates, usage
 from .adapters import get_adapter
 from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
 from .config import Config
@@ -143,6 +143,7 @@ STOP_CANCEL = "cancel"  # orch cancel: the Task is cancelled
 STOP_RUNTIME_CAP = "runtime_cap"  # max runtime hit: a Failed Attempt
 STOP_USAGE_LIMIT = "usage_limit"  # a (possibly simulated) rate limit: the Task pauses
 STOP_PAUSE = "pause"  # orch pause: the Task pauses until orch resume
+STOP_SPEND_CAP = "spend_cap"  # the Task reached its per-Task spend cap: needs you
 
 #: Seconds between SIGTERM and SIGKILL when an agent ignores a stop.
 KILL_GRACE_SECONDS = 15.0
@@ -271,6 +272,48 @@ class _Watchdog(threading.Thread):
                 conn.close()
 
 
+class _SpendWatcher(threading.Thread):
+    """Records the paid calls of a running Attempt as spend (one
+    ``spend_events`` row each) and stops the Attempt as soon as its Task
+    reaches the per-Task cap (§1.5). Has its own DB connection (SQLite
+    connections stay in their thread). Once ``done`` is set it collects the
+    calls written at the agent's exit, then ends."""
+
+    def __init__(self, cfg: Config, adapter: AgentAdapter, control: AttemptControl, *,
+                 db_path: Path, task_id: str, run_id: int, clock: Callable[[], datetime],
+                 interval: float = 0.5):
+        super().__init__(daemon=True)
+        self.cfg, self.adapter, self.control = cfg, adapter, control
+        self.db_path, self.task_id, self.run_id, self.clock = db_path, task_id, run_id, clock
+        self.interval = interval
+        self.done = threading.Event()
+        self.error: str | None = None
+
+    def run(self) -> None:
+        db = Database(self.db_path, tz=self.cfg.timezone)
+        try:
+            while True:
+                finished = self.done.is_set()
+                self._collect(db, may_stop=not finished)
+                if finished:
+                    return
+                self.done.wait(self.interval)
+        except Exception as exc:  # spend must never be lost silently
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.control.request_stop(STOP_SPEND_CAP)
+        finally:
+            db.close()
+
+    def _collect(self, db: Database, *, may_stop: bool) -> None:
+        for call in self.adapter.paid_calls():
+            spend.record(self.cfg, db, self.task_id, call, run_id=self.run_id,
+                         agent=self.adapter.name, at=iso(self.clock()))
+        # After the agent exited the calls are only recorded: an Attempt
+        # that finished on its own is not turned into a stop.
+        if may_stop and spend.cap_reached(self.cfg, db, self.task_id):
+            self.control.request_stop(STOP_SPEND_CAP)
+
+
 @dataclass
 class AttemptResult:
     run_id: int
@@ -328,6 +371,10 @@ def run_attempt(
     adapter = adapter_provider(agent_name, cfg.agent(agent_name))
     if hasattr(adapter, "clock"):
         adapter.clock = clock  # reset times given as a clock time ("resets 3pm")
+    paid = adapter.paid
+    if paid and adapter.api_key_secret:
+        # A paid path's API key (§1.5); loading it registers it for redaction.
+        adapter.api_key = cfg.secrets.require(adapter.api_key_secret)
 
     # A fresh policy every Attempt, so config changes apply and nothing the
     # agent did to an earlier one carries over.
@@ -400,19 +447,22 @@ def run_attempt(
     errors: list[str] = []
     interrupted = False
     session_recorded = False
-    try:
-        proc = subprocess.Popen(
-            command.argv,
-            cwd=folder,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-    except OSError as exc:
-        proc = None
-        errors.append(f"could not start {command.argv[0]}: {exc}")
+    # A Task already at its spend cap makes no paid call at all.
+    at_cap = paid and spend.cap_reached(cfg, db, task_id)
+    proc: subprocess.Popen | None = None
+    if not at_cap:
+        try:
+            proc = subprocess.Popen(
+                command.argv,
+                cwd=folder,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        except OSError as exc:
+            errors.append(f"could not start {command.argv[0]}: {exc}")
 
     watchdog: _Watchdog | None = None
     if proc is not None:
@@ -423,6 +473,11 @@ def run_attempt(
             failures.runtime_cap_seconds(cfg, row))
         watchdog = _Watchdog(control, proc, cap_seconds=cap, db_path=db.path, task_id=task_id)
         watchdog.start()
+    spend_watcher: _SpendWatcher | None = None
+    if paid and proc is not None:
+        spend_watcher = _SpendWatcher(cfg, adapter, control, db_path=db.path, task_id=task_id,
+                                      run_id=run_id, clock=clock)
+        spend_watcher.start()
 
     if proc is not None:
         stderr_chunks: list[str] = []
@@ -482,6 +537,9 @@ def run_attempt(
         if watchdog is not None:
             watchdog.done.set()
             watchdog.join(timeout=5)
+        if spend_watcher is not None:
+            spend_watcher.done.set()
+            spend_watcher.join(timeout=30)
         stderr_log.write_text(redact("".join(stderr_chunks)))
         if stderr_chunks and exit_code:
             errors.append(redact("".join(stderr_chunks)).strip()[-500:])
@@ -512,7 +570,8 @@ def run_attempt(
     # A limit or pause that came up ends the Attempt as a pause, unless the
     # agent finished cleanly on its own before it could be stopped.
     finished_alone = stop is None and exit_code == 0 and ok is not False
-    if control.pending is not None and stop != STOP_CANCEL and not interrupted and not finished_alone:
+    if (control.pending is not None and stop not in (STOP_CANCEL, STOP_SPEND_CAP)
+            and not interrupted and not finished_alone):
         _reason, kind, limit = control.pending
         step_note = f"after {steps} Step{'s' if steps != 1 else ''}"
         if kind == pauses.KIND_SIMULATED:
@@ -562,6 +621,12 @@ def run_attempt(
     if stop == STOP_CANCEL:
         state, outcome = TaskState.CANCELLED, "cancelled"
         end_reason = f"cancelled by hand (orch cancel) during Attempt {attempt_no}"
+        detail = end_reason
+    elif stop == STOP_SPEND_CAP and spend_watcher is not None and spend_watcher.error:
+        failed_attempt = f"Attempt {attempt_no} stopped: could not record spend: {spend_watcher.error}"
+    elif stop == STOP_SPEND_CAP or at_cap:
+        state, outcome = TaskState.NEEDS_YOU, spend.OUTCOME_CAP
+        end_reason = f"Attempt {attempt_no} stopped: {spend.cap_reason(cfg, db, task_id)}"
         detail = end_reason
     elif stop == STOP_RUNTIME_CAP:
         cap_min = (max_runtime_seconds / 60 if max_runtime_seconds is not None
@@ -630,7 +695,7 @@ def run_attempt(
         usage_rows=db.usage_for_task(task_id),
         redact=redact,
         appendix=templates.report_appendix(cfg, row) if row["template"] else None,
-        needs_you=failover.needs_you_lines(db, task_id),
+        needs_you=failures.needs_you_extra(cfg, db, task_id),
     )
     db.transition(task_id, state, end_reason, run_id=run_id)
     return AttemptResult(run_id=run_id, state=state, session_id=adapter.session_id(), exit_code=exit_code)

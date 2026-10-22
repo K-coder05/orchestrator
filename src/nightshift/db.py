@@ -313,6 +313,27 @@ MIGRATIONS: list[str] = [
         value  TEXT NOT NULL
     );
     """,
+    # 10: paid-per-use spend (§1.5).
+    """
+    -- One row per paid model call (the Gemini API path), priced by
+    -- Nightshift from its tokens. Subscription agents never write here.
+    CREATE TABLE spend_events (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id            TEXT NOT NULL REFERENCES tasks(id),
+        run_id             INTEGER REFERENCES runs(id),
+        agent              TEXT NOT NULL,
+        model              TEXT,
+        at                 TEXT NOT NULL,
+        input_tokens       INTEGER NOT NULL,
+        cached_tokens      INTEGER NOT NULL,
+        output_tokens      INTEGER NOT NULL,
+        thoughts_tokens    INTEGER NOT NULL,
+        cost_usd           REAL NOT NULL,
+        raw                TEXT
+    );
+    CREATE INDEX spend_events_task ON spend_events(task_id, id);
+    CREATE INDEX spend_events_at ON spend_events(at);
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -820,6 +841,30 @@ class Database:
         """A Task's agent switches, oldest first."""
         return self.conn.execute("SELECT * FROM failovers WHERE task_id = ? ORDER BY id",
                                  (task_id,)).fetchall()
+
+    # -- Spend (§1.5) -------------------------------------------------------------
+    def record_spend(self, task_id: str, *, run_id: int | None, agent: str, model: str | None,
+                     at: str, input_tokens: int, cached_tokens: int, output_tokens: int,
+                     thoughts_tokens: int, cost_usd: float, raw: dict[str, Any] | None) -> None:
+        with self.tx() as c:
+            c.execute(
+                "INSERT INTO spend_events (task_id, run_id, agent, model, at, input_tokens, "
+                "cached_tokens, output_tokens, thoughts_tokens, cost_usd, raw) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, run_id, agent, model, at, input_tokens, cached_tokens, output_tokens,
+                 thoughts_tokens, cost_usd, json.dumps(raw) if raw is not None else None))
+
+    def spend_events(self, task_id: str | None = None) -> list[sqlite3.Row]:
+        if task_id is None:
+            return self.conn.execute("SELECT * FROM spend_events ORDER BY id").fetchall()
+        return self.conn.execute("SELECT * FROM spend_events WHERE task_id = ? ORDER BY id",
+                                 (task_id,)).fetchall()
+
+    def task_spend(self, task_id: str) -> float:
+        """Dollars a Task has spent on paid calls, all its Attempts."""
+        return float(self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM spend_events WHERE task_id = ?",
+            (task_id,)).fetchone()[0])
 
     # -- Telegram alerts (§2.12) --------------------------------------------------
     def get_meta(self, key: str) -> str | None:

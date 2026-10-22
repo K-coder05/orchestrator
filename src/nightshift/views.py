@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import queries
+from . import queries, spend
 from .adapters import get_adapter
 from .adapters.base import Event, EventKind
 from .config import Config
@@ -270,8 +270,21 @@ def _cost(value: float | None) -> str:
     return "not reported" if value is None else f"${value:.4f}"
 
 
-def format_usage(report: list[queries.AgentUsage], tz: str) -> str:
-    """Usage per agent and Window, and whether each Window has a Baseline."""
+def format_credits(c: spend.CreditView, per_task_cap: float) -> list[str]:
+    """AI Studio credits: spend so far, what is left, expiry (§1.5)."""
+    as_of = f" (balance as of {c.balance_as_of})" if c.balance_as_of else ""
+    left = f"${c.remaining:.2f} left of ${c.balance:.2f}{as_of}"
+    if c.expiry:
+        left += f"; {'expired' if c.expired else 'expires'} {c.expiry}"
+    return ["Gemini API credits (paid, agent gemini-api)",
+            f"  spent ${c.spent_total:.2f} so far; {left}",
+            f"  per-Task cap ${per_task_cap:.2f}", ""]
+
+
+def format_usage(report: list[queries.AgentUsage], tz: str,
+                 credits: tuple[spend.CreditView, float] | None = None) -> str:
+    """Usage per agent and Window, and whether each Window has a Baseline;
+    with ``credits`` (credit view, per-Task cap), the paid credits too."""
     out: list[str] = []
     for agent in report:
         rows = []
@@ -313,6 +326,8 @@ def format_usage(report: list[queries.AgentUsage], tz: str) -> str:
                     else f"next probe {_local(t.resume_at, tz)}")
             out.append(f"  Paused on its limit: Task {t.task_id} ({when})")
         out.append("")
+    if credits is not None:
+        out += format_credits(*credits)
     out.append(USAGE_NOTE)
     return "\n".join(out)
 

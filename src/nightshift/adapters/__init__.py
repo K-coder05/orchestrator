@@ -9,7 +9,7 @@ from typing import Any
 from .base import AgentAdapter
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
-from .gemini import GeminiAdapter
+from .gemini import GeminiAdapter, GeminiApiAdapter
 
 AdapterFactory = Callable[[dict[str, Any]], AgentAdapter]
 
@@ -17,7 +17,13 @@ REGISTRY: dict[str, AdapterFactory] = {
     "claude": ClaudeAdapter,
     "codex": CodexAdapter,
     "gemini": GeminiAdapter,
+    "gemini-api": GeminiApiAdapter,
 }
+
+
+def is_paid(name: str) -> bool:
+    """Whether agent ``name`` is a paid path (§1.5): spend, not usage Windows."""
+    return bool(getattr(REGISTRY.get(name), "paid", False))
 
 
 def get_adapter(name: str, settings: dict[str, Any] | None = None) -> AgentAdapter:

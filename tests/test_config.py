@@ -85,6 +85,23 @@ def test_invalid_values_rejected(tmp_path):
         load_config(tmp_path, host=FakeHost())
 
 
+@pytest.mark.parametrize("text, match", [
+    ("spend: {per_task_usd: 0}\n", "per_task_usd"),
+    ("spend: {gemini_api_prices: {my-model: {input: 1, output: 2}}}\n", "gemini_api_prices"),
+    ("planning: {agent: gemini-api}\n", "never spend"),
+])
+def test_invalid_spend_settings_rejected(tmp_path, text, match):
+    (tmp_path / "config.yaml").write_text(text)
+    with pytest.raises(ConfigError, match=match):
+        load_config(tmp_path, host=FakeHost())
+
+
+def test_unlisted_model_is_priced_as_default(tmp_path):
+    cfg = load_config(tmp_path, host=FakeHost())
+    assert cfg.gemini_api_price("gemini-9-ultra") == cfg.gemini_api_price("default")
+    assert cfg.per_task_spend_cap == 2
+
+
 def test_secrets_in_config_yaml_rejected(tmp_path):
     (tmp_path / "config.yaml").write_text("secrets: {telegram_token: abc}\n")
     with pytest.raises(ConfigError, match="do not belong"):

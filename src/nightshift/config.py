@@ -12,6 +12,7 @@ tests and dry runs); the Task data root with ``paths.agents_root``.
 from __future__ import annotations
 
 import copy
+from datetime import date
 import os
 import re
 import stat
@@ -306,6 +307,22 @@ class Config:
         return float(self.USAGE_DEFAULTS[key] if value is None else value)
 
 
+    # -- Spend (§1.5) ------------------------------------------------------------
+    PRICE_KEYS = ("input", "cached_input", "output")
+
+    @property
+    def per_task_spend_cap(self) -> float:
+        """``spend.per_task_usd``: a Task that reaches it is stopped."""
+        return float((self.data.get("spend") or {}).get("per_task_usd", 2))
+
+    def gemini_api_price(self, model: str | None) -> dict[str, float]:
+        """USD per million tokens of ``model`` on the Gemini API
+        (``spend.gemini_api_prices``); a model not listed is priced as ``default``."""
+        prices = (self.data.get("spend") or {}).get("gemini_api_prices") or {}
+        entry = prices.get(model or "") or prices["default"]
+        return {k: float(entry[k]) for k in self.PRICE_KEYS}
+
+
 def _telegram_user_id(data: dict[str, Any]) -> int | None:
     uid = (data.get("telegram") or {}).get("user_id")
     return None if uid is None else int(uid)
@@ -424,6 +441,34 @@ def _validate(data: dict[str, Any]) -> None:
         num = telegram.get(key, Config.TELEGRAM_DEFAULTS[key])
         if isinstance(num, bool) or not isinstance(num, (int, float)) or num <= 0:
             raise ConfigError(f"telegram.{key} must be a positive number")
+    spend = data.get("spend") or {}
+    if not isinstance(spend, dict):
+        raise ConfigError("config section 'spend' must be a mapping")
+    cap = spend.get("per_task_usd", 2)
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or cap <= 0:
+        raise ConfigError("spend.per_task_usd must be a positive number of dollars")
+    prices = spend.get("gemini_api_prices") or {}
+    if not isinstance(prices, dict) or "default" not in prices or not all(
+        isinstance(p, dict) and all(
+            isinstance(p.get(k), (int, float)) and not isinstance(p.get(k), bool) and p[k] >= 0
+            for k in Config.PRICE_KEYS)
+        for p in prices.values()
+    ):
+        raise ConfigError("spend.gemini_api_prices must map model -> {input, cached_input, "
+                          "output: USD per million tokens >= 0} and include `default`")
+    gemini_plan = (data.get("plans") or {}).get("gemini") or {}
+    for key in ("api_credit_balance_as_of", "api_credit_expiry"):
+        value = gemini_plan.get(key)
+        if value is not None and not isinstance(value, date):
+            try:
+                date.fromisoformat(str(value))
+            except ValueError:
+                raise ConfigError(f"plans.gemini.{key} must be a date, YYYY-MM-DD (or null)") from None
+    balance = gemini_plan.get("api_credit_balance_usd", 0)
+    if isinstance(balance, bool) or not isinstance(balance, (int, float)) or balance < 0:
+        raise ConfigError("plans.gemini.api_credit_balance_usd must be a number >= 0")
+    if planning.get("agent") == "gemini-api":
+        raise ConfigError("planning.agent may not be gemini-api: planning calls never spend")
     poll = (data.get("daemon") or {}).get("poll_seconds", 5)
     if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("daemon.poll_seconds must be a positive number")

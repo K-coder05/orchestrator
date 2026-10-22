@@ -1300,3 +1300,58 @@ lasting consequences go in `docs/adr/` instead.
   takeover note, saw Claude's `progress.md`, and the Task ended `done` with
   both agents in the report. About 10s. The test's last check (all three
   part files) needs the real Gemini: docs/adapters.md item 8.
+
+## Phase 2, issue #20: Gemini API path, spend and the $2 per-Task cap
+
+- **The paid path is the Gemini CLI with an API key, not a second agent
+  implementation.** Agent `gemini-api` (`GeminiApiAdapter`) reuses the
+  Gemini adapter: same flags, settings, policy and sandbox, plus
+  `security.auth.selectedType: gemini-api-key` and the key in
+  `GEMINI_API_KEY` (env only). The plan path now pins `oauth-personal` and
+  blanks `GEMINI_API_KEY`/`GOOGLE_API_KEY`, so a key in your shell can't
+  silently bill credits (the CLI picks the configured type before env, and
+  `GOOGLE_API_KEY` would win over `GEMINI_API_KEY`). It runs Tasks given
+  `--agent gemini-api`; when Nightshift itself picks credits is the
+  paid-credit rule (#26).
+- **Paid calls come from the CLI's local telemetry file.** stream-json only
+  has session totals at the end, so the cap couldn't stop a running
+  Attempt. With `GEMINI_TELEMETRY_ENABLED/TARGET=local/OUTFILE` (env, which
+  beats every settings layer; 0.65.0 has no telemetry flags) the CLI writes
+  one `gemini_cli.api_response` log record per model call, with
+  `input_token_count` (prompt, cached included), `cached_content_token_count`,
+  `output_token_count`, `thoughts_token_count` and `tool_token_count`
+  (`ApiResponseEvent` in the 0.65.0 source). Records are pretty-printed JSON
+  with spans and metrics in between; the adapter reads them incrementally
+  (`paid_calls()`). Prompt logging is off. The file is in the Task's
+  agent-inaccessible settings folder, fresh each Attempt.
+- **Nightshift prices each call** from `spend.gemini_api_prices` (USD per
+  million tokens: uncached prompt and tool-use prompt at `input`, cached at
+  `cached_input`, output and thinking at `output`; unknown models at
+  `default`, the dearest). The values are placeholders; where a model has a
+  long-context tier the higher price is used so spend errs high. One
+  `spend_events` row per call (migration 10).
+- **The cap is checked while the Attempt runs.** A watcher thread (own DB
+  connection) collects calls every 0.5 s, records them, and stops the
+  Attempt as soon as the Task's total reaches `spend.per_task_usd`; one last
+  pass after the CLI exits collects what it flushed at shutdown (the CLI
+  flushes telemetry on SIGTERM), recording it without turning an Attempt
+  that finished on its own into a stop. A Task already at the cap doesn't
+  start the CLI at all. The Task
+  goes `running -> needs_you` (Attempt outcome `spend_cap`) with the reason
+  in the transition (so the Telegram alert says it) and in the report's
+  Needs you. Known gap: the CLI's log batch delay (~5 s) means a call or two
+  may land after the cap, and a CLI that ignores SIGTERM for 15 s is
+  killed before it flushes, so its last batch is lost. The cap is per
+  Task, all Attempts.
+- **No planning calls or probes on the paid path**, and its quota/credit
+  errors are not usage-Window hits (there is no plan to wait for): they're
+  Failed Attempts, retried like crashes. `orch usage` doesn't list Windows
+  for it; it shows a credits block instead: spend so far, and
+  `plans.gemini.api_credit_balance_usd` minus the spend recorded after the
+  day `api_credit_balance_as_of` (new key; that day's spend is taken to be
+  in the balance, local dates), zero once `api_credit_expiry` has passed.
+  Shown when `gemini-api` is configured or any spend exists.
+- **Not verified on the real CLI yet** (no key on this Mac); the fake
+  `gemini` writes telemetry records shaped from the source. To check: a real
+  `--agent gemini-api` Task records one row per call, and the costs match
+  AI Studio's billing page.

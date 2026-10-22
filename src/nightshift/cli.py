@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from . import alerts, daemon, failures, pauses, planning, queries, schedules, templates, views
+from . import alerts, daemon, failures, pauses, planning, queries, schedules, spend, templates, views
 from . import usage as usage_mod
 from . import priority as prio
 from .adapters import get_adapter
@@ -542,8 +542,11 @@ def usage_cmd(ctx, probe_agents):
                 cfg.agent(agent)
             except ConfigError as exc:
                 raise click.ClickException(str(exc)) from None
-            found = usage_mod.probe(cfg, db, agent, adapter_provider=probe_provider,
-                                    clock=lambda: _clock(cfg))
+            try:
+                found = usage_mod.probe(cfg, db, agent, adapter_provider=probe_provider,
+                                        clock=lambda: _clock(cfg))
+            except ValueError as exc:  # e.g. a paid path, which has no Window to probe
+                raise click.ClickException(f"cannot probe {agent}: {exc}") from None
             if found.available:
                 click.echo(f"probe {agent}: available")
             elif found.limit is not None:
@@ -554,7 +557,11 @@ def usage_cmd(ctx, probe_agents):
                 click.echo(f"probe {agent}: failed: {found.error}")
         if probe_agents:
             click.echo()
-        click.echo(views.format_usage(queries.usage_report(cfg, db, _clock(cfg)), cfg.timezone))
+        at = _clock(cfg)
+        paid = "gemini-api" in (cfg.data.get("agents") or {}) or db.spend_events()
+        click.echo(views.format_usage(
+            queries.usage_report(cfg, db, at), cfg.timezone,
+            credits=(spend.credits(cfg, db, at), cfg.per_task_spend_cap) if paid else None))
     finally:
         db.close()
 

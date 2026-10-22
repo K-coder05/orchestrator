@@ -35,6 +35,7 @@ from .base import (
     Command,
     Event,
     EventKind,
+    PaidCall,
     PermissionPolicy,
     Permissions,
     PlanningReply,
@@ -192,6 +193,10 @@ class GeminiAdapter(AgentAdapter):
             # sandboxed one by one (security.toolSandboxing).
             "GEMINI_SANDBOX": "false",
             "PATH": safe_path(os.environ.get("PATH", ""), private_roots, tool_dirs),
+            # The plan path never sees an API key (which would bill credits).
+            # The CLI treats an empty value as unset.
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
         }
         if tmpdir is not None:
             env["TMPDIR"] = str(tmpdir)
@@ -236,9 +241,13 @@ class GeminiAdapter(AgentAdapter):
         return self._task_command(permissions, ["--resume", session_id],
                                   self._with_protocol(task, prompt))
 
+    #: ``security.auth.selectedType``: beats an API key in the environment.
+    auth_type = "oauth-personal"  # Sign in with Google (the AI Pro plan)
+
     def _settings(self, tools: list[str]) -> dict[str, Any]:
         return {
             "security": {
+                "auth": {"selectedType": self.auth_type},
                 "toolSandboxing": True,
                 "folderTrust": {"enabled": True},
                 "disableYoloMode": True,
@@ -572,6 +581,108 @@ class GeminiAdapter(AgentAdapter):
             return ProbeReply(available=True, usage=usage)
         err = run.result_error() or f"no result from gemini (exit code {exit_code})"
         return ProbeReply(available=False, error=err, usage=usage)
+
+
+class GeminiApiAdapter(GeminiAdapter):
+    """The paid Gemini API path (AI Studio credits, §1.5): the same CLI and
+    per-Task settings, signed in with an API key (``security.auth.selectedType``
+    ``gemini-api-key``, the key in ``GEMINI_API_KEY``).
+
+    Every model call is read from the CLI's local telemetry file
+    (``GEMINI_TELEMETRY_OUTFILE``, in the Nightshift-owned settings folder):
+    one ``gemini_cli.api_response`` log record per call, with its token
+    counts. ``paid_calls()`` returns the calls written since the last call.
+    No planning calls or probes run here (they would spend), and quota or
+    credit errors are not usage-Window hits: there is no plan to wait for.
+    """
+
+    name = "gemini-api"
+    paid = True
+    auth_type = "gemini-api-key"
+    TELEMETRY_FILE = "gemini-api-calls.json"
+
+    def __init__(self, settings: dict[str, Any] | None = None):
+        super().__init__(settings)
+        self.api_key_secret = (settings or {}).get("api_key_secret") or "GEMINI_API_KEY"
+        self._telemetry: Path | None = None
+        self._telemetry_pos = 0
+        self._telemetry_buf = ""
+
+    def _task_command(self, permissions: Permissions, extra: list[str], stdin: str) -> Command:
+        if not self.api_key:
+            raise ValueError(f"the Gemini API path needs the {self.api_key_secret} secret")
+        command = super()._task_command(permissions, extra, stdin)
+        self._telemetry = Path(permissions.sandbox["telemetry_file"])
+        command.env |= {
+            "GEMINI_API_KEY": self.api_key,
+            # Telemetry to a local file only (an outfile turns OTLP export off),
+            # without prompts. Env beats every settings layer.
+            "GEMINI_TELEMETRY_ENABLED": "true",
+            "GEMINI_TELEMETRY_TARGET": "local",
+            "GEMINI_TELEMETRY_OUTFILE": str(self._telemetry),
+            "GEMINI_TELEMETRY_LOG_PROMPTS": "false",
+            "GEMINI_TELEMETRY_USE_COLLECTOR": "false",
+        }
+        return command
+
+    def write_permissions(self, workspace: Path, policy: PermissionPolicy) -> Permissions:
+        permissions = super().write_permissions(workspace, policy)
+        assert policy.settings_dir is not None
+        telemetry = policy.settings_dir / self.TELEMETRY_FILE
+        telemetry.unlink(missing_ok=True)  # one file per Attempt
+        permissions.sandbox["telemetry_file"] = str(telemetry)
+        return permissions
+
+    def paid_calls(self) -> list[PaidCall]:
+        """Model calls written to the telemetry file since the last call.
+        The CLI writes whole records (pretty-printed JSON, spans and metrics
+        in between); a record still being written waits for the next call."""
+        if self._telemetry is None or not self._telemetry.exists():
+            return []
+        with open(self._telemetry, encoding="utf-8", errors="replace") as f:
+            f.seek(self._telemetry_pos)
+            self._telemetry_buf += f.read()
+            self._telemetry_pos = f.tell()
+        calls, decoder, buf = [], json.JSONDecoder(), self._telemetry_buf
+        while True:
+            buf = buf.lstrip()
+            if not buf:
+                break
+            try:
+                record, end = decoder.raw_decode(buf)
+            except json.JSONDecodeError:
+                if buf.startswith("{") and buf.find("\n{", 1) == -1:
+                    break  # a record still being written
+                nxt = buf.find("{", 1)  # not a record: skip to the next one
+                if nxt == -1:
+                    break
+                buf = buf[nxt:]
+                continue
+            buf = buf[end:]
+            attrs = record.get("attributes") if isinstance(record, dict) else None
+            if not isinstance(attrs, dict) or attrs.get("event.name") != "gemini_cli.api_response":
+                continue
+            calls.append(PaidCall(
+                model=attrs.get("model"),
+                prompt_tokens=int(attrs.get("input_token_count") or 0),
+                cached_tokens=int(attrs.get("cached_content_token_count") or 0),
+                output_tokens=int(attrs.get("output_token_count") or 0),
+                thoughts_tokens=int(attrs.get("thoughts_token_count") or 0),
+                tool_prompt_tokens=int(attrs.get("tool_token_count") or 0),
+                raw={k: v for k, v in attrs.items() if k.endswith("_count") or k in (
+                    "model", "event.timestamp", "prompt_id", "auth_type", "status_code")},
+            ))
+        self._telemetry_buf = buf
+        return calls
+
+    def detect_rate_limit(self, event_or_exit: Event | int) -> RateLimit | None:
+        return None
+
+    def planning_command(self, prompt: str, *, system: str, schema: dict[str, Any]) -> Command:
+        raise ValueError("the paid Gemini API path is not used for planning calls")
+
+    def probe_command(self) -> Command:
+        raise ValueError("the paid Gemini API path has no usage Window to probe")
 
 
 _LIMIT_TEXT = re.compile(

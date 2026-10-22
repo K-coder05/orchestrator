@@ -56,17 +56,17 @@ def finalize(cfg: Config, db: Database, row: Mapping[str, Any], state: TaskState
             usage_rows=db.usage_for_task(row["id"]),
             redact=cfg.secrets.redact,
             appendix=_appendix(cfg, row),
-            needs_you=needs_you_extra(db, row["id"]),
+            needs_you=needs_you_extra(cfg, db, row["id"]),
         )
         log_line(folder, f"{iso(at)} {reason}", cfg.secrets.redact)
 
 
-def needs_you_extra(db: Database, task_id: str) -> list[str]:
+def needs_you_extra(cfg: Config, db: Database, task_id: str) -> list[str]:
     """Needs you entries Nightshift adds to the report itself (deadline-driven
-    failovers, §2.8)."""
-    from . import failover  # failover imports this module
+    failovers, §2.8; the per-Task spend cap, §1.5)."""
+    from . import failover, spend  # failover imports this module
 
-    return failover.needs_you_lines(db, task_id)
+    return spend.needs_you_lines(cfg, db, task_id) + failover.needs_you_lines(db, task_id)
 
 
 def _appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:

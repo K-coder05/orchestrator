@@ -29,7 +29,12 @@ plans:
     tier: chatgpt-work
   gemini:
     tier: google-ai-pro
+    # AI Studio API credits (the paid `gemini-api` agent). The balance as
+    # of the end of api_credit_balance_as_of (YYYY-MM-DD; null: before any
+    # recorded spend); `orch usage` subtracts the spend recorded after it.
     api_credit_balance_usd: 0
+    api_credit_balance_as_of: null
+    # YYYY-MM-DD the credits expire; null: no expiry known.
     api_credit_expiry: null
 
 agents:
@@ -65,6 +70,18 @@ agents:
     # Extra flags for `gemini`. Flags that change approvals, the sandbox, the
     # workspace or policies (--yolo, --approval-mode, --sandbox, --policy,
     # --include-directories, -e, ...) are refused.
+    extra_args: []
+  # The paid Gemini API path (AI Studio credits, §1.5): the same Gemini CLI,
+  # signed in with an API key instead of the plan. Only runs Tasks given
+  # `--agent gemini-api`. Every model call is recorded as spend and counts
+  # toward spend.per_task_usd. The key is a secret: put it in .env or the
+  # Keychain under the name below, never here.
+  gemini-api:
+    binary: gemini
+    # null uses the CLI's own default model.
+    model: null
+    api_key_secret: GEMINI_API_KEY
+    # Same refused flags as agents.gemini.extra_args.
     extra_args: []
 
 defaults:
@@ -291,6 +308,23 @@ permissions:
     - pmset
     - git push
     - gh
+
+spend:
+  # Paid-per-use caps (§1.5). Only the Gemini API path (agents.gemini-api)
+  # spends money; subscription agents never record spend.
+  # A Task that reaches this much is stopped and moved to needs_you.
+  per_task_usd: 2
+  # AI Studio prices in USD per million tokens, used to price each call.
+  # PLACEHOLDERS: check https://ai.google.dev/gemini-api/docs/pricing and
+  # update them. Where a model has a long-context tier, its higher price is
+  # used (spend errs high). Thinking tokens are billed as output. A model not
+  # listed is priced as `default`.
+  gemini_api_prices:
+    default: {input: 4.0, cached_input: 0.4, output: 18.0}
+    gemini-3-pro-preview: {input: 4.0, cached_input: 0.4, output: 18.0}
+    gemini-2.5-pro: {input: 2.5, cached_input: 0.25, output: 15.0}
+    gemini-2.5-flash: {input: 0.3, cached_input: 0.03, output: 2.5}
+    gemini-2.5-flash-lite: {input: 0.1, cached_input: 0.01, output: 0.4}
 
 telegram:
   # Outbound alerts (§2.12): a message when a Task finishes (its one-line
