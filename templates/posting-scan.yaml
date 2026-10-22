@@ -12,11 +12,11 @@
 # rows, dedupes them against the Tracker (normalized posting_url, then
 # normalized company+role+season) and appends only new ones with status=new.
 # The report's New postings section is written by Nightshift from the merge
-# result; duplicates appear only as a count. Runs on Claude in Phase 1.
+# result; duplicates appear only as a count. Runs on Gemini (Phase 2, #22).
 name: posting-scan
 description: Daily scan of tracker repos and career pages for matching internships
 task_type: scraping
-agent: claude
+agent: gemini
 estimated_minutes: 20
 max_runtime_minutes: 60
 long: false

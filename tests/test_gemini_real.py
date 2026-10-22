@@ -8,6 +8,8 @@ unless ``NIGHTSHIFT_REAL_AGENT=1`` and ``gemini`` is installed and signed in
     NIGHTSHIFT_REAL_AGENT=1 .venv/bin/python -m pytest tests/test_gemini_real.py
 
 ``NIGHTSHIFT_GEMINI_MODEL`` picks the model (default: the CLI's own).
+``test_posting_scan_on_gemini`` also needs ``NIGHTSHIFT_SCAN_REPO``, a public
+internship tracker repo URL for the configured season.
 """
 
 from __future__ import annotations
@@ -20,8 +22,9 @@ from pathlib import Path
 
 import pytest
 import yaml
+from click.testing import CliRunner
 
-from nightshift import planning, runner, usage
+from nightshift import cli, planning, runner, tracker, usage
 from nightshift.adapters.base import EventKind
 from nightshift.adapters.gemini import GeminiAdapter
 from nightshift.config import load_config
@@ -233,5 +236,46 @@ def test_claude_to_gemini_failover(tmp_path):
         text = (new.folder / "report.md").read_text()
         assert "| claude | 1 |" in text and "| gemini | 1 |" in text
         print("progress.md:\n" + (new.folder / "progress.md").read_text())
+    finally:
+        db.close()
+
+
+@pytest.mark.skipif(not os.environ.get("NIGHTSHIFT_SCAN_REPO"),
+                    reason="set NIGHTSHIFT_SCAN_REPO to a public internship tracker repo")
+def test_posting_scan_on_gemini(tmp_path):
+    """#22 on the real CLI: two posting-scans in a row on Gemini each write a
+    valid output/proposed_rows.csv that merges cleanly; the Tracker has no
+    duplicates and the second report lists only the rows it appended."""
+    _, db = _cfg(tmp_path)
+    config_dir = tmp_path / "config"
+    (config_dir / "config.yaml").write_text(yaml.safe_dump({
+        **yaml.safe_load((config_dir / "config.yaml").read_text()),
+        "templates": {"posting_scan": {"tracker_repos": [os.environ["NIGHTSHIFT_SCAN_REPO"]]}}}))
+    cfg = load_config(config_dir, host=FakeHost())
+    task_ids = []
+    try:
+        for _ in range(2):
+            r = CliRunner().invoke(cli.main, ["--config-dir", str(config_dir), "add",
+                                              "Daily scan for new internship postings",
+                                              "--template", "posting-scan"])
+            assert r.exit_code == 0, r.output
+            [tid] = [row["id"] for row in db.list_tasks() if row["id"] not in task_ids]
+            QueueRunner(cfg, db, FakeHost(), clock=lambda: now(cfg.timezone)).run_next()
+            row = db.get_task(tid)
+            assert row["agent"] == "gemini"
+            assert row["state"] in (TaskState.DONE, TaskState.PARTIAL), row["state"]
+            [m] = db.tracker_merges(tid)
+            assert m["proposed"] > 0 and m["invalid"] < m["proposed"], dict(m)
+            print(f"scan {len(task_ids) + 1}:",
+                  {k: m[k] for k in ("proposed", "appended", "duplicates", "invalid")})
+            task_ids.append(tid)
+        rows = tracker.read_tracker(cfg.tracker_path)
+        assert len({tracker.normalize_url(r["posting_url"]) for r in rows}) == len(rows)
+        assert len({tracker.row_key(r) for r in rows}) == len(rows)
+        second = db.get_task(task_ids[1])
+        new = (Path(second["folder"]) / "report.md").read_text().split("### New postings", 1)[1]
+        n1 = db.tracker_merges(task_ids[0])[0]["appended"]
+        assert not any(f"[link]({r['posting_url'].replace(')', '%29')})" in new
+                       for r in rows[:n1])
     finally:
         db.close()

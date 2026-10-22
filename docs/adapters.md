@@ -854,3 +854,10 @@ extensions and hooks off) and items 1, 2 and 6 are by hand.
 7. `orch add ... --agent gemini` to `done` on the real CLI.
 8. A real Claude -> Gemini failover (§2.8, issue #19): `test_claude_to_gemini_failover`
    in `tests/test_gemini_real.py` (also needs the signed-in `claude` CLI).
+9. A real `posting-scan` on Gemini (issue #22): `test_posting_scan_on_gemini`
+   (also needs `NIGHTSHIFT_SCAN_REPO`, a public internship tracker repo for
+   the configured season) runs two scans in a row and checks that each
+   `output/proposed_rows.csv` merges cleanly, the Tracker has no duplicates
+   and the second report lists only its own rows. Also worth a look by hand:
+   whether `web_fetch` on a big README returns a sample, as WebFetch does on
+   Claude ("Web fetch on big pages" above).

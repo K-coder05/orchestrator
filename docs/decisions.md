@@ -1387,3 +1387,29 @@ lasting consequences go in `docs/adr/` instead.
 - Tested with fixed datetimes for the rules and the view, and with the fake
   clock through the daemon (a running Task crossing 80% finishes, the next
   waits; a background Task waits at 10am and runs at 11pm).
+
+## Phase 2, issue #22: `posting-scan` on Gemini
+
+- **Template only.** `templates/posting-scan.yaml` now says `agent:
+  gemini` (the subscription sign-in, not `gemini-api`: a daily scan
+  shouldn't spend credits). Nothing else changed: the prompt already asks
+  for "your web fetch and search tools", which on Gemini are `web_fetch`
+  and `google_web_search` (added for internet-on Tasks; the LinkedIn deny
+  rules come with them), and the merge, dedupe and New postings section
+  are Nightshift's, so they don't depend on the agent.
+- **Failover back to Claude.** `scraping` fails over along `[claude,
+  gemini]`, so a scan that finds Gemini out moves to Claude (the next agent
+  on the list that isn't out) instead of waiting. The Schedule itself is
+  unchanged (6:30am, catch-up within 12h else skip, overlap skip).
+  An existing Schedule picks the agent up from the template when it fires,
+  unless it was added with its own `--agent`.
+- **Tests.** The posting-scan tests in `tests/test_tracker.py` and Gate
+  Test 2 (`tests/test_gate2.py`) now run through the fake `gemini` CLI
+  (which writes `FAKE_PROPOSED` to `output/proposed_rows.csv`, as the fake
+  `claude` does): two scans in a row add no duplicate Tracker rows and the
+  second reports only its New postings. A new test covers a scan that hits
+  a Gemini usage limit and finishes on Claude with the merge intact.
+- **Not run on the real CLI yet**: Gemini CLI isn't installed on this Mac.
+  `tests/test_gemini_real.py::test_posting_scan_on_gemini` is the opt-in
+  check (`NIGHTSHIFT_REAL_AGENT=1 NIGHTSHIFT_SCAN_REPO=<repo URL>`); its
+  logic was dry-run with a `gemini` wrapper around the fake on PATH.

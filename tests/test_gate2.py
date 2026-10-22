@@ -5,7 +5,7 @@ days pass on a fake clock and the sleep is a `FakeHost` whose awake clock
 stops while the wall clock jumps (what `CLOCK_UPTIME_RAW` does on a Mac).
 Everything else is real: the built-in posting-scan template and its
 standard Schedule, the scheduler, the daemon's queue runner, the fake
-`claude` CLI streaming through the real adapter, the merge_tracker
+`gemini` CLI streaming through the real adapter, the merge_tracker
 post-hook and report.md.
 """
 
@@ -25,8 +25,9 @@ from nightshift.host import FakeHost
 from nightshift.states import TaskState
 from nightshift.workspace import read_task_yaml
 
-from test_runner import env, fake_provider  # noqa: F401  (pytest fixture)
-from test_tracker import _row, scan_env, scfg, scfg_dir  # noqa: F401  (pytest fixtures)
+from test_gemini import genv  # noqa: F401  (pytest fixture)
+from test_runner import env  # noqa: F401  (pytest fixture)
+from test_tracker import _row, scan_env, scan_provider, scfg, scfg_dir  # noqa: F401  (fixtures)
 
 LA = ZoneInfo("America/Los_Angeles")
 
@@ -70,7 +71,7 @@ def gate(scfg, scfg_dir, scan_env, monkeypatch):  # noqa: F811
     assert res.exit_code == 0, res.output
     db = Database(scfg.db_path, tz=scfg.timezone)
     logs: list[str] = []
-    runner = QueueRunner(scfg, db, mac.host, adapter_provider=fake_provider, clock=mac.clock,
+    runner = QueueRunner(scfg, db, mac.host, adapter_provider=scan_provider, clock=mac.clock,
                          log=logs.append)
     runner.check_wake()  # the daemon's first look only sets the mark
     yield mac, db, runner, logs, res.output
@@ -109,6 +110,7 @@ def test_gate_two_runs_and_a_fire_missed_while_asleep(gate, scfg, scan_env):  # 
     assert first is not None
     row1 = db.get_task(first)
     assert row1["state"] == TaskState.DONE and row1["schedule_name"] == "posting-scan"
+    assert row1["agent"] == "gemini"
     assert Path(row1["folder"]) == scfg.recurring_dir / "posting-scan" / "2026-10-21"
     assert read_task_yaml(Path(row1["folder"])).approved is True
     new1 = _report_new(row1)
@@ -148,7 +150,7 @@ def test_gate_two_runs_and_a_fire_missed_while_asleep(gate, scfg, scan_env):  # 
     mac.awake(minutes=30)
     assert runner.run_next() is None
     assert runner.check_wake() is False
-    QueueRunner(scfg, db, mac.host, adapter_provider=fake_provider,
+    QueueRunner(scfg, db, mac.host, adapter_provider=scan_provider,
                 clock=mac.clock).serve(exit_when_idle=True)
     occ = db.occurrences("posting-scan")
     assert [r["id"] for r in occ] == [first, second]

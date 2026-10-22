@@ -22,6 +22,8 @@ from nightshift.host import FakeHost
 from nightshift.permissions import build_policy
 from nightshift.states import TaskState
 
+from test_gemini import fake_gemini
+from test_gemini import genv  # noqa: F401  (pytest fixture)
 from test_runner import env, fake_provider  # noqa: F401  (pytest fixture)
 
 LA = ZoneInfo("America/Los_Angeles")
@@ -392,8 +394,13 @@ def scfg(scfg_dir):
     return load_config(scfg_dir, host=FakeHost())
 
 
+def scan_provider(name, settings):
+    """posting-scan runs on Gemini; Claude is its failover (task_types.scraping)."""
+    return fake_gemini(settings) if name == "gemini" else fake_provider(name, settings)
+
+
 @pytest.fixture
-def scan_env(env, monkeypatch, tmp_path):  # noqa: F811
+def scan_env(env, genv, monkeypatch, tmp_path):  # noqa: F811
     for k in ("FAKE_RESUME", "FAKE_PROGRESS", "FAKE_STEP_DELAY"):
         monkeypatch.delenv(k, raising=False)
     proposed = tmp_path / "proposed.csv"
@@ -418,7 +425,7 @@ def _run(cfg, task_id):
     db = Database(cfg.db_path, tz=cfg.timezone)
     try:
         clock = lambda: datetime(2026, 10, 21, 6, 30, tzinfo=LA)  # noqa: E731
-        QueueRunner(cfg, db, FakeHost(), adapter_provider=fake_provider, clock=clock).run_next()
+        QueueRunner(cfg, db, FakeHost(), adapter_provider=scan_provider, clock=clock).run_next()
         return db.get_task(task_id)
     finally:
         db.close()
@@ -426,7 +433,7 @@ def _run(cfg, task_id):
 
 def test_posting_scan_template_loads(scfg):
     tpl = templates.load(scfg, "posting-scan")
-    assert (tpl.task_type, tpl.agent, tpl.internet, tpl.long) == ("scraping", "claude", "on", False)
+    assert (tpl.task_type, tpl.agent, tpl.internet, tpl.long) == ("scraping", "gemini", "on", False)
     assert tpl.estimated_minutes <= 30  # a daily scan never waits for plan approval
     assert [h["hook"] for h in tpl.post_hooks] == ["require_outputs", "merge_tracker"]
     assert tpl.post_hooks[-1] == {"hook": "merge_tracker", "proposed": "output/proposed_rows.csv"}
@@ -510,8 +517,22 @@ def test_posting_scan_end_to_end_two_runs_no_duplicates(scfg, scfg_dir, scan_env
         [m] = db.tracker_merges(second)
         assert (m["proposed"], m["appended"], m["duplicates"], m["invalid"]) == (3, 1, 2, 0)
         assert m["run_id"] == db.attempts(second)[-1]["id"]
+        assert [a["agent"] for a in db.attempts(first) + db.attempts(second)] == [
+            "gemini", "gemini"]
     finally:
         db.close()
+
+
+def test_posting_scan_out_of_gemini_fails_over_to_claude_and_merges(scfg, scfg_dir, scan_env,
+                                                                     monkeypatch):
+    scan_env(_row())
+    monkeypatch.setenv("FAKE_GEMINI_LIMIT", "1")
+    task = _add_scan(scfg_dir)
+    assert _run(scfg, task)["state"] == TaskState.QUEUED
+    row = _run(scfg, task)
+    assert row["state"] == TaskState.DONE and row["agent"] == "claude"
+    assert [r["company"] for r in _tracker_rows(scfg.tracker_path)] == ["Acme"]
+    assert "1 new posting appended" in _report(row).split("### New postings", 1)[1]
 
 
 def test_posting_scan_nothing_new(scfg, scfg_dir, scan_env):
@@ -536,7 +557,7 @@ def test_posting_scan_missing_or_bad_file_is_a_failed_attempt(scfg, scfg_dir, sc
 
 def test_posting_scan_agent_failure_never_merges(scfg, scfg_dir, scan_env, monkeypatch):
     scan_env(_row())
-    monkeypatch.setenv("FAKE_RESULT", "failed")
+    monkeypatch.setenv("FAKE_GEMINI_RESULT", "failed")
     task = _add_scan(scfg_dir)
     row = _run(scfg, task)
     assert row["state"] == TaskState.FAILED
