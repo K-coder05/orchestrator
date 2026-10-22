@@ -60,6 +60,44 @@ def task_list(
     return out
 
 
+#: The dashboard's status groups (§4 item 8), in display order. Every state
+#: is in exactly one; each Task still shows its own state.
+STATUS_GROUPS: list[tuple[str, frozenset[TaskState]]] = [
+    ("running", frozenset({TaskState.RUNNING})),
+    ("queued", frozenset({TaskState.QUEUED, TaskState.RETRY_WAIT, TaskState.SCHEDULED})),
+    ("paused", frozenset({TaskState.PAUSED_USAGE, TaskState.PAUSED_SPEND})),
+    ("needs you", frozenset({TaskState.NEEDS_YOU, TaskState.AWAITING_APPROVAL})),
+    ("done", frozenset({TaskState.DONE, TaskState.PARTIAL, TaskState.CANCELLED})),
+    ("failed", frozenset({TaskState.FAILED})),
+]
+
+#: How many of the newest Tasks a finished group shows by default.
+FINISHED_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class TaskGroup:
+    name: str
+    #: Newest first; for a finished group (done, failed) only the newest few.
+    tasks: list[TaskSummary]
+    #: How many Tasks are in the group, shown or not.
+    total: int
+
+
+def task_groups(
+    cfg: Config, db: Database, now: datetime, finished_limit: int = FINISHED_LIMIT
+) -> list[TaskGroup]:
+    """Tasks grouped by status, as the dashboard shows them."""
+    tasks = task_list(cfg, db, now)
+    out = []
+    for name, states in STATUS_GROUPS:
+        members = [t for t in tasks if t.state in states]
+        finished = states <= TERMINAL
+        out.append(TaskGroup(name=name, tasks=members[:finished_limit] if finished else members,
+                             total=len(members)))
+    return out
+
+
 # --------------------------------------------------------------------------
 # Task detail
 # --------------------------------------------------------------------------

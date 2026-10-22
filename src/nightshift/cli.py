@@ -860,5 +860,69 @@ def daemon_run(ctx, exit_when_idle):
         lock.release()
 
 
+@main.group("dashboard")
+def dashboard_group():
+    """The read-only web dashboard (its own launchd agent with KeepAlive)."""
+
+
+@dashboard_group.command("install")
+@click.option("--allow-protected", is_flag=True,
+              help="Install even though Nightshift's Python, source or data is in a "
+                   "privacy-protected folder (only after granting Python Full Disk Access).")
+@click.pass_context
+def dashboard_install(ctx, allow_protected):
+    """Write the dashboard's LaunchAgent plist and load it (replaces an existing one)."""
+    from . import dashboard
+
+    host = host_factory()
+    cfg = _load(ctx, host)
+    problems = [p for p in daemon.launchd_access_problems(cfg, host) if p.blocking]
+    if problems and not allow_protected:
+        raise click.ClickException(
+            "not installing: the launchd dashboard could not start or read the database.\n  "
+            + "\n  ".join(daemon.format_access_problems(problems, service="dashboard"))
+        )
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    err = host.launchd_install(dashboard.label(cfg), dashboard.build_plist(cfg))
+    if err:
+        raise click.ClickException(err)
+    st = host.launchd_status(dashboard.label(cfg))
+    click.echo(f"Installed {st.label}: {st.plist_path}")
+    click.echo(f"Dashboard log: {dashboard.log_path(cfg)}")
+    try:
+        click.echo("Open " + " or ".join(dashboard.urls(cfg, dashboard.listen_addresses(cfg, host))))
+    except dashboard.BindRefused as exc:
+        click.echo(f"warning: {exc}; it will start once that is fixed.", err=True)
+
+
+@dashboard_group.command("uninstall")
+@click.pass_context
+def dashboard_uninstall(ctx):
+    """Unload the dashboard's LaunchAgent and delete its plist."""
+    from . import dashboard
+
+    host = host_factory()
+    cfg = _load(ctx, host)
+    err = host.launchd_uninstall(dashboard.label(cfg))
+    if err:
+        raise click.ClickException(err)
+    click.echo(f"Uninstalled {dashboard.label(cfg)}")
+
+
+@dashboard_group.command("run")
+@click.pass_context
+def dashboard_run(ctx):
+    """Serve the dashboard in the foreground (launchd runs this): on
+    127.0.0.1 and the Tailscale address only."""
+    from . import dashboard  # lazy: FastAPI is only loaded by the dashboard
+
+    host = host_factory()
+    cfg = _load(ctx, host)
+    try:
+        dashboard.serve(cfg, host, log=click.echo)
+    except dashboard.BindRefused as exc:
+        raise click.ClickException(str(exc)) from None
+
+
 if __name__ == "__main__":  # pragma: no cover
     main()

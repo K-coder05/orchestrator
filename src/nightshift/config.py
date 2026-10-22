@@ -501,6 +501,14 @@ def _validate(data: dict[str, Any]) -> None:
     poll = (data.get("daemon") or {}).get("poll_seconds", 5)
     if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("daemon.poll_seconds must be a positive number")
+    dash = data.get("dashboard") or {}
+    if not isinstance(dash, dict):
+        raise ConfigError("config section 'dashboard' must be a mapping")
+    port = dash.get("port", 8765)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ConfigError("dashboard.port must be a port number, 1-65535")
+    if not isinstance(dash.get("tailscale", True), bool):
+        raise ConfigError("dashboard.tailscale must be true or false")
     wake = data.get("wake") or {}
     days = str(wake.get("days", "MTWRFSU"))
     if not days or any(c not in "MTWRFSU" for c in days):

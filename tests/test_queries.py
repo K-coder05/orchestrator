@@ -41,6 +41,61 @@ def test_task_list_filters_by_state(cfg, db):
     assert queries.task_list(cfg, db, NOW, [TaskState.RUNNING]) == []
 
 
+def _task_in(cfg, db, title, *path):
+    tid = create_task(cfg, db, title).spec.id
+    for state in path:
+        db.transition(tid, state, "test")
+    return tid
+
+
+def test_task_groups_put_every_state_in_one_of_six_groups(cfg, db):
+    S = TaskState
+    ids = {
+        "running": _task_in(cfg, db, "running", S.RUNNING),
+        "queued": _task_in(cfg, db, "queued"),
+        "retry": _task_in(cfg, db, "retry", S.RUNNING, S.RETRY_WAIT),
+        "scheduled": _task_in(cfg, db, "scheduled", S.SCHEDULED),
+        "usage": _task_in(cfg, db, "usage", S.RUNNING, S.PAUSED_USAGE),
+        "spend": _task_in(cfg, db, "spend", S.RUNNING, S.PAUSED_SPEND),
+        "needs": _task_in(cfg, db, "needs", S.RUNNING, S.NEEDS_YOU),
+        "approval": _task_in(cfg, db, "approval", S.AWAITING_APPROVAL),
+        "done": _task_in(cfg, db, "done", S.RUNNING, S.DONE),
+        "partial": _task_in(cfg, db, "partial", S.RUNNING, S.PARTIAL),
+        "cancelled": _task_in(cfg, db, "cancelled", S.CANCELLED),
+        "failed": _task_in(cfg, db, "failed", S.FAILED),
+    }
+
+    groups = queries.task_groups(cfg, db, NOW)
+
+    assert [g.name for g in groups] == [
+        "running", "queued", "paused", "needs you", "done", "failed"]
+    titles = {g.name: sorted(t.title for t in g.tasks) for g in groups}
+    assert titles == {
+        "running": ["running"],
+        "queued": ["queued", "retry", "scheduled"],
+        "paused": ["spend", "usage"],
+        "needs you": ["approval", "needs"],
+        "done": ["cancelled", "done", "partial"],
+        "failed": ["failed"],
+    }
+    assert all(g.total == len(g.tasks) for g in groups)
+    assert {t.id for g in groups for t in g.tasks} == set(ids.values())
+
+
+def test_task_groups_show_only_the_newest_finished_tasks(cfg, db):
+    for n in range(4):
+        _task_in(cfg, db, f"done {n}", TaskState.RUNNING, TaskState.DONE)
+    _task_in(cfg, db, "still queued")
+    for n in range(3):
+        _task_in(cfg, db, f"open {n}")
+
+    groups = {g.name: g for g in queries.task_groups(cfg, db, NOW, finished_limit=2)}
+
+    assert [t.title for t in groups["done"].tasks] == ["done 3", "done 2"]
+    assert groups["done"].total == 4
+    assert len(groups["queued"].tasks) == groups["queued"].total == 4  # open groups: all
+
+
 # --------------------------------------------------------------------------
 # Task detail
 # --------------------------------------------------------------------------

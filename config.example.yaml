@@ -205,6 +205,17 @@ daemon:
   # How often the idle daemon checks for newly queued Tasks.
   poll_seconds: 5
 
+dashboard:
+  # Read-only web dashboard (§4 item 8), served by its own launchd agent
+  # (`orch dashboard install`). It binds to 127.0.0.1 and, with
+  # `tailscale: true`, this Mac's Tailscale address: never 0.0.0.0, the LAN
+  # or a public address. With Tailscale wanted but not connected it refuses
+  # to start (launchd retries until Tailscale is up).
+  port: 8765
+  tailscale: true
+  # launchd LaunchAgent label; the plist is ~/Library/LaunchAgents/<label>.plist.
+  label: com.nightshift.dashboard
+
 wake:
   # Optional scheduled wake (§1.9). `orch doctor` prints the pmset command
   # built from these; Nightshift never runs it. days: any of MTWRFSU.

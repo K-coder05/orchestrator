@@ -111,6 +111,11 @@ class Host(Protocol):
         permitted`` (docs/decisions.md #3, real launchd)."""
         ...
 
+    def tailscale_ipv4(self) -> str | None:
+        """This machine's Tailscale IPv4 address, or None when Tailscale is
+        not installed or not connected (the dashboard binds to it)."""
+        ...
+
     def hold_awake(self) -> None:
         """Start holding the machine awake (idempotent)."""
         ...
@@ -144,6 +149,9 @@ class Host(Protocol):
         except ``readable`` and ``writable``, writes only to ``writable``
         (and the system temp dir)."""
         ...
+
+
+TAILSCALE_APP_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 
 def _run(argv: list[str], timeout: float = 10) -> subprocess.CompletedProcess[str] | None:
@@ -245,6 +253,16 @@ class MacHost:
         home = Path.home()
         return [home / "Desktop", home / "Documents", home / "Downloads",
                 home / "Library" / "Mobile Documents", Path("/Volumes")]
+
+    def tailscale_ipv4(self) -> str | None:
+        # The Homebrew CLI, else the one inside the Mac app (App Store or
+        # standalone): `tailscale ip -4` prints nothing useful when logged out.
+        for cli in (shutil.which("tailscale"), TAILSCALE_APP_CLI):
+            if cli and Path(cli).exists():
+                proc = _run([cli, "ip", "-4"])
+                if proc is not None and proc.returncode == 0 and proc.stdout.split():
+                    return proc.stdout.split()[0]
+        return None
 
     def _domain(self) -> str:
         return f"gui/{os.getuid()}"
@@ -358,6 +376,8 @@ class FakeHost:
     awake_clock: float | None = None
     #: ``run_confined`` calls (kwargs plus argv); FakeHost runs them unconfined.
     confined_runs: list[dict] = field(default_factory=list)
+    #: What ``tailscale_ipv4`` returns (None: Tailscale down).
+    tailscale_ip: str | None = None
 
     def keychain_get(self, service: str, account: str) -> str | None:
         self.keychain_reads.append((service, account))
@@ -408,6 +428,9 @@ class FakeHost:
         self.plists.pop(label, None)
         self.launchd.pop(label, None)
         return None
+
+    def tailscale_ipv4(self) -> str | None:
+        return self.tailscale_ip
 
     def hold_awake(self) -> None:
         if not self.awake:

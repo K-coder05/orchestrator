@@ -1462,3 +1462,50 @@ lasting consequences go in `docs/adr/` instead.
   fake clock (missed 2am fire caught up once on wake and run at 00:45; three
   missed fires collapse into one). Not run on the real Gemini CLI (not
   installed on this Mac).
+
+## Phase 2, issue #24: dashboard tracer (Tasks grouped by status)
+
+- **Frontend: HTMX, over server-rendered Jinja2 pages.** Single user, read
+  only and phone-first: every view is a query from `nightshift.queries`
+  rendered as HTML, so the dashboard stays in Python with no Node build,
+  bundle or second copy of the data model in TypeScript. The live parts
+  coming next (log tail, usage countdowns, then Phase 3's buttons) are
+  partial swaps and polling, which HTMX does with attributes. This tracer
+  needs no script at all (a 30 s meta refresh), so `htmx.min.js` gets
+  vendored into the package (no CDN: the page must work with only the
+  tailnet) by the first view that swaps a fragment.
+- **Served by its own launchd agent** (`orch dashboard install`, label
+  `com.nightshift.dashboard`, KeepAlive, log `data/dashboard.log`), not
+  inside the daemon. A web server crash or hang can't stall the queue, the
+  daemon can restart mid-night without dropping the page, and the
+  dashboard reads SQLite through its own connection (WAL), one per request.
+  The plist is the daemon's (`daemon.launch_agent_plist`), and install
+  refuses the same privacy-protected paths.
+- **Binds 127.0.0.1 and the Tailscale IPv4 only.** Addresses aren't
+  configurable: `dashboard.tailscale` (default true) adds the address from
+  `tailscale ip -4` (Homebrew CLI or the one in Tailscale.app, behind the
+  host seam). Nightshift binds the sockets itself and hands them to
+  uvicorn, after a guard (`check_bind_address`) that refuses anything not
+  loopback or that exact address inside 100.64.0.0/10, so a probe that
+  returned a LAN address can't open it up. Tailscale wanted but not
+  connected: refuse to start rather than quietly serve localhost only;
+  under KeepAlive it comes up once Tailscale does. IPv6 loopback isn't
+  bound (use `127.0.0.1`, not `localhost`, if a browser tries `::1` first).
+- **Host header allowlist** (`localhost`, `127.0.0.1`, the Tailscale
+  address, `*.ts.net`): anything else gets a 400, so a web page that
+  rebinds its own name to 127.0.0.1 can't read Task titles. Short MagicDNS
+  names (`http://mac:8765`) are refused; use the IP or the full name.
+  `proxy_headers` off, no OpenAPI or docs routes; only `GET /` exists.
+- **Groups** (`queries.task_groups`): running; queued (+ `retry_wait`,
+  `scheduled`); paused (usage, spend); needs you (+ `awaiting_approval`,
+  which also waits on you); done (+ `partial`, `cancelled`); failed. Every
+  state is in exactly one group, and a Task whose state isn't the group's
+  name shows it (e.g. "retry wait" under Queued). Done and failed show the
+  newest 20 with "N older not shown"; open groups show everything.
+- **Tests** (`tests/test_dashboard.py`): bind addresses and the guard (0.0.0.0,
+  `::`, LAN, public, a foreign 100.64/10 address), real sockets on
+  127.0.0.1, the routes through FastAPI's TestClient (grouping order,
+  escaping, Host header, read-only), the plist and `orch dashboard
+  install|uninstall|run` on FakeHost. Smoke-run for real on localhost only:
+  Tailscale isn't installed on this Mac, so the Tailscale bind is untested
+  on a real interface.

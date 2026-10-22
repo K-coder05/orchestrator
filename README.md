@@ -31,7 +31,17 @@ orch report <id>
 orch schedule add posting-scan   # daily 6:30am, catch-up within 12h else skip, overlap skip
 orch schedule add company-rescrape  # 2am every 2 days, catch-up on next wake, overlap skip
 orch schedule list           # also enable | disable | run-now | remove <name>
+orch dashboard install       # read-only web dashboard: its own launchd agent on
+                             # 127.0.0.1 and the Tailscale address, port 8765
 ```
+
+The dashboard shows Tasks grouped by status (running, queued, paused, needs
+you, done, failed), dark and phone-sized, refreshing every 30 seconds. Open
+`http://127.0.0.1:8765/` on the Mac, or the Mac's Tailscale address (or its
+full `*.ts.net` MagicDNS name) on your phone. It never listens on the LAN or
+a public address: with Tailscale not connected it refuses to start, and
+launchd retries until it is (set `dashboard.tailscale: false` for localhost
+only). `orch dashboard run` serves it in a terminal instead.
 
 `orch add` first makes a quick planning call that estimates the minutes and
 proposes a Task type, prints both and asks y/n (`--type T` overrides the type,

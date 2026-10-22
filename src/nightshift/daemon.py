@@ -127,7 +127,14 @@ def read_state(cfg: Config) -> dict[str, Any] | None:
 
 
 def build_plist(cfg: Config, *, python: str | None = None, path_env: str | None = None) -> bytes:
-    """The LaunchAgent plist that runs ``orch daemon run`` under KeepAlive.
+    """The LaunchAgent plist that runs ``orch daemon run`` under KeepAlive."""
+    return launch_agent_plist(cfg, label=label(cfg), command=["daemon", "run"],
+                              log=log_path(cfg), python=python, path_env=path_env)
+
+
+def launch_agent_plist(cfg: Config, *, label: str, command: list[str], log: Path,
+                       python: str | None = None, path_env: str | None = None) -> bytes:
+    """A LaunchAgent plist that runs ``orch <command>`` under KeepAlive.
 
     ``PYTHONPATH`` points at Nightshift's source so the daemon starts even
     when macOS hides the editable-install ``.pth`` (docs/decisions.md).
@@ -139,25 +146,23 @@ def build_plist(cfg: Config, *, python: str | None = None, path_env: str | None 
     path_env = path_env if path_env is not None else os.environ.get("PATH", "/usr/bin:/bin")
     entries = [str(Path(python).parent), *path_env.split(":")]
     path_env = ":".join(dict.fromkeys(e for e in entries if e))  # dedupe, keep order
-    log = str(log_path(cfg))
     data = {
-        "Label": label(cfg),
+        "Label": label,
         "ProgramArguments": [
             python,
             "-m",
             "nightshift",
             "--config-dir",
             str(cfg.config_dir),
-            "daemon",
-            "run",
+            *command,
         ],
         "RunAtLoad": True,
         "KeepAlive": True,
         # Give a running agent time to stop cleanly on SIGTERM before SIGKILL.
         "ExitTimeOut": 30,
         "WorkingDirectory": str(Path.home()),
-        "StandardOutPath": log,
-        "StandardErrorPath": log,
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
         "EnvironmentVariables": {
             "PATH": path_env,
             "PYTHONPATH": src_dir,
@@ -225,21 +230,22 @@ def launchd_access_problems(cfg: Config, host: Host, *, python: str | None = Non
     return out
 
 
-def format_access_problems(problems: list[AccessProblem], python: str | None = None) -> list[str]:
-    """Human lines for ``orch daemon install`` and ``orch doctor``."""
+def format_access_problems(problems: list[AccessProblem], python: str | None = None,
+                           service: str = "daemon") -> list[str]:
+    """Human lines for ``orch daemon|dashboard install`` and ``orch doctor``."""
     if not problems:
         return []
     real_python = Path(python or sys.executable).resolve()
     lines = []
     for p in problems:
-        kind = "daemon can't run" if p.blocking else "a launchd-run Task touching it waits on a privacy prompt"
+        kind = f"{service} can't run" if p.blocking else "a launchd-run Task touching it waits on a privacy prompt"
         lines.append(f"{p.what} {p.path} is in {p.folder} ({kind})")
     lines.append(
         "macOS privacy protection (TCC) keeps launchd agents out of Desktop, Documents, "
         "Downloads, iCloud Drive and external volumes: the access either fails or waits, "
         "unattended, on a \"python3.12 would like to access ...\" dialog. Move these "
-        "outside them (the repo with its .python/.venv, then re-run `orch daemon "
-        f"install`), or allow {real_python} that folder (answer the dialog once at the "
+        "outside them (the repo with its .python/.venv, then re-run `orch "
+        f"{service} install`), or allow {real_python} that folder (answer the dialog once at the "
         "Mac, or give it Full Disk Access in System Settings > Privacy & Security) and "
         "install with --allow-protected."
     )
