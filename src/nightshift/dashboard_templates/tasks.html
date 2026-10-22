@@ -1,26 +1,6 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
-<meta http-equiv="refresh" content="30">
-<title>Nightshift</title>
-<style>
-  :root {
-    --bg: #111317; --panel: #1a1d23; --line: #2a2e36; --text: #e4e6eb; --muted: #8b919c;
-    --running: #6cb6ff; --queued: #a8b1bd; --paused: #e0b44c; --needs: #f08c5a;
-    --done: #57c785; --failed: #ef6b6b;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  }
-  main { max-width: 760px; margin: 0 auto; padding: 16px 14px 40px; }
-  header { display: flex; justify-content: space-between; align-items: baseline; }
-  h1 { font-size: 20px; margin: 0 0 12px; }
-  .asof { color: var(--muted); font-size: 13px; }
+{% extends "base.html" %}
+{% block head %}<meta http-equiv="refresh" content="30">{% endblock %}
+{% block style %}
   section { margin-top: 18px; }
   .group { display: flex; align-items: baseline; gap: 8px; border-bottom: 1px solid var(--line);
            padding-bottom: 4px; }
@@ -30,23 +10,47 @@
   li { background: var(--panel); border-radius: 8px; padding: 10px 12px; margin-top: 8px;
        border-left: 3px solid var(--accent); }
   .title { overflow-wrap: anywhere; }
+  .title a { color: inherit; text-decoration: none; }
   .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px;
           display: flex; flex-wrap: wrap; gap: 4px 10px; }
-  .state { color: var(--accent); }
+  .state, .kind { color: var(--accent); }
+  .summary { margin-top: 4px; overflow-wrap: anywhere; }
+  .details, .action { color: var(--muted); font-size: 13px; margin-top: 4px;
+                      overflow-wrap: anywhere; white-space: pre-line; }
   .empty, .more { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
-  code { font: 12px ui-monospace, Menlo, monospace; }
   .g-running { --accent: var(--running); } .g-queued { --accent: var(--queued); }
-  .g-paused { --accent: var(--paused); } .g-needs-you { --accent: var(--needs); }
+  .g-paused { --accent: var(--paused); } .g-needs-you, .inbox { --accent: var(--needs); }
   .g-done { --accent: var(--done); } .g-failed { --accent: var(--failed); }
-  .g-running h2, .g-needs-you h2, .g-failed h2 { color: var(--accent); }
-</style>
-</head>
-<body>
-<main>
+  .g-running h2, .g-needs-you h2, .g-failed h2, .inbox h2 { color: var(--accent); }
+{% endblock %}
+{% block body %}
   <header>
     <h1>Nightshift</h1>
     <span class="asof">{{ now.strftime("%a %b %-d, %H:%M") }}</span>
   </header>
+  <section class="inbox" id="inbox">
+    <div class="group"><h2>Inbox</h2><span class="count">{{ inbox|length }}</span></div>
+    {% if inbox %}
+    <ul>
+      {% for r in inbox %}
+      <li>
+        <div class="title"><a href="/tasks/{{ r.task_id }}/report">{{ r.title }}</a></div>
+        <div class="meta">
+          <span class="kind">{{ r.kind }}</span>
+          <code>{{ r.task_id }}</code>
+          <span>{{ r.task_type }}</span>
+          <span>since {{ r.since|short_time }}</span>
+        </div>
+        <div class="summary">{{ r.summary }}</div>
+        {% if r.details %}<div class="details">{{ r.details }}</div>{% endif %}
+        {% if r.proposed_action %}<div class="action">Proposed: {{ r.proposed_action }}</div>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">Nothing needs you</p>
+    {% endif %}
+  </section>
   {% for g in groups %}
   <section class="g-{{ g.name|replace(' ', '-') }}">
     <div class="group"><h2>{{ g.name|capitalize }}</h2><span class="count">{{ g.total }}</span></div>
@@ -54,7 +58,7 @@
     <ul>
       {% for t in g.tasks %}
       <li>
-        <div class="title">{{ t.title }}</div>
+        <div class="title"><a href="/tasks/{{ t.id }}/report">{{ t.title }}</a></div>
         <div class="meta">
           {% set state = t.state|replace('_', ' ') %}{% if state != g.name %}<span class="state">{{ state }}</span>{% endif %}
           <code>{{ t.id }}</code>
@@ -73,6 +77,4 @@
     {% endif %}
   </section>
   {% endfor %}
-</main>
-</body>
-</html>
+{% endblock %}

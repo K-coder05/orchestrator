@@ -35,8 +35,13 @@ orch dashboard install       # read-only web dashboard: its own launchd agent on
                              # 127.0.0.1 and the Tailscale address, port 8765
 ```
 
-The dashboard shows Tasks grouped by status (running, queued, paused, needs
-you, done, failed), dark and phone-sized, refreshing every 30 seconds. Open
+The dashboard shows the "needs you" inbox (every open request: the agent's
+`needs_you.json`, plan approvals and re-approvals, spend caps, each with its
+Task, kind and summary; view only, approve with `orch approve` until Phase 3)
+and Tasks grouped by status (running, queued, paused, needs you, done,
+failed), dark and phone-sized, refreshing every 30 seconds. Tap a Task to
+read its `report.md` rendered as Markdown (`/tasks/<id>/report`; raw HTML in
+a report shows as text). Open
 `http://127.0.0.1:8765/` on the Mac, or the Mac's Tailscale address (or its
 full `*.ts.net` MagicDNS name) on your phone. It never listens on the LAN or
 a public address: with Tailscale not connected it refuses to start, and

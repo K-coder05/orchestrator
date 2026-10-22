@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from nightshift import queries, usage
+from nightshift import queries, spend, usage
 from nightshift.adapters.base import RateLimit
 from nightshift.runner import create_task
 from nightshift.states import TaskState
@@ -94,6 +96,97 @@ def test_task_groups_show_only_the_newest_finished_tasks(cfg, db):
     assert [t.title for t in groups["done"].tasks] == ["done 3", "done 2"]
     assert groups["done"].total == 4
     assert len(groups["queued"].tasks) == groups["queued"].total == 4  # open groups: all
+
+
+# --------------------------------------------------------------------------
+# "Needs you" inbox
+# --------------------------------------------------------------------------
+
+
+def _folder(db, tid):
+    return Path(db.get_task(tid)["folder"])
+
+
+def test_inbox_shows_the_agents_request_from_needs_you_json(cfg, db):
+    tid = _task_in(cfg, db, "Tailor resume", TaskState.RUNNING)
+    (_folder(db, tid) / "needs_you.json").write_text(json.dumps({
+        "kind": "approval", "summary": "Push to GitHub?", "details": "Repo acme/site",
+        "proposed_action": "push the branch"}))
+    db.transition(tid, TaskState.NEEDS_YOU, "agent wrote needs_you.json and stopped")
+
+    [r] = queries.needs_you_inbox(cfg, db)
+
+    assert (r.task_id, r.title, r.state) == (tid, "Tailor resume", TaskState.NEEDS_YOU)
+    assert (r.kind, r.summary, r.details, r.proposed_action) == (
+        "approval", "Push to GitHub?", "Repo acme/site", "push the branch")
+    assert r.since == db.get_task(tid)["state_changed_at"]
+
+
+def test_inbox_survives_a_broken_needs_you_json(cfg, db):
+    tid = _task_in(cfg, db, "broken", TaskState.RUNNING)
+    (_folder(db, tid) / "needs_you.json").write_text("{not json")
+    db.transition(tid, TaskState.NEEDS_YOU, "agent wrote needs_you.json and stopped")
+    [r] = queries.needs_you_inbox(cfg, db)
+    assert r.kind == "request" and "not a JSON object" in r.summary
+
+
+def test_inbox_explains_a_per_task_spend_cap_stop(cfg, db):
+    tid = _task_in(cfg, db, "paid", TaskState.RUNNING)
+    run = db.start_attempt(tid, "gemini-api", ["x"], "log")
+    db.finish_attempt(run, exit_code=0, outcome=spend.OUTCOME_CAP, end_reason="cap",
+                      session_id=None)
+    db.transition(tid, TaskState.NEEDS_YOU, "spend cap")
+    [r] = queries.needs_you_inbox(cfg, db)
+    assert r.kind == "spend cap" and "per-Task spend cap" in r.summary
+
+
+def test_inbox_falls_back_to_the_transition_reason(cfg, db):
+    tid = _task_in(cfg, db, "odd", TaskState.RUNNING)
+    db.transition(tid, TaskState.NEEDS_YOU, "stuck twice")
+    [r] = queries.needs_you_inbox(cfg, db)
+    assert (r.kind, r.summary) == ("needs you", "stuck twice")
+
+
+def test_inbox_includes_plan_approvals_and_re_approvals(cfg, db):
+    plan = create_task(cfg, db, "Big plan", needs_approval=True, estimated_minutes=90).spec.id
+    again = _task_in(cfg, db, "Paused long", TaskState.PAUSED_USAGE)
+    db.transition(again, TaskState.AWAITING_APPROVAL,
+                  f"paused for more than 72 hours; needs re-approval (`orch approve {again}`)")
+
+    reqs = {r.task_id: r for r in queries.needs_you_inbox(cfg, db)}
+
+    assert reqs[plan].kind == "plan approval" and "90 min" in reqs[plan].summary
+    assert reqs[plan].proposed_action == f"orch approve {plan} (or orch deny {plan})"
+    assert reqs[again].kind == "re-approval" and "re-approval" in reqs[again].summary
+
+
+def test_inbox_includes_the_monthly_spend_cap_but_not_the_daily_one(cfg, db):
+    month = _task_in(cfg, db, "month", TaskState.RUNNING)
+    db.transition(month, TaskState.PAUSED_SPEND, f"paid calls reached the $50.00 "
+                  f"{spend.MONTHLY_CAP}", set_fields={"pause_kind": spend.KIND_MONTH})
+    day = _task_in(cfg, db, "day", TaskState.RUNNING)
+    db.transition(day, TaskState.PAUSED_SPEND, "daily cap",
+                  set_fields={"pause_kind": spend.KIND_DAY})
+
+    [r] = queries.needs_you_inbox(cfg, db)
+
+    assert r.task_id == month and r.kind == "spend cap" and spend.MONTHLY_CAP in r.summary
+
+
+def test_inbox_is_empty_when_nothing_waits_on_you(cfg, db):
+    _task_in(cfg, db, "queued")
+    _task_in(cfg, db, "running", TaskState.RUNNING)
+    _task_in(cfg, db, "done", TaskState.RUNNING, TaskState.DONE)
+    assert queries.needs_you_inbox(cfg, db) == []
+
+
+def test_inbox_lists_the_longest_waiting_first(cfg, db):
+    first = _task_in(cfg, db, "first", TaskState.RUNNING, TaskState.NEEDS_YOU)
+    second = create_task(cfg, db, "second", needs_approval=True).spec.id
+    db.conn.execute("UPDATE tasks SET state_changed_at = ? WHERE id = ?",
+                    (iso(NOW - timedelta(hours=5)), second))
+    db.conn.commit()
+    assert [r.task_id for r in queries.needs_you_inbox(cfg, db)] == [second, first]
 
 
 # --------------------------------------------------------------------------

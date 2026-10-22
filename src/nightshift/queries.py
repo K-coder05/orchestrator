@@ -6,12 +6,14 @@ dashboard can render the same data its own way.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
-from . import priority, schedules, usage
+from . import priority, schedules, spend, usage
 from .adapters import is_paid
 from .config import Config
 from .db import Database
@@ -96,6 +98,104 @@ def task_groups(
         out.append(TaskGroup(name=name, tasks=members[:finished_limit] if finished else members,
                              total=len(members)))
     return out
+
+
+# --------------------------------------------------------------------------
+# "Needs you" inbox
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NeedsYouRequest:
+    """One open "needs you" request: something waiting on you before its
+    Task can go on. View only until Phase 3's approve/deny buttons."""
+
+    task_id: str
+    title: str
+    task_type: str
+    state: TaskState
+    #: What is asked: the agent's own ``kind`` from ``needs_you.json``, or
+    #: Nightshift's ("plan approval", "re-approval", "spend cap", ...).
+    kind: str
+    summary: str
+    details: str | None
+    proposed_action: str | None
+    #: When the Task started waiting (its last state change).
+    since: str
+
+
+def _needs_you_file(folder: Path) -> dict[str, Any] | None:
+    """The agent's ``needs_you.json``; a dict with only a summary when it is
+    not a JSON object; None when there is none."""
+    path = folder / "needs_you.json"
+    if not path.exists():
+        return None
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        d = None
+    if not isinstance(d, dict):
+        return {"summary": "The agent wrote needs_you.json, but it is not a JSON object; "
+                           "check the Task folder."}
+    return d
+
+
+def _text(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+def _last_reason(db: Database, row: sqlite3.Row) -> tuple[str | None, str]:
+    """The from-state and reason of the transition into the Task's current state."""
+    ts = db.transitions(row["id"])
+    if not ts:
+        return None, ""
+    return ts[-1]["from_state"], ts[-1]["reason"]
+
+
+def _request(cfg: Config, db: Database, row: sqlite3.Row) -> NeedsYouRequest:
+    state = TaskState(row["state"])
+    from_state, reason = _last_reason(db, row)
+    kind, summary, details, action = "needs you", reason, None, None
+    if state == TaskState.NEEDS_YOU:
+        asked = _needs_you_file(Path(row["folder"]))
+        if any(a["outcome"] == spend.OUTCOME_CAP for a in db.attempts(row["id"])) and not asked:
+            kind, summary = "spend cap", spend.cap_reason(cfg, db, row["id"])
+        elif asked is not None:
+            kind = _text(asked.get("kind")) or "request"
+            summary = _text(asked.get("summary")) or reason
+            details = _text(asked.get("details"))
+            action = _text(asked.get("proposed_action"))
+    elif state == TaskState.AWAITING_APPROVAL:
+        if from_state == TaskState.PAUSED_USAGE:
+            kind = "re-approval"
+        else:
+            kind = "plan approval"
+            mins = row["estimated_minutes"]
+            summary = (f"Approve the plan (estimated {mins} min) before it runs" if mins
+                       else "Approve the plan before it runs")
+        action = f"orch approve {row['id']} (or orch deny {row['id']})"
+    elif state == TaskState.PAUSED_SPEND:
+        kind = "spend cap"
+        action = "orch raise-cap USD, or wait for the month to end"
+    return NeedsYouRequest(
+        task_id=row["id"], title=row["title"], task_type=row["task_type"], state=state,
+        kind=kind, summary=summary or "(no summary)", details=details,
+        proposed_action=action, since=row["state_changed_at"],
+    )
+
+
+def needs_you_inbox(cfg: Config, db: Database) -> list[NeedsYouRequest]:
+    """Every open "needs you" request, longest waiting first: Tasks in
+    ``needs_you`` or ``awaiting_approval``, and Tasks paused on the monthly
+    spend cap (which only you can raise)."""
+    rows = [*db.tasks_in_state(TaskState.NEEDS_YOU),
+            *db.tasks_in_state(TaskState.AWAITING_APPROVAL),
+            *(r for r in db.tasks_in_state(TaskState.PAUSED_SPEND)
+              if r["pause_kind"] == spend.KIND_MONTH)]
+    rows.sort(key=lambda r: (r["state_changed_at"], r["created_at"]))
+    return [_request(cfg, db, r) for r in rows]
 
 
 # --------------------------------------------------------------------------

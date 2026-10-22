@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import plistlib
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -169,6 +171,142 @@ def test_refuses_other_host_names(cfg, host):
 
 def test_is_read_only(cfg):
     assert _client(cfg).post("/").status_code == 405
+
+
+# --------------------------------------------------------------------------
+# "Needs you" inbox
+# --------------------------------------------------------------------------
+
+
+def _needs_you(cfg, db, title, request):
+    tid = create_task(cfg, db, title).spec.id
+    db.transition(tid, TaskState.RUNNING, "picked")
+    (Path(db.get_task(tid)["folder"]) / "needs_you.json").write_text(json.dumps(request))
+    db.transition(tid, TaskState.NEEDS_YOU, "agent wrote needs_you.json and stopped")
+    return tid
+
+
+def test_inbox_lists_each_request_with_its_task_kind_and_summary(cfg, db):
+    asks = _needs_you(cfg, db, "Tailor resume for Acme",
+                      {"kind": "scope change", "summary": "Add a cover letter too?",
+                       "details": "The posting asks for one.",
+                       "proposed_action": "write cover.tex"})
+    plan = create_task(cfg, db, "Write a long essay", needs_approval=True,
+                       estimated_minutes=45).spec.id
+    create_task(cfg, db, "Just queued")
+
+    html = _client(cfg).get("/").text
+
+    inbox = html[html.index(">Inbox<"):html.index(">Running<")]
+    for text in ("Tailor resume for Acme", asks, "scope change", "Add a cover letter too?",
+                 "The posting asks for one.", "write cover.tex",
+                 "Write a long essay", plan, "plan approval", "45 min"):
+        assert text in inbox
+    assert "Just queued" not in inbox
+    assert f'href="/tasks/{asks}/report"' in inbox
+    assert html.index(">Inbox<") < html.index(">Running<")  # it leads the page
+
+
+def test_inbox_has_no_action_buttons(cfg, db):
+    _needs_you(cfg, db, "Asks", {"kind": "approval", "summary": "OK to push?"})
+    create_task(cfg, db, "Wants a plan approved", needs_approval=True)
+    html = _client(cfg).get("/").text.lower()
+    assert "<button" not in html and "<form" not in html and 'method="post"' not in html
+
+
+def test_inbox_says_when_nothing_needs_you(cfg):
+    assert "Nothing needs you" in _client(cfg).get("/").text
+
+
+def test_inbox_requests_are_escaped(cfg, db):
+    _needs_you(cfg, db, "Sneaky", {"kind": "<b>k</b>", "summary": "<script>alert(1)</script>",
+                                   "details": "<img src=x onerror=alert(1)>"})
+    html = _client(cfg).get("/").text
+    assert "<script>alert(1)" not in html and "<img src=x" not in html
+    assert "&lt;script&gt;" in html and "&lt;b&gt;k&lt;/b&gt;" in html
+
+
+# --------------------------------------------------------------------------
+# Report viewer
+# --------------------------------------------------------------------------
+
+
+def _report(cfg, db, text, title="Scan postings"):
+    tid = create_task(cfg, db, title).spec.id
+    (Path(db.get_task(tid)["folder"]) / "report.md").write_text(text)
+    return tid
+
+
+def test_report_viewer_renders_report_md_as_markdown(cfg, db):
+    tid = _report(cfg, db, "# Scan postings\n\n## 1. Result\n\n**done**: the Task finished.\n\n"
+                           "## 4. Files created\n\n- `output/new.csv`\n- [notes](output/notes.md)\n\n"
+                           "| agent | cost |\n|---|---|\n| claude | $0.00 |\n")
+
+    r = _client(cfg).get(f"/tasks/{tid}/report")
+
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+    html = r.text
+    assert "<h2>1. Result</h2>" in html
+    assert "<strong>done</strong>: the Task finished." in html
+    assert "<li><code>output/new.csv</code></li>" in html
+    assert '<a href="output/notes.md">notes</a>' in html
+    assert "<table>" in html and "<td>claude</td>" in html
+    assert tid in html and 'href="/"' in html
+
+
+def test_report_viewer_shows_a_new_tasks_skeleton(cfg, db):
+    tid = create_task(cfg, db, "Fresh").spec.id  # create_task writes the draft report
+    html = _client(cfg).get(f"/tasks/{tid}/report").text
+    assert "<h2>2. Needs you</h2>" in html and "not written yet" in html
+
+
+@pytest.mark.parametrize("evil, injected", [
+    ("<script>alert(1)</script>", "<script>alert(1)"),
+    ('<img src=x onerror="alert(1)">', "<img src=x"),
+    ('<a href="https://evil.example">x</a>', '<a href="https://evil.example"'),
+    ("<iframe src=//evil.example></iframe>", "<iframe"),
+    ("[click](javascript:alert(1))", 'href="javascript:'),
+    ("[click](vbscript:msgbox(1))", 'href="vbscript:'),
+    ("[click](data:text/html;base64,PHNjcmlwdD4=)", 'href="data:'),
+    ('![x](x" onerror="alert(1))', "onerror=\"alert"),
+])
+def test_report_viewer_never_injects_raw_html(cfg, db, evil, injected):
+    tid = _report(cfg, db, f"# Report\n\n{evil}\n\ninline {evil} too\n")
+    html = _client(cfg).get(f"/tasks/{tid}/report").text
+    assert injected not in html
+
+
+def test_report_viewer_escapes_the_task_title(cfg, db):
+    tid = _report(cfg, db, "# ok\n", title="<script>alert(1)</script>")
+    html = _client(cfg).get(f"/tasks/{tid}/report").text
+    assert "<script>alert(1)" not in html and "&lt;script&gt;" in html
+
+
+def test_report_viewer_says_when_there_is_no_report(cfg, db):
+    tid = create_task(cfg, db, "No report").spec.id
+    (Path(db.get_task(tid)["folder"]) / "report.md").unlink()
+    r = _client(cfg).get(f"/tasks/{tid}/report")
+    assert r.status_code == 200 and "No report.md yet" in r.text
+
+
+@pytest.mark.parametrize("tid", ["nope", "..%2F..%2Fetc", "%2E%2E"])
+def test_report_viewer_404s_on_an_unknown_task(cfg, tid):
+    assert _client(cfg).get(f"/tasks/{tid}/report").status_code == 404
+
+
+def test_task_titles_link_to_their_reports(cfg, db):
+    tid = create_task(cfg, db, "Linked").spec.id
+    assert f'href="/tasks/{tid}/report"' in _client(cfg).get("/").text
+
+
+def test_report_viewer_is_phone_friendly_and_read_only(cfg, db):
+    tid = _report(cfg, db, "# r\n\n```\n" + "x" * 300 + "\n```\n")
+    client = _client(cfg)
+    html = client.get(f"/tasks/{tid}/report").text
+    assert 'name="viewport"' in html and "width=device-width" in html
+    assert 'name="color-scheme" content="dark"' in html
+    assert "overflow-x: auto" in html  # long code lines and tables scroll, not the page
+    assert client.post(f"/tasks/{tid}/report").status_code == 405
 
 
 # --------------------------------------------------------------------------

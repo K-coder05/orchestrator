@@ -1648,3 +1648,37 @@ lasting consequences go in `docs/adr/` instead.
   several missed 8ams, first start, the next digest covering only what
   happened since, comedy, an outage, a dropped digest, redaction, length,
   config, and the daemon's alert thread sending it.
+
+## Phase 2, issue #28: dashboard "needs you" inbox and report viewer
+
+- **The inbox leads the home page** (`/`, above the status groups), not a
+  page of its own: it is what you open the dashboard for, and it is usually
+  short. Each Task title (inbox and groups) links to its report.
+- **What counts as an open "needs you" request** (`queries.needs_you_inbox`):
+  the same events that alert as "needs you" (§2.12), while they are still
+  open. A Task in `needs_you` shows the agent's `needs_you.json` (`kind`,
+  `summary`, `details`, `proposed_action`; a broken file says so); without
+  one, a per-Task spend cap stop shows the cap reason, else the reason of
+  the transition into `needs_you`. `awaiting_approval` is a "plan approval"
+  (with the estimate) or a "re-approval" (after a long usage pause). A
+  Task in `paused_spend` on the monthly cap is a "spend cap" request, since
+  only `orch raise-cap` (or the new month) frees it; the daily cap clears
+  itself at midnight and isn't listed. Longest waiting first.
+- **View only:** no buttons or forms; the proposed action is text (e.g.
+  `orch approve <id>`). Phase 3 adds the buttons. Comedy Tasks show their
+  title and request here: the dashboard is only on localhost and the
+  tailnet, unlike Telegram where they are status lines only.
+- **Report viewer** (`/tasks/<id>/report`): `markdown-it-py` (new
+  dependency), CommonMark plus tables, with raw HTML **off**, so HTML in a
+  report renders as text and is never injected; markdown-it also refuses
+  `javascript:`, `vbscript:`, `file:` and non-image `data:` links. The
+  folder comes from the database row, never from the URL; an unknown id is
+  a 404, a missing `report.md` says so. Relative links in a report (e.g.
+  `logs/`) aren't served yet. Long code lines and tables scroll inside the
+  page on a phone.
+- **Templates:** a shared `base.html` (head, palette, dark scheme) that the
+  home page and the report extend.
+- **Tests:** the inbox query for each request kind and its order
+  (`tests/test_queries.py`); through TestClient, the inbox's Task, kind and
+  summary, no buttons, escaping, and the report's Markdown, raw HTML and
+  dangerous links never injected, 404, phone meta (`tests/test_dashboard.py`).

@@ -5,6 +5,9 @@ interface, the LAN or a public address, and refuses to start otherwise. It
 runs as its own launchd agent (`orch dashboard install`), apart from the
 daemon. It has no route that changes anything; opening the database (as
 every `orch` command does) may still migrate it.
+
+Routes: ``/`` (the "needs you" inbox, then Tasks grouped by status) and
+``/tasks/<id>/report`` (the Task's ``report.md`` rendered as Markdown).
 """
 
 from __future__ import annotations
@@ -15,9 +18,11 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from markdown_it import MarkdownIt
+from markupsafe import Markup
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import daemon, queries
@@ -136,6 +141,17 @@ def _environment() -> Environment:
     return env
 
 
+#: CommonMark plus tables, with raw HTML off: any HTML in a report is shown
+#: as text, never injected. markdown-it also refuses ``javascript:``,
+#: ``vbscript:``, ``file:`` and non-image ``data:`` links.
+_MARKDOWN = MarkdownIt("commonmark", {"html": False}).enable("table")
+
+
+def render_markdown(text: str) -> Markup:
+    """``text`` as safe HTML for the report viewer."""
+    return Markup(_MARKDOWN.render(text))
+
+
 def allowed_hosts(tailscale_ip: str | None) -> list[str]:
     """Host header names the dashboard answers to. Anything else gets a 400,
     so a web page that points its own name at 127.0.0.1 (DNS rebinding)
@@ -163,10 +179,29 @@ def create_app(
         at = now()
         db = Database(cfg.db_path, tz=cfg.timezone)
         try:
+            inbox = queries.needs_you_inbox(cfg, db)
             groups = queries.task_groups(cfg, db, at)
         finally:
             db.close()
-        return env.get_template("tasks.html").render(groups=groups, now=at)
+        return env.get_template("tasks.html").render(inbox=inbox, groups=groups, now=at)
+
+    @app.get("/tasks/{task_id}/report", response_class=HTMLResponse)
+    def report(task_id: str) -> str:
+        db = Database(cfg.db_path, tz=cfg.timezone)
+        try:
+            row = db.get_task(task_id)
+        finally:
+            db.close()
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such Task")
+        # The folder comes from the database, never from the URL.
+        path = Path(row["folder"]) / "report.md"
+        try:
+            text = path.read_text(errors="replace")
+        except FileNotFoundError:
+            text = None
+        return env.get_template("report.html").render(
+            task=dict(row), report=render_markdown(text) if text is not None else None)
 
     return app
 

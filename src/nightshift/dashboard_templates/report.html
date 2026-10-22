@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}{{ task.title }} · Nightshift{% endblock %}
+{% block style %}
+  nav { font-size: 14px; margin-bottom: 10px; }
+  .meta { color: var(--muted); font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 4px 10px; }
+  .empty { color: var(--muted); }
+  article { background: var(--panel); border-radius: 8px; padding: 4px 14px 12px; margin-top: 12px;
+            overflow-wrap: anywhere; }
+  article h1 { font-size: 18px; margin: 12px 0 8px; }
+  article h2 { font-size: 15px; margin: 18px 0 6px; border-bottom: 1px solid var(--line);
+               padding-bottom: 3px; }
+  article h3, article h4 { font-size: 14px; margin: 14px 0 4px; }
+  article p, article ul, article ol { margin: 6px 0; }
+  article ul, article ol { padding-left: 20px; }
+  article pre { background: var(--bg); border-radius: 6px; padding: 8px 10px; overflow-x: auto;
+                white-space: pre; }
+  article :not(pre) > code { background: var(--bg); border-radius: 4px; padding: 1px 4px;
+                             overflow-wrap: anywhere; }
+  article blockquote { margin: 6px 0; padding-left: 10px; border-left: 3px solid var(--line);
+                       color: var(--muted); }
+  article table { display: block; overflow-x: auto; border-collapse: collapse; font-size: 13px; }
+  article th, article td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }
+  article img { max-width: 100%; }
+  article hr { border: 0; border-top: 1px solid var(--line); }
+{% endblock %}
+{% block body %}
+  <nav><a href="/">&larr; Nightshift</a></nav>
+  <header>
+    <h1>{{ task.title }}</h1>
+  </header>
+  <div class="meta">
+    <code>{{ task.id }}</code>
+    <span>{{ task.state|replace('_', ' ') }}</span>
+    <span>{{ task.task_type }} · {{ task.agent }}</span>
+    <span>{{ task.created_at|short_time }}</span>
+  </div>
+  {% if report is none %}
+  <p class="empty">No report.md yet.</p>
+  {% else %}
+  <article>{{ report }}</article>
+  {% endif %}
+{% endblock %}
