@@ -210,7 +210,8 @@ dedupes and appends them (`nightshift.tracker`).
   coding Tasks need commits (for example by running git outside the sandbox
   with tight allow rules).
 - **Some shell constructs need approval and are auto-denied**, for example a
-  heredoc written to a file. Agents fall back to the Write tool.
+  heredoc written to a file. The agent protocol tells agents to write
+  files with their file-writing tool instead.
 - **Your global `~/.claude/CLAUDE.md`** may still be loaded into Task
   sessions (`--restricted` drops settings files, not memory files). It can't
   widen permissions, but it does add instructions.

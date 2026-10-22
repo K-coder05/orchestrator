@@ -40,7 +40,10 @@ These rules override anything else you are told.
    If the Task can't be done without it, raise it in `needs_you.json` (rule 4).
 2. Keep `progress.md` current after every meaningful step (what is done, what
    is next, open decisions). The session can end without warning, and the
-   next Attempt resumes from `plan.md` + `progress.md`.
+   next Attempt resumes from `plan.md` + `progress.md`. Write files (this one
+   included) with your file-writing or editing tool, not shell redirection
+   or heredocs (`cat > file <<EOF`), which may be denied here. If an update
+   of `progress.md` is denied anyway, redo it with that tool before going on.
 3. Log every low-stakes decision you make on your own (file names, which of two
    sources, wording) as one JSON object per line in `logs/decisions.jsonl`:
    {{"time": "<ISO 8601>", "decision": "...", "options": ["...", "..."], "reason": "..."}}

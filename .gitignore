@@ -13,3 +13,6 @@ dist/
 .env
 config.yaml
 .DS_Store
+
+# The user's own resume (personal; never commit)
+/master.tex

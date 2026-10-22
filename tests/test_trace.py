@@ -129,3 +129,14 @@ def test_unified_diff_and_fence():
     assert d.splitlines()[:2] == ["--- a/master.tex", "+++ b/output/resume.tex"]
     assert "-b" in d and "+c" in d
     assert trace.fenced("x ``` y", "diff").startswith("````diff\n")
+
+
+def test_unified_diff_when_master_has_no_final_newline():
+    # A master.tex saved without a trailing newline, an agent's copy with one.
+    d = trace.unified_diff("\\begin{document}\nx\n\\end{document}",
+                           "\\begin{document}\ny\n\\end{document}\n",
+                           "a/master.tex", "b/output/resume.tex")
+    lines = d.splitlines()
+    assert "-\\end{document}" in lines and "+\\end{document}" in lines
+    assert "\\ No newline at end of file" in lines
+    assert not any(ln.count("\\end{document}") > 1 for ln in lines)

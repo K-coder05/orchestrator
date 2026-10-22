@@ -125,6 +125,14 @@ def test_internet_on_allows_web_tools(tmp_path):
     assert "WebFetch" in perms.tools and "WebFetch" in perms.allow
 
 
+def test_protocol_says_to_write_progress_with_the_file_tool(tmp_path):
+    # A real haiku run lost its only progress.md update to an auto-denied
+    # heredoc (`cat > progress.md <<EOF`) and then paused with it unchanged.
+    text = " ".join(agent_protocol(tmp_path).split())
+    assert "not shell redirection or heredocs" in text
+    assert "If an update of `progress.md` is denied anyway, redo it" in text
+
+
 def test_resume_command_reinjects_protocol(tmp_path):
     a = ClaudeAdapter()
     perms = a.write_permissions(tmp_path, _policy(tmp_path))

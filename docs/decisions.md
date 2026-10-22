@@ -805,6 +805,29 @@ lasting consequences go in `docs/adr/` instead.
   after the 5-minute simulated reset, `done`; the same 7 output files, all
   post-hook checks passed (2 changed lines traced, 1 page), $0.020 over 2
   Attempts.
+- **Gate Test 1 re-run on the user's real `master.tex` (2026-10-21,
+  21:26-21:46 PDT)**, scratch config, haiku, real TeX. It compiles on its own
+  to 1 page in the sandbox. No cover-letter template was configured and
+  `orch add` refuses without one (the default path doesn't exist), so a
+  generic placeholder letter template was used. Run 1 (live Cloudflare SWE
+  intern posting, Greenhouse): `done` in 2m 20s, $0.028; 2 changed lines,
+  3 entries (one a removed bullet), 38 numbers, all trace; 1 page; only
+  WebFetch GETs. Run 2 (live Figma SWE intern posting,
+  `--simulate-rate-limit-after 10`): paused, resumed the same session after
+  the 5-minute reset, `done` with all post-hooks passing, but the log said
+  "progress.md was NOT updated during this Attempt": haiku's only update was
+  a `cat > progress.md <<EOF` heredoc, which is auto-denied, and it didn't
+  redo it. Two fixes, then a re-run of run 2: `done` in 2m 16s over 2
+  Attempts, $0.029 (the stopped Attempt's cost isn't known), "progress.md
+  was updated during this Attempt", 3 changed lines + moved blocks, 14
+  entries, 40 numbers, all trace, 1 page, GETs only.
+  - The agent protocol (rule 2) now says to write files, `progress.md`
+    included, with the file-writing tool rather than shell redirection or
+    heredocs, and to redo a denied `progress.md` update that way.
+  - `trace.unified_diff` now emits diff's `\ No newline at end of file`
+    marker. The real `master.tex` has no final newline, and difflib glued
+    the next line on (`-\end{document}+\end{document}` on one line), which
+    also made the report's "N line(s) added" count wrong.
 
 ## Phase 1, issue #12: Schedules with catch-up and overlap rules
 

@@ -279,9 +279,15 @@ def check(master: str, resume: str, changes: str, *, master_name: str = "master.
 
 
 def unified_diff(old: str, new: str, old_name: str, new_name: str) -> str:
-    return "".join(difflib.unified_diff(
-        old.splitlines(keepends=True), new.splitlines(keepends=True),
-        fromfile=old_name, tofile=new_name)).rstrip("\n")
+    """``diff -u`` style. A last line without a newline gets diff's own
+    ``\\ No newline at end of file`` marker (difflib would otherwise glue the
+    next diff line onto it, e.g. ``-\\end{document}+\\end{document}``)."""
+    out = []
+    for line in difflib.unified_diff(
+            old.splitlines(keepends=True), new.splitlines(keepends=True),
+            fromfile=old_name, tofile=new_name):
+        out.append(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n")
+    return "".join(out).rstrip("\n")
 
 
 def fenced(text: str, lang: str = "") -> str:
