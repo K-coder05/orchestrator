@@ -2,7 +2,7 @@
 
 > **Instructions for Claude Code**
 >
-> **CURRENT PHASE: 1.** Build only the current phase. Do not start work listed under a later phase, even if it looks easy. Do not implement anything listed under "Open decisions" (§7) until it is resolved in this file.
+> **CURRENT PHASE: 2.** Build only the current phase. Do not start work listed under a later phase, even if it looks easy. Do not implement anything listed under "Open decisions" (§7) until it is resolved in this file.
 >
 > - If something in this spec is ambiguous or contradicts itself, stop and ask. Do not guess.
 > - If a CLI flag, output format or error message named here doesn't match the installed tool, trust the tool (`--help`, real output), record what you found in `docs/adapters.md`, and tell me.
@@ -276,7 +276,7 @@ The daemon keeps its own scheduler state in SQLite. On every start and every wak
 |---|---|
 | Research, scraping, summaries | Fail over to Gemini |
 | Coding projects | Fail over to Codex. If Codex is also out, wait, and resume on whichever of Claude or Codex resets first |
-| Resume and cover-letter tailoring | Wait for reset, unless the deadline is within 24 hours |
+| Resume and cover-letter tailoring | Wait for reset, unless the deadline is within 24 hours. Then fail over to Gemini, or to Codex if Gemini is also out |
 | YouTube comedy writing (scripts, punch-up, descriptions, captions) | Always wait for Claude |
 | Study plans and practice problems | Fail over to Gemini |
 
@@ -474,4 +474,4 @@ Gemini, failover other than coding to Codex, Telegram, the dashboard, spend caps
 
 If new ones come up, add them here, and don't implement them until they're resolved in this file.
 
-- **(Phase 2) Paid credits vs. failover order.** When Claude is out and a task fails over to Gemini, but the Gemini subscription quota is also gone: does the paid-credit rule (§1.5) apply to the failover target, or does the task wait?
+- ~~**(Phase 2) Paid credits vs. failover order.**~~ **Resolved:** when a task fails over and the failover target's subscription quota (e.g. Gemini's) is also gone, the paid-credit rule (§1.5) does **not** apply. The task waits, like any other task whose agents are all out.
