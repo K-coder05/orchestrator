@@ -785,6 +785,16 @@ fence is stripped). The probe sends "Answer with the single word OK." /
 
 ### Still to verify (needs the CLI installed and signed in)
 
+`tests/test_gemini_real.py` (opt-in: `NIGHTSHIFT_REAL_AGENT=1 .venv/bin/python
+-m pytest tests/test_gemini_real.py`, model from `NIGHTSHIFT_GEMINI_MODEL`)
+covers item 4 (escapes, data dir, home, read-only dirs, shell network,
+web fetch per internet setting), "tools run in an untrusted folder" of item
+3, a resume of the same session after Nightshift stops an Attempt (item 5,
+usage printed, not judged), a real Task to `done` with a report (item 7,
+through `create_task`/`run_attempt`, not the `orch add` CLI), and a real
+planning call and probe. The rest of item 3 (no warnings, tool list, MCP,
+extensions and hooks off) and items 1, 2 and 6 are by hand.
+
 1. `gemini --version` / `--help` from the installed CLI (0.65.0 read here).
 2. A recorded stream of a real Task (replace `gemini_stream.jsonl`).
 3. Settings and policy accepted (no warnings), tools limited to
