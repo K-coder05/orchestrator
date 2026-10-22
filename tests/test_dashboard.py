@@ -13,11 +13,13 @@ import yaml
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
-from nightshift import cli, dashboard
+from nightshift import cli, dashboard, views
 from nightshift.config import ConfigError, load_config
 from nightshift.host import FakeHost
-from nightshift.runner import create_task
+from nightshift.runner import create_task, run_attempt
 from nightshift.states import TaskState
+
+from test_runner import env, fake_provider  # noqa: F401  (pytest fixture)
 
 TAILSCALE_IP = "100.101.102.103"
 NOW = datetime(2026, 10, 21, 22, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -307,6 +309,152 @@ def test_report_viewer_is_phone_friendly_and_read_only(cfg, db):
     assert 'name="color-scheme" content="dark"' in html
     assert "overflow-x: auto" in html  # long code lines and tables scroll, not the page
     assert client.post(f"/tasks/{tid}/report").status_code == 405
+
+
+# --------------------------------------------------------------------------
+# Live log tail
+# --------------------------------------------------------------------------
+
+
+def _log(db, tid, *lines):
+    with open(Path(db.get_task(tid)["folder"]) / "logs" / "nightshift.log", "a") as f:
+        f.write("".join(f"{line}\n" for line in lines))
+
+
+def _running(cfg, db, title="Tailor resume for Acme"):
+    tid = create_task(cfg, db, title).spec.id
+    db.transition(tid, TaskState.RUNNING, "picked")
+    return tid
+
+
+def _events(cfg, polls=1):
+    app = dashboard.create_app(cfg, tailscale_ip=TAILSCALE_IP, clock=lambda: NOW,
+                               live_interval=0, live_polls=polls)
+    r = TestClient(app, base_url="http://127.0.0.1:8765").get("/live/events")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
+    out = []
+    for block in r.text.split("\n\n"):
+        if block:
+            event, data = block.split("\n")
+            out.append((event.removeprefix("event: "), data.removeprefix("data: ")))
+    return out
+
+
+def test_live_tail_matches_orch_logs_after_a_real_run(cfg, db, env):  # noqa: F811
+    tid = create_task(cfg, db, "Write a haiku to output/haiku.txt").spec.id
+    run_attempt(cfg, db, tid, adapter_provider=fake_provider)
+    # Watch it as if it were still running.
+    db.conn.execute("UPDATE tasks SET state = 'running' WHERE id = ?", (tid,))
+    db.conn.commit()
+
+    events = _events(cfg)
+
+    assert events[0][0] == "task"
+    assert json.loads(events[0][1]) == {"id": tid, "title": "Write a haiku to output/haiku.txt",
+                                        "task_type": "general", "agent": "claude"}
+    lines = [d for e, d in events[1:]]
+    assert {e for e, _ in events[1:]} == {"line"}
+    assert lines == list(views.task_logs(cfg, db, tid))
+    assert "== Attempt 1 (claude) ==" in lines and "[step] Write" in lines
+
+
+def test_live_tail_streams_new_lines_as_they_happen(cfg, db):
+    tid = _running(cfg, db)
+    _log(db, tid, "Attempt 1 started")
+    tail = dashboard.LiveTail(cfg)
+
+    assert tail.poll(db)[1:] == [("line", "[nightshift] Attempt 1 started")]
+    assert tail.poll(db) == []
+    _log(db, tid, "step one")
+    with open(Path(db.get_task(tid)["folder"]) / "logs" / "nightshift.log", "a") as f:
+        f.write("partial")
+    assert tail.poll(db) == [("line", "[nightshift] step one")]  # whole lines only
+    _log(db, tid, " now whole")
+    assert tail.poll(db) == [("line", "[nightshift] partial now whole")]
+
+
+def test_live_tail_ends_like_orch_logs_f_then_goes_idle(cfg, db):
+    tid = _running(cfg, db)
+    tail = dashboard.LiveTail(cfg)
+    tail.poll(db)
+    _log(db, tid, "last words")
+    db.transition(tid, TaskState.DONE, "finished")
+
+    assert tail.poll(db) == [("line", "[nightshift] last words"),
+                             ("line", f"Task {tid} is done."),
+                             ("idle", dashboard.IDLE_TEXT)]
+    assert tail.poll(db) == []  # says idle once
+
+
+def test_live_tail_moves_on_to_the_next_running_task(cfg, db):
+    first = _running(cfg, db, "First")
+    tail = dashboard.LiveTail(cfg)
+    tail.poll(db)
+    db.transition(first, TaskState.DONE, "finished")
+    second = _running(cfg, db, "Second")
+    _log(db, second, "hello")
+
+    events = tail.poll(db)
+
+    assert events[0] == ("line", f"Task {first} is done.")
+    assert events[1][0] == "task" and json.loads(events[1][1])["id"] == second
+    assert events[2:] == [("line", "[nightshift] hello")]
+
+
+def test_live_tail_is_idle_when_nothing_is_running(cfg, db):
+    create_task(cfg, db, "Only queued")
+    assert _events(cfg) == [("idle", "Nothing is running.")]
+    html = _client(cfg).get("/live").text
+    assert "Nothing is running." in html and 'id="idle" hidden' not in html
+    assert 'id="task" hidden' in html
+
+
+def test_live_page_shows_the_running_task_and_streams_from_live_events(cfg, db):
+    tid = _running(cfg, db, "<b>Acme</b>")
+    html = _client(cfg).get("/live").text
+    assert tid in html and "&lt;b&gt;Acme&lt;/b&gt;" in html and "<b>Acme" not in html
+    assert 'id="idle" hidden' in html
+    assert 'new EventSource("/live/events")' in html
+    assert "innerHTML" not in html  # lines go in as text only
+    assert 'name="viewport"' in html and 'http-equiv="refresh"' not in html
+    assert 'href="/live"' in _client(cfg).get("/").text
+
+
+def test_live_tail_sends_only_the_last_lines_on_connect(cfg, db):
+    tid = _running(cfg, db)
+    _log(db, tid, *[f"line {n}" for n in range(10)])
+    events = dashboard.LiveTail(cfg, backlog=3).poll(db)
+    assert events[1:] == [("line", f"... 7 earlier lines: orch logs {tid}"),
+                          ("line", "[nightshift] line 7"), ("line", "[nightshift] line 8"),
+                          ("line", "[nightshift] line 9")]
+
+
+def test_live_tail_masks_secrets(cfg, db):
+    cfg.secrets.also_redact("tok-123456")
+    tid = _running(cfg, db)
+    _log(db, tid, "calling with tok-123456")
+    events = _events(cfg)
+    assert "tok-123456" not in str(events)
+    assert ("line", "[nightshift] calling with [REDACTED]") in events
+
+
+def test_live_tail_shows_no_more_than_orch_logs_for_comedy(cfg, db):
+    tid = create_task(cfg, db, "Punch up the bit", task_type="comedy").spec.id
+    db.transition(tid, TaskState.RUNNING, "picked")
+    _log(db, tid, "Attempt 1 started")
+    lines = [d for e, d in dashboard.LiveTail(cfg).poll(db) if e == "line"]
+    assert lines == list(views.task_logs(cfg, db, tid))
+
+
+def test_events_cannot_forge_another_event():
+    assert dashboard.sse("line", "a\n\nevent: task\rdata: x") == \
+        "event: line\ndata: a  event: task data: x\n\n"
+
+
+def test_live_routes_are_read_only(cfg):
+    client = _client(cfg)
+    assert client.post("/live").status_code == 405
+    assert client.post("/live/events").status_code == 405
 
 
 # --------------------------------------------------------------------------

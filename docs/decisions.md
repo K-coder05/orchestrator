@@ -1682,3 +1682,36 @@ lasting consequences go in `docs/adr/` instead.
   (`tests/test_queries.py`); through TestClient, the inbox's Task, kind and
   summary, no buttons, escaping, and the report's Markdown, raw HTML and
   dangerous links never injected, 404, phone meta (`tests/test_dashboard.py`).
+
+## Phase 2, issue #29: dashboard live log tail
+
+- **Its own page, `/live`, linked from the home page header.** The home
+  page reloads every 30 s, which would cut a stream; the live tail is a
+  page that never reloads.
+- **Server-sent events, not HTMX or WebSockets.** `/live/events` is a
+  `text/event-stream` (`StreamingResponse`), read by `EventSource` in a
+  dozen lines of inline script: one-way is all a read-only tail needs,
+  EventSource reconnects by itself (each connection starts afresh, so a
+  reconnect never repeats lines), and no script is loaded from a CDN.
+  Lines are added with `textContent`, never as HTML; an event's data is
+  one line, line breaks flattened, so log text can't forge an event.
+- **Exactly `orch logs -f`.** `views.task_logs` was split into
+  `views.LogReader` (one incremental pass: Nightshift's lines, then each
+  Attempt's stream through its adapter, whole lines only), used by both.
+  So it shows no more than `orch logs` does: comedy Tasks' lines show
+  here as they do in the terminal (the dashboard is localhost and the
+  tailnet only, as for the inbox), and each line is also masked with every
+  known secret value, as alerts are.
+- **What it streams** (`dashboard.LiveTail`, polled every second per open
+  page): `task` when a Task starts running, then its lines; when it stops,
+  its last lines and `Task <id> is <state>.` (where `orch logs -f` ends),
+  then `idle` ("Nothing is running.") or the next Task. Joining mid-run
+  sends only the last 200 lines, with a pointer to `orch logs <id>`; the
+  page keeps at most 2000. The daemon runs one Task at a time; were there
+  several, the oldest is tailed. The page itself renders the running Task
+  or the idle state, so it's right before the first event arrives.
+- **Tests:** `LiveTail` polls (new and partial lines, the end line, idle
+  once, the next Task, the backlog, secrets, comedy) and through
+  TestClient the stream after a real fake-agent run equals `orch logs`, the
+  idle stream and page, escaping, no reload, and event forging. Smoke-run
+  under uvicorn with curl: lines arrived as they were written.

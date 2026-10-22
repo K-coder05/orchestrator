@@ -6,29 +6,34 @@ runs as its own launchd agent (`orch dashboard install`), apart from the
 daemon. It has no route that changes anything; opening the database (as
 every `orch` command does) may still migrate it.
 
-Routes: ``/`` (the "needs you" inbox, then Tasks grouped by status) and
-``/tasks/<id>/report`` (the Task's ``report.md`` rendered as Markdown).
+Routes: ``/`` (the "needs you" inbox, then Tasks grouped by status),
+``/tasks/<id>/report`` (the Task's ``report.md`` rendered as Markdown) and
+``/live`` (a live tail of the running Task's logs, streamed from
+``/live/events`` as server-sent events).
 """
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import json
 import socket
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markdown_it import MarkdownIt
 from markupsafe import Markup
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import daemon, queries
+from . import daemon, queries, views
 from .config import Config
 from .db import Database
 from .host import Host
+from .states import TaskState
 from .timeutil import now as local_now
 from .timeutil import parse_iso
 
@@ -152,6 +157,86 @@ def render_markdown(text: str) -> Markup:
     return Markup(_MARKDOWN.render(text))
 
 
+# --------------------------------------------------------------------------
+# Live log tail
+# --------------------------------------------------------------------------
+
+#: Lines of the running Task's log sent when the tail starts on it; earlier
+#: ones are left to `orch logs`.
+BACKLOG = 200
+
+IDLE_TEXT = "Nothing is running."
+
+
+class LiveTail:
+    """The running Task's log lines for ``/live``, one poll at a time.
+
+    Lines are exactly what ``orch logs -f`` prints (``views.LogReader``),
+    then masked with every known secret value like other output. Each poll
+    returns ``(event, data)`` pairs: ``task`` when a Task starts running (or
+    on the first poll, with only its last ``BACKLOG`` lines after it),
+    ``line`` for each log line, and ``idle`` once nothing is running. When
+    the Task stops, its last lines and the ``Task <id> is <state>.`` line
+    that ends ``orch logs -f`` come before ``idle`` or the next ``task``.
+    The daemon runs one Task at a time; were there ever several, the oldest
+    is tailed."""
+
+    def __init__(self, cfg: Config, *, backlog: int = BACKLOG):
+        self.cfg = cfg
+        self.backlog = backlog
+        self.reader: views.LogReader | None = None
+        self.idle: bool | None = None  # None until the first poll
+
+    def _line(self, text: str) -> tuple[str, str]:
+        return ("line", self.cfg.secrets.redact(text))
+
+    def poll(self, db: Database) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        running = db.tasks_in_state(TaskState.RUNNING)
+        current = running[0] if running else None
+        if self.reader is not None and (current is None or current["id"] != self.reader.task_id):
+            ended = self.reader
+            self.reader = None
+            try:
+                lines = ended.read(db)
+            except KeyError:  # deleted
+                lines = []
+            out += [self._line(line) for line in lines]
+            if ended.state is not None:
+                out.append(self._line(views.stopped_line(ended.task_id, ended.state)))
+        if current is None:
+            if self.idle is not True:
+                out.append(("idle", IDLE_TEXT))
+            self.idle = True
+            return out
+        self.idle = False
+        if self.reader is None:
+            self.reader = views.LogReader(self.cfg, current["id"])
+            out.append(("task", json.dumps(_task_header(current))))
+            lines = self.reader.read(db)
+            if len(lines) > self.backlog:
+                skipped = len(lines) - self.backlog
+                out.append(self._line(
+                    f"... {skipped} earlier lines: orch logs {current['id']}"))
+                lines = lines[-self.backlog:]
+        else:
+            lines = self.reader.read(db)
+        out += [self._line(line) for line in lines]
+        return out
+
+
+def _task_header(row) -> dict[str, str]:
+    return {"id": row["id"], "title": row["title"], "task_type": row["task_type"],
+            "agent": row["agent"]}
+
+
+def sse(event: str, data: str) -> str:
+    """One server-sent event. ``data`` is one line; any line break in it is
+    flattened so it can't end the event or start a forged one."""
+    data = " ".join(data.splitlines())
+    return f"event: {event}\ndata: {data}\n\n"
+
+
 def allowed_hosts(tailscale_ip: str | None) -> list[str]:
     """Host header names the dashboard answers to. Anything else gets a 400,
     so a web page that points its own name at 127.0.0.1 (DNS rebinding)
@@ -165,8 +250,12 @@ def allowed_hosts(tailscale_ip: str | None) -> list[str]:
 def create_app(
     cfg: Config, *, tailscale_ip: str | None = None,
     clock: Callable[[], datetime] | None = None,
+    live_interval: float = 1.0, live_polls: int | None = None,
 ) -> FastAPI:
-    """The dashboard app. Each request opens its own read of the database."""
+    """The dashboard app. Each request opens its own read of the database.
+
+    ``/live/events`` polls the logs every ``live_interval`` seconds until the
+    browser goes away (or, in tests, after ``live_polls`` polls)."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts(tailscale_ip))
     env = _environment()
@@ -202,6 +291,38 @@ def create_app(
             text = None
         return env.get_template("report.html").render(
             task=dict(row), report=render_markdown(text) if text is not None else None)
+
+    @app.get("/live", response_class=HTMLResponse)
+    def live() -> str:
+        db = Database(cfg.db_path, tz=cfg.timezone)
+        try:
+            running = db.tasks_in_state(TaskState.RUNNING)
+        finally:
+            db.close()
+        task = _task_header(running[0]) if running else None
+        return env.get_template("live.html").render(task=task, idle_text=IDLE_TEXT)
+
+    @app.get("/live/events")
+    def live_events(request: Request) -> StreamingResponse:
+        async def stream() -> AsyncIterator[str]:
+            tail = LiveTail(cfg)
+            db = Database(cfg.db_path, tz=cfg.timezone)
+            try:
+                polls = 0
+                while True:
+                    for event, data in tail.poll(db):
+                        yield sse(event, data)
+                    polls += 1
+                    if live_polls is not None and polls >= live_polls:
+                        return
+                    if await request.is_disconnected():
+                        return
+                    await asyncio.sleep(live_interval)
+            finally:
+                db.close()
+
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-store"})
 
     return app
 

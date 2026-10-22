@@ -41,7 +41,9 @@ Task, kind and summary; view only, approve with `orch approve` until Phase 3)
 and Tasks grouped by status (running, queued, paused, needs you, done,
 failed), dark and phone-sized, refreshing every 30 seconds. Tap a Task to
 read its `report.md` rendered as Markdown (`/tasks/<id>/report`; raw HTML in
-a report shows as text). Open
+a report shows as text). **Live log** (`/live`) tails the running Task's
+logs as they happen, the same lines as `orch logs -f`, and says "Nothing is
+running." when it's idle. Open
 `http://127.0.0.1:8765/` on the Mac, or the Mac's Tailscale address (or its
 full `*.ts.net` MagicDNS name) on your phone. It never listens on the LAN or
 a public address: with Tailscale not connected it refuses to start, and

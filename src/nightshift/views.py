@@ -1,6 +1,7 @@
 """Text rendering for the CLI: ``orch list|show|logs|usage`` and ``orch schedule list``.
 
-The data comes from ``queries``; ``task_logs`` reads the log files itself."""
+The data comes from ``queries``; ``LogReader`` reads the log files itself
+(for `orch logs` and the dashboard's live tail)."""
 
 from __future__ import annotations
 
@@ -181,6 +182,74 @@ def _stream_path(folder: Path, attempt: sqlite3.Row) -> Path | None:
     return path if path.is_absolute() else folder / path
 
 
+class LogReader:
+    """A Task's logs read a pass at a time, rendered as ``orch logs`` prints
+    them: Nightshift's own lines, then each Attempt's agent stream (``raw``
+    gives the stream's JSON lines as written). Each ``read`` returns only
+    what is new since the last one, including new Attempts. Only whole
+    lines are returned; a partial last line waits for the next pass.
+
+    Shared by ``orch logs -f`` and the dashboard's live tail, so both show
+    exactly the same lines."""
+
+    def __init__(self, cfg: Config, task_id: str, *, raw: bool = False):
+        self.cfg = cfg
+        self.task_id = task_id
+        self.raw = raw
+        #: The Task's state when the last ``read`` started: once it is no
+        #: longer running, that read saw everything it will write.
+        self.state: TaskState | None = None
+        self._read_upto: dict[str, int] = {}  # file -> bytes already returned
+        self._adapters: dict[int, object | None] = {}
+
+    def _new_lines(self, path: Path) -> list[str]:
+        if not path.exists():
+            return []
+        done = self._read_upto.get(str(path), 0)
+        with open(path, "rb") as f:
+            f.seek(done)
+            chunk = f.read()
+        cut = chunk.rfind(b"\n") + 1
+        self._read_upto[str(path)] = done + cut
+        return chunk[:cut].decode(errors="replace").splitlines()
+
+    def read(self, db: Database) -> list[str]:
+        row = db.get_task(self.task_id)
+        if row is None:
+            raise KeyError(self.task_id)
+        self.state = TaskState(row["state"])
+        folder = Path(row["folder"])
+        out = [f"[nightshift] {line}" for line in self._new_lines(folder / "logs" / "nightshift.log")]
+        for a in db.attempts(self.task_id):
+            path = _stream_path(folder, a)
+            if path is None:
+                continue
+            if a["id"] not in self._adapters:
+                out.append(f"== Attempt {a['attempt_no']} ({a['agent']}) ==")
+                adapter = None
+                if not self.raw:
+                    try:
+                        adapter = get_adapter(a["agent"], self.cfg.agent(a["agent"]))
+                    except Exception:  # unknown agent: fall back to raw lines
+                        adapter = None
+                self._adapters[a["id"]] = adapter
+            adapter = self._adapters[a["id"]]
+            for line in self._new_lines(path):
+                if adapter is None:
+                    out.append(line)
+                    continue
+                for ev in adapter.parse_stream(line):  # type: ignore[attr-defined]
+                    text = format_event(ev)
+                    if text:
+                        out.append(text)
+        return out
+
+
+def stopped_line(task_id: str, state: TaskState) -> str:
+    """The line ``orch logs -f`` ends on."""
+    return f"Task {task_id} is {state}."
+
+
 def task_logs(
     cfg: Config,
     db: Database,
@@ -191,58 +260,19 @@ def task_logs(
     interval: float = 0.5,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Iterator[str]:
-    """Nightshift's log lines for the Task plus every Attempt's agent stream,
-    rendered readably (``raw`` gives the stream's JSON lines as written).
+    """Every log line of the Task (see ``LogReader``).
 
     With ``follow`` it keeps printing new output, including new Attempts,
     until the Task is no longer queued or running (Ctrl-C stops it earlier).
-    Only whole lines are printed; a partial last line waits for the next pass.
     """
-    read_upto: dict[str, int] = {}  # file -> bytes already printed
-    adapters: dict[int, object | None] = {}
-
-    def new_lines(path: Path) -> list[str]:
-        if not path.exists():
-            return []
-        with open(path, "rb") as f:
-            f.seek(read_upto.get(str(path), 0))
-            chunk = f.read()
-        cut = chunk.rfind(b"\n") + 1
-        read_upto[str(path)] = read_upto.get(str(path), 0) + cut
-        return chunk[:cut].decode(errors="replace").splitlines()
-
+    reader = LogReader(cfg, task_id, raw=raw)
     while True:
-        row = db.get_task(task_id)
-        folder = Path(row["folder"])
-        for line in new_lines(folder / "logs" / "nightshift.log"):
-            yield f"[nightshift] {line}"
-        for a in db.attempts(task_id):
-            path = _stream_path(folder, a)
-            if path is None:
-                continue
-            if a["id"] not in adapters:
-                yield f"== Attempt {a['attempt_no']} ({a['agent']}) =="
-                adapter = None
-                if not raw:
-                    try:
-                        adapter = get_adapter(a["agent"], cfg.agent(a["agent"]))
-                    except Exception:  # unknown agent: fall back to raw lines
-                        adapter = None
-                adapters[a["id"]] = adapter
-            adapter = adapters[a["id"]]
-            for line in new_lines(path):
-                if adapter is None:
-                    yield line
-                    continue
-                for ev in adapter.parse_stream(line):  # type: ignore[attr-defined]
-                    text = format_event(ev)
-                    if text:
-                        yield text
-        state = TaskState(row["state"])
+        yield from reader.read(db)
         if not follow:
             return
-        if state not in (TaskState.QUEUED, TaskState.RUNNING):
-            yield f"Task {task_id} is {state}."
+        assert reader.state is not None
+        if reader.state not in (TaskState.QUEUED, TaskState.RUNNING):
+            yield stopped_line(task_id, reader.state)
             return
         sleep(interval)
 
