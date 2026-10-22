@@ -381,6 +381,9 @@ def resume_by_hand(cfg: Config, db: Database, task_id: str, *, at: datetime,
     if state == TaskState.AWAITING_APPROVAL and row["resume_pending"]:
         raise NotAllowed(f"Task {task_id} was paused too long and needs re-approval: "
                          f"`orch approve {task_id}`")
+    if state == TaskState.PAUSED_SPEND:
+        raise NotAllowed(f"Task {task_id} is paused on a spend cap; it resumes on its own once "
+                         "the cap lifts (`orch raise-cap USD` raises this month's)")
     if state != TaskState.PAUSED_USAGE:
         raise NotAllowed(f"Task {task_id} is {state}, not paused")
     kind = row["pause_kind"] or "pause"

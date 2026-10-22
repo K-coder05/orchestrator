@@ -93,6 +93,12 @@ with the API key from `.env` or the Keychain as `GEMINI_API_KEY`). Every model
 call is priced (`spend.gemini_api_prices`) and recorded; a Task that reaches
 $2 (`spend.per_task_usd`) is stopped and moved to `needs_you`. `orch usage`
 shows the spend so far and the credit left (`plans.gemini.api_credit_*`).
+Paid calls also stop at $5 a day (`spend.per_day_usd`): every paid Task moves
+to `paused_spend` (a running one is stopped) until midnight Los Angeles time,
+then resumes on its own. At $15 a month (`spend.per_month_usd`) they pause
+and Telegram asks you to raise the cap: `orch raise-cap 25` raises it for
+this month only, and the Tasks resume. Subscription work is never paused by
+spend.
 
 `orch usage` lists each agent's Windows with the percent of the Window's
 Baseline used and the time to its next reset. Once a Window has a Baseline

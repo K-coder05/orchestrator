@@ -321,3 +321,34 @@ def test_alert_thread_that_cannot_start_says_so(tg_cfg, api, monkeypatch):
     service.start()
     service.stop()
     assert any("could not start" in m and "database is locked" in m for m in logs)
+
+
+def test_monthly_spend_cap_raises_a_needs_you_alert_and_the_daily_one_is_silent(
+        tg_cfg, tg_db, api, notifier):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from nightshift import spend
+
+    la = ZoneInfo("America/Los_Angeles")
+    day_task = create_task(tg_cfg, tg_db, "Summarize lecture 3", agent="gemini-api",
+                           task_type="summary").spec.id
+    month_task = create_task(tg_cfg, tg_db, "Summarize lecture 4", agent="gemini-api",
+                             task_type="summary").spec.id
+    tg_db.record_spend(day_task, run_id=None, agent="gemini-api", model=None,
+                       at="2026-10-22T09:00:00-07:00", input_tokens=0, cached_tokens=0,
+                       output_tokens=0, thoughts_tokens=0, cost_usd=5.0, raw=None)
+    spend.pause_paid_queued(tg_cfg, tg_db, datetime(2026, 10, 22, 10, tzinfo=la))
+    notifier.tick()
+    assert api.sent == []  # like a usage pause: it resumes on its own
+
+    spend.promote_paused(tg_cfg, tg_db, datetime(2026, 10, 23, 0, tzinfo=la))
+    tg_db.record_spend(day_task, run_id=None, agent="gemini-api", model=None,
+                       at="2026-10-23T09:00:00-07:00", input_tokens=0, cached_tokens=0,
+                       output_tokens=0, thoughts_tokens=0, cost_usd=10.0, raw=None)
+    spend.pause_paid_queued(tg_cfg, tg_db, datetime(2026, 10, 23, 10, tzinfo=la))
+    notifier.tick()
+    assert len(api.sent) == 2  # both queued paid Tasks
+    [text] = [t for _, t in api.sent if f"Task {month_task} " in t]
+    assert f"Task {month_task} needs you" in text
+    assert "$15.00 monthly spend cap" in text and "orch raise-cap" in text

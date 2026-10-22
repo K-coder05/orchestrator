@@ -566,6 +566,25 @@ def usage_cmd(ctx, probe_agents):
         db.close()
 
 
+@main.command("raise-cap")
+@click.argument("usd", type=float)
+@click.pass_context
+def raise_cap(ctx, usd):
+    """Raise this month's spend cap (§1.5) to USD, this month only. Paid
+    Tasks paused on the monthly cap resume at the daemon's next look."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        at = _clock(cfg)
+        try:
+            old = spend.raise_month_cap(cfg, db, at, usd)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from None
+        click.echo(f"Monthly spend cap raised from ${old:.2f} to ${usd:.2f} for "
+                   f"{at:%Y-%m} (spend.per_month_usd applies again next month).")
+    finally:
+        db.close()
+
+
 # --------------------------------------------------------------------------
 # Schedules (§2.5)
 # --------------------------------------------------------------------------

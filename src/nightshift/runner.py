@@ -144,6 +144,7 @@ STOP_RUNTIME_CAP = "runtime_cap"  # max runtime hit: a Failed Attempt
 STOP_USAGE_LIMIT = "usage_limit"  # a (possibly simulated) rate limit: the Task pauses
 STOP_PAUSE = "pause"  # orch pause: the Task pauses until orch resume
 STOP_SPEND_CAP = "spend_cap"  # the Task reached its per-Task spend cap: needs you
+STOP_SPEND_PAUSE = "spend_pause"  # the daily/monthly spend cap: the Task pauses
 
 #: Seconds between SIGTERM and SIGKILL when an agent ignores a stop.
 KILL_GRACE_SECONDS = 15.0
@@ -275,7 +276,8 @@ class _Watchdog(threading.Thread):
 class _SpendWatcher(threading.Thread):
     """Records the paid calls of a running Attempt as spend (one
     ``spend_events`` row each) and stops the Attempt as soon as its Task
-    reaches the per-Task cap (§1.5). Has its own DB connection (SQLite
+    reaches the per-Task cap, or paid calls reach the daily or monthly cap
+    (§1.5). Has its own DB connection (SQLite
     connections stay in their thread). Once ``done`` is set it collects the
     calls written at the agent's exit, then ends."""
 
@@ -312,6 +314,8 @@ class _SpendWatcher(threading.Thread):
         # that finished on its own is not turned into a stop.
         if may_stop and spend.cap_reached(self.cfg, db, self.task_id):
             self.control.request_stop(STOP_SPEND_CAP)
+        elif may_stop and spend.spend_pause(self.cfg, db, self.clock()) is not None:
+            self.control.request_stop(STOP_SPEND_PAUSE)
 
 
 @dataclass
@@ -447,10 +451,12 @@ def run_attempt(
     errors: list[str] = []
     interrupted = False
     session_recorded = False
-    # A Task already at its spend cap makes no paid call at all.
+    # A Task already at its spend cap makes no paid call at all, nor does
+    # one while the daily or monthly cap holds.
     at_cap = paid and spend.cap_reached(cfg, db, task_id)
+    spend_held = paid and not at_cap and spend.spend_pause(cfg, db, clock()) is not None
     proc: subprocess.Popen | None = None
-    if not at_cap:
+    if not at_cap and not spend_held:
         try:
             proc = subprocess.Popen(
                 command.argv,
@@ -570,6 +576,8 @@ def run_attempt(
     # A limit or pause that came up ends the Attempt as a pause, unless the
     # agent finished cleanly on its own before it could be stopped.
     finished_alone = stop is None and exit_code == 0 and ok is not False
+    # A pending limit or `orch pause` wins over a spend pause: the paused Task
+    # is paused on spend again before its next pick if the cap still holds.
     if (control.pending is not None and stop not in (STOP_CANCEL, STOP_SPEND_CAP)
             and not interrupted and not finished_alone):
         _reason, kind, limit = control.pending
@@ -605,6 +613,12 @@ def run_attempt(
         return AttemptResult(run_id=run_id, state=state,
                              session_id=adapter.session_id(), exit_code=exit_code)
     db.clear_pause_request(task_id)
+    if stop == STOP_SPEND_PAUSE or spend_held:
+        state = _pause_on_spend(cfg, db, task_id, folder, run_id=run_id, attempt_no=attempt_no,
+                                at=clock(), exit_code=exit_code, session_id=adapter.session_id(),
+                                resume_pending=stop == STOP_SPEND_PAUSE or continuing)
+        return AttemptResult(run_id=run_id, state=state, session_id=adapter.session_id(),
+                             exit_code=exit_code)
     if stop == STOP_DAEMON:
         end_reason = redact(f"daemon stopped during Attempt {attempt_no}; Task requeued")
         db.finish_attempt(
@@ -699,6 +713,26 @@ def run_attempt(
     )
     db.transition(task_id, state, end_reason, run_id=run_id)
     return AttemptResult(run_id=run_id, state=state, session_id=adapter.session_id(), exit_code=exit_code)
+
+
+def _pause_on_spend(cfg: Config, db: Database, task_id: str, folder: Path, *, run_id: int,
+                    attempt_no: int, at: datetime, exit_code: int | None,
+                    session_id: str | None, resume_pending: bool) -> TaskState:
+    """End an Attempt the daily or monthly spend cap stopped (or kept from
+    starting): the Task moves to ``paused_spend`` until the cap lifts
+    (``spend.promote_paused``). Not a Failed Attempt."""
+    pause = spend.spend_pause(cfg, db, at)
+    # The cap lifted meanwhile (raised by hand): back in line at once.
+    state = TaskState.QUEUED if pause is None else TaskState.PAUSED_SPEND
+    why = "the spend cap that stopped it no longer holds" if pause is None else pause.reason
+    end_reason = cfg.secrets.redact(f"Attempt {attempt_no} stopped: {why}")
+    db.finish_attempt(run_id, exit_code=exit_code, outcome="paused", end_reason=end_reason,
+                      session_id=session_id)
+    _log(folder, f"{iso(at)} Attempt {attempt_no} ended: {end_reason}", cfg.secrets.redact)
+    fields = {} if pause is None else spend.pause_fields(pause)
+    db.transition(task_id, state, end_reason, run_id=run_id,
+                  set_fields=fields | {"resume_pending": int(resume_pending)})
+    return state
 
 
 def _stored_arg(arg: str, protocol: str, redact: Callable[[str], str]) -> str:

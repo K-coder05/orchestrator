@@ -28,7 +28,7 @@ from typing import IO, Any
 
 import nightshift
 
-from . import failover, failures, pauses, schedules, usage
+from . import failover, failures, pauses, schedules, spend, usage
 from .alerts import AlertService
 from .adapters import get_adapter
 from .config import Config
@@ -360,6 +360,16 @@ class QueueRunner:
             self.log(f"Task {tid} usage pause over; queued to resume")
         return done
 
+    def apply_spend_caps(self) -> None:
+        """Daily and monthly spend caps (§1.5): queue paused paid Tasks again
+        once no cap holds; while one does, pause the queued ones."""
+        at = self.clock()
+        for tid in spend.promote_paused(self.cfg, self.db, at):
+            self.log(f"Task {tid} spend pause over; {self.db.task_state(tid)}")
+        pause = spend.spend_pause(self.cfg, self.db, at)
+        for tid in spend.pause_paid_queued(self.cfg, self.db, at):
+            self.log(f"Task {tid} paused: {pause.reason if pause else 'spend cap reached'}")
+
     def apply_schedules(self, trigger: str = schedules.TRIGGER_POLL) -> list[schedules.Decision]:
         """Apply every Schedule's Catch-up and Overlap rules now (§2.5)."""
         try:
@@ -393,6 +403,7 @@ class QueueRunner:
         self.apply_schedules()
         self.promote_retries()
         self.promote_paused()
+        self.apply_spend_caps()
         # Effective priority and time windows are re-evaluated on every pick;
         # an agent out of usage starts nothing until its reset.
         held = pauses.held_agents(self.cfg, self.db, self.clock())

@@ -12,7 +12,9 @@ afterwards: a Telegram outage only leaves alerts pending (retried until
 | failed                                 | failed, with the reason       |
 | needs_you                              | needs you, with the request   |
 | awaiting_approval from paused_usage    | needs re-approval             |
-| anything else (incl. paused_usage)     | nothing                       |
+| paused_spend on the monthly cap        | needs you: raise the cap      |
+| anything else (incl. paused_usage and  | nothing                       |
+| paused_spend on the daily cap)         |                               |
 
 Comedy Tasks get status lines only: never the title, the Result, the
 reason or the request, which may carry script or idea content (§1.6).
@@ -26,7 +28,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import report
+from . import report, spend
 from .config import Config
 from .db import Database
 from .states import TaskState
@@ -45,7 +47,7 @@ MAX_LINE = 300
 S = TaskState
 
 
-def alert_kind(from_state: str | None, to_state: str) -> str | None:
+def alert_kind(from_state: str | None, to_state: str, reason: str = "") -> str | None:
     if to_state in (S.DONE, S.PARTIAL):
         return "finished"
     if to_state == S.FAILED:
@@ -54,6 +56,8 @@ def alert_kind(from_state: str | None, to_state: str) -> str | None:
         return "needs_you"
     if to_state == S.AWAITING_APPROVAL and from_state == S.PAUSED_USAGE:
         return "reapproval"
+    if to_state == S.PAUSED_SPEND and spend.MONTHLY_CAP in reason:
+        return "spend_cap"
     return None
 
 
@@ -93,7 +97,7 @@ def alert_text(task, kind: str, reason: str) -> str:
     tid, status_only = task["id"], task["task_type"] in STATUS_ONLY_TYPES
     state = {"finished": task["state"] if task["state"] in (S.DONE, S.PARTIAL) else "done",
              "failed": "failed", "needs_you": "needs you",
-             "reapproval": "needs re-approval"}[kind]
+             "reapproval": "needs re-approval", "spend_cap": "needs you"}[kind]
     if status_only:
         head = f"Nightshift: {task['task_type']} Task {tid} {state}."
         return f"{head}\nDetails: orch report {tid}"
@@ -105,6 +109,8 @@ def alert_text(task, kind: str, reason: str) -> str:
         detail = _one_line(reason)
     elif kind == "needs_you":
         detail = needs_you_line(folder) or _one_line(reason)
+    elif kind == "spend_cap":
+        detail = _one_line(reason)
     else:
         detail = f"Paused too long; approve it again with orch approve {tid}"
     return "\n".join(filter(None, [head, detail, f"Details: orch report {tid}"]))
@@ -150,7 +156,7 @@ class Notifier:
         oldest = self.clock() - self.max_age
         for t in self.db.transitions_after(last):
             last = t["id"]
-            kind = alert_kind(t["from_state"], t["to_state"])
+            kind = alert_kind(t["from_state"], t["to_state"], t["reason"])
             if kind is None or parse_iso(t["at"]) < oldest:
                 continue
             task = self.db.get_task(t["task_id"])

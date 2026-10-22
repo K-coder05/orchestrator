@@ -338,6 +338,13 @@ spend:
   # spends money; subscription agents never record spend.
   # A Task that reaches this much is stopped and moved to needs_you.
   per_task_usd: 2
+  # Once paid calls reach this much in a day (America/Los_Angeles), every
+  # paid Task pauses (paused_spend) until midnight, then resumes on its own.
+  per_day_usd: 5
+  # Once they reach this much in a calendar month, paid Tasks pause and you
+  # get a "needs you" request to raise the cap (`orch raise-cap USD`, this
+  # month only); they resume once it is raised or the month ends.
+  per_month_usd: 15
   # AI Studio prices in USD per million tokens, used to price each call.
   # PLACEHOLDERS: check https://ai.google.dev/gemini-api/docs/pricing and
   # update them. Where a model has a long-context tier, its higher price is

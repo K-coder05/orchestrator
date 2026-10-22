@@ -32,8 +32,10 @@ ALLOWED: dict[TaskState, frozenset[TaskState]] = {
     S.AWAITING_APPROVAL: frozenset({S.QUEUED, S.SCHEDULED, S.CANCELLED}),
     # queued -> failed: the daemon could not even start an Attempt (e.g. bad agent config).
     # queued/retry_wait -> paused_usage: paused by hand (orch pause).
+    # queued -> paused_spend: a paid Task held by the daily/monthly spend cap.
     S.QUEUED: frozenset(
-        {S.RUNNING, S.AWAITING_APPROVAL, S.SCHEDULED, S.FAILED, S.CANCELLED, S.PAUSED_USAGE}
+        {S.RUNNING, S.AWAITING_APPROVAL, S.SCHEDULED, S.FAILED, S.CANCELLED, S.PAUSED_USAGE,
+         S.PAUSED_SPEND}
     ),
     # running -> queued: the daemon was stopped mid-Attempt; the Task goes back in line.
     S.RUNNING: frozenset(

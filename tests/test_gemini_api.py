@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
@@ -140,6 +142,57 @@ def test_calls_flushed_at_exit_are_recorded_without_undoing_a_finished_task(cfg,
     assert db.task_spend(new.spec.id) == pytest.approx(2.4)
 
 
+#: A fixed afternoon in Los Angeles, so "today" is known.
+NOON = datetime(2026, 10, 22, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+
+def _earlier_spend(cfg, db, usd):
+    """``usd`` spent this morning by another paid Task."""
+    other = _task(cfg, db).spec.id
+    db.transition(other, TaskState.CANCELLED, "test: only its spend matters")
+    db.record_spend(other, run_id=None, agent="gemini-api", model="gemini-3.1-pro",
+                    at="2026-10-22T09:00:00-07:00", input_tokens=0, cached_tokens=0,
+                    output_tokens=0, thoughts_tokens=0, cost_usd=usd, raw=None)
+
+
+def test_task_that_crosses_the_daily_cap_pauses_and_resumes_its_work(cfg, db, genv):
+    # $4 spent this morning; $1.00 a call, so the first call reaches the $5 day.
+    _earlier_spend(cfg, db, 4.0)
+    genv.setenv("FAKE_GEMINI_CALL_TOKENS", json.dumps(
+        {"promptTokenCount": 0, "cachedContentTokenCount": 0, "candidatesTokenCount": 100_000}))
+    genv.setenv("FAKE_GEMINI_STEP_DELAY", "0.5")
+    new = _task(cfg, db)
+    tid = new.spec.id
+    result = run_attempt(cfg, db, tid, adapter_provider=provider, clock=lambda: NOON)
+
+    assert result.state == TaskState.PAUSED_SPEND
+    [attempt] = db.attempts(tid)
+    assert attempt["outcome"] == "paused"  # not a Failed Attempt
+    row = db.get_task(tid)
+    assert row["retries_used"] == 0 and row["resume_pending"] == 1
+    assert row["pause_kind"] == "spend_day" and row["resume_at"] == "2026-10-23T00:00:00-07:00"
+    why = db.transitions(tid)[-1]["reason"]
+    assert why.startswith("Attempt 1 stopped: paid calls reached the $5.00 daily spend cap")
+    assert not (new.folder / "output" / "notes.md").exists()  # stopped before it finished
+
+
+def test_paid_task_started_while_a_cap_holds_makes_no_paid_call(cfg, db, genv):
+    _earlier_spend(cfg, db, 5.0)
+    new = _task(cfg, db)
+    tid = new.spec.id
+    assert run_attempt(cfg, db, tid, adapter_provider=provider,
+                       clock=lambda: NOON).state == TaskState.PAUSED_SPEND
+    assert _gemini_runs(new.folder) == []  # the CLI never started
+    assert "daily spend cap" in db.transitions(tid)[-1]["reason"]
+
+
+def test_subscription_path_runs_while_a_cap_holds(cfg, db, genv):
+    _earlier_spend(cfg, db, 15.0)
+    new = _task(cfg, db, agent="gemini")
+    assert run_attempt(cfg, db, new.spec.id, adapter_provider=provider,
+                       clock=lambda: NOON).state == TaskState.DONE
+
+
 def test_subscription_path_never_spends_or_sees_the_key(cfg, db, genv):
     new = _task(cfg, db, agent="gemini")
     assert run_attempt(cfg, db, new.spec.id, adapter_provider=provider).state == TaskState.DONE
@@ -207,6 +260,29 @@ def test_orch_usage_shows_spend_and_remaining_credit(config_dir, cfg, db, genv):
     assert "spent $3.50 so far" in r.output
     assert "$7.50 left of $10.00 (balance as of 2026-10-01)" in r.output
     assert "expires 2027-01-31" in r.output
+
+
+def test_orch_usage_shows_the_day_and_month_against_their_caps(config_dir, cfg, db,
+                                                               monkeypatch):
+    monkeypatch.setattr(cli, "clock", lambda: NOON)
+    _earlier_spend(cfg, db, 5.0)
+    r = CliRunner().invoke(cli.main, ["--config-dir", str(config_dir), "usage"])
+    assert r.exit_code == 0, r.output
+    assert "today $5.00 of $5.00, this month $5.00 of $15.00" in r.output
+    assert "Paid calls paused: paid calls reached the $5.00 daily spend cap" in r.output
+
+
+def test_orch_raise_cap_raises_this_months_cap_and_needs_more_than_it(config_dir, cfg, db,
+                                                                      monkeypatch):
+    monkeypatch.setattr(cli, "clock", lambda: NOON)
+    run = CliRunner().invoke
+    r = run(cli.main, ["--config-dir", str(config_dir), "raise-cap", "20"])
+    assert r.exit_code == 0, r.output
+    assert "raised from $15.00 to $20.00 for 2026-10" in r.output
+    r = run(cli.main, ["--config-dir", str(config_dir), "usage"])
+    assert "this month $0.00 of $20.00" in r.output
+    r = run(cli.main, ["--config-dir", str(config_dir), "raise-cap", "18"])
+    assert r.exit_code != 0 and "above this month's cap of $20.00" in r.output
 
 
 def test_orch_usage_with_expired_credits_has_none_left(config_dir, cfg, db):

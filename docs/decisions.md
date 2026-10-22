@@ -1509,3 +1509,53 @@ lasting consequences go in `docs/adr/` instead.
   install|uninstall|run` on FakeHost. Smoke-run for real on localhost only:
   Tailscale isn't installed on this Mac, so the Tailscale bind is untested
   on a real interface.
+
+## Phase 2, issue #25: daily and monthly spend caps → `paused_spend`
+
+- **What counts.** Every `spend_events` row (only paid paths write them),
+  dated in America/Los_Angeles whatever offset it was written with. A day
+  is local midnight to midnight; a month is the calendar month. The rule
+  (`spend.spend_pause`) is one function of the clock, so the daemon,
+  the spend watcher and `orch usage` agree, and the tests drive it with a
+  fake clock.
+- **The month wins over the day.** At both caps the pause is the monthly
+  one, since midnight alone would not lift it.
+- **Who pauses.** Only Tasks on a paid agent (`adapters.is_paid`). Before
+  every pick the daemon moves queued paid Tasks to `paused_spend` (a new
+  `queued -> paused_spend` transition), so each gets a recorded reason
+  rather than waiting silently in `queued`. A running paid Attempt is
+  stopped by the spend watcher as soon as a recorded call reaches a cap,
+  at once like the per-Task cap (letting the Step finish would mean more
+  paid calls). It is not a Failed Attempt; `resume_pending` is set, so the
+  next Attempt continues the same session. `run_attempt` also refuses to
+  start a paid call while a cap holds. Calls flushed after the agent
+  exited on its own are recorded but never turn a finished Task into a
+  pause (as with the per-Task cap). The per-Task cap is checked first.
+- **Resuming.** Before every pick, `spend.promote_paused` queues
+  `paused_spend` Tasks again, in resume order, as soon as no cap holds:
+  midnight for the day; for the month, a raised cap or the 1st. `resume_at`
+  holds midnight or the 1st, for display. A Task whose deadline passes
+  while paused is cancelled and reported, as for usage pauses. The 72-hour
+  re-approval rule is not applied: `paused_spend` has no way to
+  `awaiting_approval` in the state machine, and a monthly pause can last
+  weeks by design.
+- **Raising the cap.** `orch raise-cap USD` stores the raise in `meta`
+  (`spend.month_cap.YYYY-MM`), so the running daemon sees it at once (it
+  loads `config.yaml` only at start) and it lapses with the month. It must
+  be above the current cap. `orch resume` refuses `paused_spend` Tasks and
+  says how they resume.
+- **The "needs you" request** is the Telegram alert made from the
+  `paused_spend` transition whose reason names the monthly spend cap
+  (`spend.MONTHLY_CAP`), with the reason as its detail (it says to run
+  `orch raise-cap USD`). The Task stays `paused_spend`, not `needs_you`:
+  it resumes by itself once the cap is raised. Daily pauses stay silent,
+  like usage pauses.
+- **Known gaps.** The request goes out when a paid Task is paused, so a
+  month crossed by calls flushed after the last paid Task finished raises
+  it only once the next paid Task is queued (nothing paid is waiting until
+  then), and each paused paid Task alerts once. A usage limit or `orch
+  pause` already pending when a cap stops an Attempt wins (the Limit
+  observation is kept); the Task is paused on spend before its next pick
+  if the cap still holds. A cap that holds when `run_attempt` starts
+  records an Attempt that launched nothing, as the per-Task cap does; the
+  daemon's pre-pick pause makes that a race only.

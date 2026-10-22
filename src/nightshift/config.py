@@ -325,6 +325,18 @@ class Config:
         """``spend.per_task_usd``: a Task that reaches it is stopped."""
         return float((self.data.get("spend") or {}).get("per_task_usd", 2))
 
+    @property
+    def per_day_spend_cap(self) -> float:
+        """``spend.per_day_usd``: paid calls pause until midnight once a day's
+        spend reaches it."""
+        return float((self.data.get("spend") or {}).get("per_day_usd", 5))
+
+    @property
+    def per_month_spend_cap(self) -> float:
+        """``spend.per_month_usd``: paid calls pause until you raise the cap
+        once a month's spend reaches it."""
+        return float((self.data.get("spend") or {}).get("per_month_usd", 15))
+
     def gemini_api_price(self, model: str | None) -> dict[str, float]:
         """USD per million tokens of ``model`` on the Gemini API
         (``spend.gemini_api_prices``); a model not listed is priced as ``default``."""
@@ -473,9 +485,10 @@ def _validate(data: dict[str, Any]) -> None:
     spend = data.get("spend") or {}
     if not isinstance(spend, dict):
         raise ConfigError("config section 'spend' must be a mapping")
-    cap = spend.get("per_task_usd", 2)
-    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or cap <= 0:
-        raise ConfigError("spend.per_task_usd must be a positive number of dollars")
+    for key, default in (("per_task_usd", 2), ("per_day_usd", 5), ("per_month_usd", 15)):
+        cap = spend.get(key, default)
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or cap <= 0:
+            raise ConfigError(f"spend.{key} must be a positive number of dollars")
     prices = spend.get("gemini_api_prices") or {}
     if not isinstance(prices, dict) or "default" not in prices or not all(
         isinstance(p, dict) and all(

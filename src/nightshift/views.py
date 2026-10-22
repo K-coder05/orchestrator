@@ -97,6 +97,10 @@ def format_show(d: queries.TaskDetail) -> str:
                     f"{row['resume_at']} (`orch resume {d.id}` queues it now)"]
         else:
             out += ["", f"Waiting: paused by hand until `orch resume {d.id}`"]
+    if d.state == TaskState.PAUSED_SPEND:
+        out += ["", "Waiting: paid calls paused on the monthly spend cap until you raise it "
+                "(`orch raise-cap USD`) or the month ends" if row["pause_kind"] == spend.KIND_MONTH
+                else f"Waiting: paid calls paused on the daily spend cap until {row['resume_at']}"]
     if row["resume_pending"] and open_:
         out += ["", "Next Attempt continues paused work (same session if under "
                 f"{d.resume_session_max_hours:g}h old)"]
@@ -272,14 +276,19 @@ def _cost(value: float | None) -> str:
 
 
 def format_credits(c: spend.CreditView, per_task_cap: float) -> list[str]:
-    """AI Studio credits: spend so far, what is left, expiry (§1.5)."""
+    """AI Studio credits: spend so far, what is left, expiry, and the day and
+    month against their caps (§1.5)."""
     as_of = f" (balance as of {c.balance_as_of})" if c.balance_as_of else ""
     left = f"${c.remaining:.2f} left of ${c.balance:.2f}{as_of}"
     if c.expiry:
         left += f"; {'expired' if c.expired else 'expires'} {c.expiry}"
-    return ["Gemini API credits (paid, agent gemini-api)",
-            f"  spent ${c.spent_total:.2f} so far; {left}",
-            f"  per-Task cap ${per_task_cap:.2f}", ""]
+    out = ["Gemini API credits (paid, agent gemini-api)",
+           f"  spent ${c.spent_total:.2f} so far; {left}",
+           f"  per-Task cap ${per_task_cap:.2f}; today ${c.spent_today:.2f} of "
+           f"${c.day_cap:.2f}, this month ${c.spent_this_month:.2f} of ${c.month_cap:.2f}"]
+    if c.pause is not None:
+        out.append(f"  Paid calls paused: {c.pause.reason}")
+    return out + [""]
 
 
 def _countdown(left: timedelta) -> str:
