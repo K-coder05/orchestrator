@@ -1261,3 +1261,42 @@ lasting consequences go in `docs/adr/` instead.
   Phase 3). The offset is stored in `meta` so a restart doesn't log the
   same strangers again. Telegram user ID is config (`telegram.user_id`),
   not a secret, but it is redacted like one.
+
+## Phase 2, issue #19: Gemini failover and retry-with-switch to Gemini
+
+- **Config only; the mechanism is #15's.** `failover.py` already moved a
+  Task along its type's `task_types.<type>.failover.agents` list, so the
+  §2.8 table is entirely in `defaults.yaml`:
+  - `research`, `scraping`, `summary`, `study`: `[claude, gemini]`,
+    `when: always`.
+  - `resume`: `[claude, gemini, codex]`, `when: deadline` (waits for
+    Claude's reset unless the deadline is within
+    `queue.deadline_urgent_hours`; then Gemini, or Codex if Gemini is also
+    out; flagged in the report's Needs you).
+  - `comedy`, `general`, `job`: no failover, so they always wait for
+    their agent.
+  The second retry of a Failed Attempt switches along the same list (the
+  first never does); for `resume` only while the deadline is near.
+- **New Task type `summary`** (long-document and lecture summaries, §1.1's
+  Gemini row), internet off since the material is local. Planning offers it
+  automatically (the type list comes from config).
+- **`resume` is gated by `queue.deadline_urgent_hours`**, the same
+  setting that makes a Task urgent in the queue (#15's choice): changing
+  it moves both.
+- **A Task on Gemini that runs out** moves to the next agent of its list
+  that isn't out (Claude first). That's the same rule; nothing Gemini-
+  specific.
+- **Tests:** `tests/test_gemini_failover.py` runs each row through the
+  queue with the fake Claude, Gemini and Codex CLIs.
+  `tests/test_gemini_real.py::test_claude_to_gemini_failover` is the real
+  Claude -> Gemini check (opt-in, needs both CLIs signed in).
+- **Real run, Claude side only (2026-10-22).** Gemini CLI isn't installed
+  on this Mac yet, so the real test ran with real Claude (haiku) and a
+  `gemini` wrapper around `tests/fixtures/fake_gemini.py` on PATH, with
+  `--simulate-rate-limit-after 5`: Claude wrote `output/part1.md`, recorded
+  it in `progress.md`, wrote `output/part2.md` and was stopped; the Task
+  went `running -> queued` on gemini (trigger `simulated`), and the Gemini
+  Attempt started a fresh session (no `--resume`) whose prompt had the
+  takeover note, saw Claude's `progress.md`, and the Task ended `done` with
+  both agents in the report. About 10s. The test's last check (all three
+  part files) needs the real Gemini: docs/adapters.md item 8.

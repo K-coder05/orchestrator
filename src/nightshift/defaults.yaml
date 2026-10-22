@@ -195,19 +195,37 @@ task_types:
   # resets first. The second retry of a Failed Attempt may also switch
   # (§2.7). `when: deadline` fails over only when the deadline is within
   # queue.deadline_urgent_hours, and flags it in the report's Needs you.
-  # Phase 1 fails over coding Tasks only. A Task with --agent never moves.
+  # A type without failover always waits for its agent. A Task with --agent
+  # never moves.
   general: {internet: "off"}
   coding:
     internet: "off"
     long: true
     max_runtime_minutes: 360
     failover: {agents: [claude, codex], when: always}
+  # YouTube comedy writing always waits for Claude.
   comedy: {internet: "off"}
-  research: {internet: "on", long: true}
-  scraping: {internet: "on"}
+  research:
+    internet: "on"
+    long: true
+    failover: {agents: [claude, gemini], when: always}
+  scraping:
+    internet: "on"
+    failover: {agents: [claude, gemini], when: always}
+  # Long-document and lecture summaries.
+  summary:
+    internet: "off"
+    failover: {agents: [claude, gemini], when: always}
   job: {internet: "on"}
-  resume: {internet: "on"}
-  study: {internet: "on"}
+  # Resume and cover-letter tailoring waits for Claude's reset unless the
+  # deadline is near; then Gemini, or Codex if Gemini is also out.
+  resume:
+    internet: "on"
+    failover: {agents: [claude, gemini, codex], when: deadline}
+  # Study plans and practice problems.
+  study:
+    internet: "on"
+    failover: {agents: [claude, gemini], when: always}
 
 permissions:
   # Per-Task agent access (§1.4). The Task folder is the only writable place.

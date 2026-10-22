@@ -807,3 +807,5 @@ extensions and hooks off) and items 1, 2 and 6 are by hand.
 6. A real quota hit: save the stream and compare with the format above;
    whether the model fallback happens headless.
 7. `orch add ... --agent gemini` to `done` on the real CLI.
+8. A real Claude -> Gemini failover (§2.8, issue #19): `test_claude_to_gemini_failover`
+   in `tests/test_gemini_real.py` (also needs the signed-in `claude` CLI).

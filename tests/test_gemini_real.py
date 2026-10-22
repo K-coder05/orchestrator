@@ -197,3 +197,41 @@ def test_gemini_planning_call_and_probe(tmp_path):
         assert found.available, found
     finally:
         db.close()
+
+
+@pytest.mark.skipif(shutil.which("claude") is None, reason="needs the signed-in claude CLI too")
+def test_claude_to_gemini_failover(tmp_path):
+    """§2.8 on the real CLIs: a research Task hits a simulated Claude limit
+    after 5 Steps and finishes on Gemini in a fresh session that picks up
+    Claude's ``progress.md``."""
+    cfg, db = _cfg(tmp_path)
+    cfg.data["agents"]["claude"]["model"] = os.environ.get("NIGHTSHIFT_CLAUDE_MODEL", "haiku")
+    cfg.data["retries"]["max_retries"] = 0  # a failover must not need retry budget
+    try:
+        new = create_task(
+            cfg, db,
+            "Study notes in three parts. Part 1: write output/part1.md (one line: what "
+            "photosynthesis is) with your file-writing tool, then immediately record it in "
+            "progress.md. Part 2: write output/part2.md (one line: what respiration is), "
+            "then record it in progress.md. Part 3: write output/part3.md (one line: how "
+            "the two relate), then record it in progress.md. Don't run any commands.",
+            task_type="research", internet="off", long=False, simulate_rate_limit_after=5)
+        tid = new.spec.id
+        qr = QueueRunner(cfg, db, FakeHost(), clock=lambda: now(cfg.timezone))
+        assert qr.run_next() == tid
+        row = db.get_task(tid)
+        assert row["state"] == "queued" and row["agent"] == "gemini"
+        [f] = db.failovers(tid)
+        assert (f["from_agent"], f["to_agent"], f["trigger"]) == ("claude", "gemini", "simulated")
+        assert qr.run_next() == tid
+        assert db.task_state(tid) == TaskState.DONE
+        first, second = db.attempts(tid)
+        assert (first["agent"], first["outcome"]) == ("claude", "paused")
+        assert (second["agent"], second["outcome"]) == ("gemini", "completed")
+        assert "--resume" not in second["command"]  # a fresh session
+        assert all((new.folder / "output" / f"part{i}.md").exists() for i in (1, 2, 3))
+        text = (new.folder / "report.md").read_text()
+        assert "| claude | 1 |" in text and "| gemini | 1 |" in text
+        print("progress.md:\n" + (new.folder / "progress.md").read_text())
+    finally:
+        db.close()
