@@ -1,0 +1,309 @@
+"""Telegram alerts for Task outcomes (§2.12).
+
+Alerts are made from the ``transitions`` table, not from the code paths
+that move Tasks, so every way a Task can finish, fail or need you alerts
+the same way. Each alert is written to the ``alerts`` outbox first and sent
+afterwards: a Telegram outage only leaves alerts pending (retried until
+``telegram.alert_max_age_hours``), it never fails or holds up a Task.
+
+| Transition to                          | Alert                         |
+|----------------------------------------|-------------------------------|
+| done, partial                          | finished, one-line Result     |
+| failed                                 | failed, with the reason       |
+| needs_you                              | needs you, with the request   |
+| awaiting_approval from paused_usage    | needs re-approval             |
+| anything else (incl. paused_usage)     | nothing                       |
+
+Comedy Tasks get status lines only: never the title, the Result, the
+reason or the request, which may carry script or idea content (§1.6).
+"""
+
+from __future__ import annotations
+
+import threading
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from . import report
+from .config import Config
+from .db import Database
+from .states import TaskState
+from .telegram import BotAPI, HttpBotAPI, TelegramError
+from .timeutil import iso, now, parse_iso
+
+#: Task types whose alerts are status lines only (unreleased material).
+STATUS_ONLY_TYPES = frozenset({"comedy"})
+
+CURSOR_KEY = "alerts.last_transition_id"
+OFFSET_KEY = "telegram.update_offset"
+
+#: Longest detail line an alert carries.
+MAX_LINE = 300
+
+S = TaskState
+
+
+def alert_kind(from_state: str | None, to_state: str) -> str | None:
+    if to_state in (S.DONE, S.PARTIAL):
+        return "finished"
+    if to_state == S.FAILED:
+        return "failed"
+    if to_state == S.NEEDS_YOU:
+        return "needs_you"
+    if to_state == S.AWAITING_APPROVAL and from_state == S.PAUSED_USAGE:
+        return "reapproval"
+    return None
+
+
+def _one_line(text: str) -> str:
+    line = " ".join(text.split())
+    return line if len(line) <= MAX_LINE else line[: MAX_LINE - 1].rstrip() + "…"
+
+
+def result_line(folder: Path) -> str | None:
+    """The one-line Result of a finished Task's ``report.md``: the agent's
+    own line if it wrote one, else Nightshift's verdict."""
+    path = folder / "report.md"
+    if not path.exists():
+        return None
+    _, sections = report.parse_sections(path.read_text())
+    body = sections.get(1, "")
+    paras = [p.strip() for p in body.split("\n\n") if p.strip()]
+    agent = next((p[len("Agent:"):] for p in paras if p.startswith("Agent:")), None)
+    line = agent if agent and agent.strip() else (paras[0] if paras else "")
+    line = line.strip().splitlines()[0] if line.strip() else ""
+    return _one_line(line.replace("**", "")) or None
+
+
+def needs_you_line(folder: Path) -> str | None:
+    """The first entry of the report's Needs you section."""
+    path = folder / "report.md"
+    if not path.exists():
+        return None
+    _, sections = report.parse_sections(path.read_text())
+    lines = [ln.strip().lstrip("- ").replace("**", "") for ln in sections.get(2, "").splitlines()]
+    first = next((ln for ln in lines if ln and ln != "Nothing."), None)
+    return _one_line(first) if first else None
+
+
+def alert_text(task, kind: str, reason: str) -> str:
+    """The message for one alert. ``task`` is the Task's DB row."""
+    tid, status_only = task["id"], task["task_type"] in STATUS_ONLY_TYPES
+    state = {"finished": task["state"] if task["state"] in (S.DONE, S.PARTIAL) else "done",
+             "failed": "failed", "needs_you": "needs you",
+             "reapproval": "needs re-approval"}[kind]
+    if status_only:
+        head = f"Nightshift: {task['task_type']} Task {tid} {state}."
+        return f"{head}\nDetails: orch report {tid}"
+    head = f"Nightshift: Task {tid} {state}: {_one_line(task['title'])}"
+    folder = Path(task["folder"])
+    if kind == "finished":
+        detail = result_line(folder)
+    elif kind == "failed":
+        detail = _one_line(reason)
+    elif kind == "needs_you":
+        detail = needs_you_line(folder) or _one_line(reason)
+    else:
+        detail = f"Paused too long; approve it again with orch approve {tid}"
+    return "\n".join(filter(None, [head, detail, f"Details: orch report {tid}"]))
+
+
+class Notifier:
+    """Makes alerts from new transitions and sends them to the configured user.
+
+    ``api`` is the Bot API (tests pass a fake). Nothing here raises on a
+    Telegram problem: it is logged and retried later.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        db: Database,
+        api: BotAPI,
+        *,
+        log: Callable[[str], None] | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ):
+        uid = cfg.telegram_user_id
+        if uid is None:
+            raise ValueError("telegram.user_id is not set")
+        self.cfg = cfg
+        self.db = db
+        self.api = api
+        self.user_id = uid
+        self._log = log or (lambda msg: None)
+        self.clock = clock or (lambda: now(cfg.timezone))
+        self.max_age = timedelta(hours=cfg.telegram_setting("alert_max_age_hours"))
+        if db.get_meta(CURSOR_KEY) is None:
+            # First start: alert on what happens from now on, not on history.
+            db.set_meta(CURSOR_KEY, str(db.last_transition_id()))
+
+    def log(self, msg: str) -> None:
+        self._log(self.cfg.secrets.redact(msg))
+
+    def collect(self) -> int:
+        """Write an alert for every new transition that calls for one."""
+        made = 0
+        last = int(self.db.get_meta(CURSOR_KEY) or 0)
+        oldest = self.clock() - self.max_age
+        for t in self.db.transitions_after(last):
+            last = t["id"]
+            kind = alert_kind(t["from_state"], t["to_state"])
+            if kind is None or parse_iso(t["at"]) < oldest:
+                continue
+            task = self.db.get_task(t["task_id"])
+            text = self.cfg.secrets.redact(alert_text(task, kind, t["reason"]))
+            self.db.insert_alert(transition_id=t["id"], task_id=t["task_id"], kind=kind,
+                                 text=text, at=iso(self.clock()))
+            made += 1
+        self.db.set_meta(CURSOR_KEY, str(last))
+        return made
+
+    def deliver(self) -> bool:
+        """Send pending alerts, oldest first. False if Telegram failed (the
+        rest wait for the next try)."""
+        oldest = self.clock() - self.max_age
+        for a in self.db.pending_alerts():
+            if parse_iso(a["created_at"]) < oldest:
+                self.db.mark_alert(a["id"], dropped_at=iso(self.clock()))
+                self.log(f"Telegram alert for Task {a['task_id']} dropped: never delivered "
+                         f"({a['tries']} tries, last error: {a['last_error']})")
+                continue
+            try:
+                self.api.send_message(self.user_id, a["text"])
+            except TelegramError as exc:
+                err = self.cfg.secrets.redact(str(exc))
+                self.db.mark_alert(a["id"], error=err)
+                self.log(f"Telegram alert for Task {a['task_id']} not sent yet: {err}")
+                return False
+            self.db.mark_alert(a["id"], sent_at=iso(self.clock()))
+        return True
+
+    def poll_updates(self) -> bool:
+        """One long poll for incoming updates. Phase 2 is outbound only, so
+        every update is ignored: one from another user is logged with its
+        sender ID (never its content). False if Telegram failed."""
+        offset = self.db.get_meta(OFFSET_KEY)
+        timeout = self.cfg.telegram_setting("poll_timeout_seconds")
+        try:
+            updates = self.api.get_updates(int(offset) if offset else None, timeout)
+        except TelegramError as exc:
+            self.log(f"Telegram getUpdates failed: {exc}")
+            return False
+        for u in updates:
+            body: dict[str, Any] = next(
+                (u[k] for k in u if k != "update_id" and isinstance(u[k], dict)), {})
+            sender = (body.get("from") or {}).get("id")
+            if sender != self.user_id:
+                self.log(f"Telegram: ignored an update from user {sender}, who is not "
+                         "telegram.user_id")
+            else:
+                self.log("Telegram: ignored a message from you (commands come in Phase 3)")
+            self.db.set_meta(OFFSET_KEY, str(int(u["update_id"]) + 1))
+        return True
+
+    def tick(self) -> bool:
+        """Collect then deliver; False if Telegram failed."""
+        self.collect()
+        return self.deliver()
+
+
+#: Longest wait between tries while Telegram is failing.
+MAX_BACKOFF_SECONDS = 300.0
+
+
+class AlertService:
+    """Runs a Notifier in the daemon on two background threads: one sends
+    alerts (every ``interval`` seconds, or at once after :meth:`kick`), one
+    long-polls for incoming updates. Each has its own DB connection. A
+    Telegram outage or hang only stalls these threads, never the queue.
+    """
+
+    def __init__(self, cfg: Config, api: BotAPI, *, log: Callable[[str], None] | None = None,
+                 interval: float = 5.0):
+        self.cfg = cfg
+        self.api = api
+        self._log = log or (lambda msg: None)
+        self.interval = interval
+        self._stop = threading.Event()
+        self._kick = threading.Event()
+        self._threads: list[threading.Thread] = []
+
+    def kick(self) -> None:
+        """Send new alerts now (the queue just finished an Attempt)."""
+        self._kick.set()
+
+    def start(self) -> None:
+        for name, loop in (("telegram-alerts", self._send_loop),
+                           ("telegram-updates", self._poll_loop)):
+            t = threading.Thread(target=self._run, args=(name, loop), name=name, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Stop the threads; the sender first sends what is pending. One
+        stuck in a Bot API call is left to die with the process (they are
+        daemon threads)."""
+        self._stop.set()
+        self._kick.set()
+        for t in self._threads:
+            t.join(timeout)
+
+    def _run(self, name: str, loop: Callable[[Notifier], None]) -> None:
+        try:
+            db = Database(self.cfg.db_path, tz=self.cfg.timezone)
+        except Exception as exc:
+            self._log(self.cfg.secrets.redact(
+                f"Telegram {name} could not start: {type(exc).__name__}: {exc}"))
+            return
+        try:
+            loop(Notifier(self.cfg, db, self.api, log=self._log))
+        except Exception as exc:  # never let alerts take the daemon down
+            self._log(self.cfg.secrets.redact(
+                f"Telegram {name} could not start: {type(exc).__name__}: {exc}"))
+        finally:
+            db.close()
+
+    @staticmethod
+    def _step(notifier: Notifier, step: Callable[[], bool]) -> bool:
+        try:
+            return step()
+        except Exception as exc:  # a bug here must not end alerts for the whole run
+            notifier.log(f"Telegram alerts error: {type(exc).__name__}: {exc}")
+            return False
+
+    def _send_loop(self, notifier: Notifier) -> None:
+        failures = 0
+        while not self._stop.is_set():
+            ok = self._step(notifier, notifier.tick)
+            failures = 0 if ok else failures + 1
+            self._kick.wait(self.interval if ok else
+                            min(MAX_BACKOFF_SECONDS, self.interval * 2 ** failures))
+            self._kick.clear()
+        # The daemon is stopping: the last Attempt's alert still goes out.
+        self._step(notifier, notifier.tick)
+
+    def _poll_loop(self, notifier: Notifier) -> None:
+        failures = 0
+        while not self._stop.is_set():
+            ok = self._step(notifier, notifier.poll_updates)
+            failures = 0 if ok else failures + 1
+            if not ok:
+                self._stop.wait(min(MAX_BACKOFF_SECONDS, 2.0 ** failures))
+
+
+def service_from_config(cfg: Config, *, log: Callable[[str], None],
+                        interval: float = 5.0) -> AlertService | None:
+    """The daemon's AlertService, or None (logged) when Telegram isn't set up."""
+    if cfg.telegram_user_id is None:
+        log("Telegram alerts off (telegram.user_id is not set)")
+        return None
+    token = cfg.secrets.get(Config.TELEGRAM_TOKEN_SECRET)
+    if not token:
+        log(f"Telegram alerts off: secret {Config.TELEGRAM_TOKEN_SECRET} not found in .env "
+            "or the Keychain")
+        return None
+    log("Telegram alerts on (long polling; no port opened)")
+    return AlertService(cfg, HttpBotAPI(token), log=log, interval=interval)

@@ -103,6 +103,7 @@ class Secrets:
         self._host = host
         self._service = keychain_service
         self._cache: dict[str, str | None] = {}
+        self._extra: set[str] = set()
 
     @classmethod
     def from_env_file(
@@ -135,8 +136,13 @@ class Secrets:
             )
         return value
 
+    def also_redact(self, value: str) -> None:
+        """Mask a value that is config, not a secret, but must never be
+        logged or written into reports (the Telegram user ID)."""
+        self._extra.add(value)
+
     def known_values(self) -> list[str]:
-        vals = list(self._env.values()) + [v for v in self._cache.values() if v]
+        vals = list(self._env.values()) + [v for v in self._cache.values() if v] + list(self._extra)
         return [v for v in vals if v]
 
     def redact(self, text: str) -> str:
@@ -279,10 +285,30 @@ class Config:
             return 168.0
         return min(table.values()) if table else 5.0
 
+    # -- Telegram (§2.12) --------------------------------------------------------
+    TELEGRAM_TOKEN_SECRET = "TELEGRAM_BOT_TOKEN"
+
+    TELEGRAM_DEFAULTS = {"poll_timeout_seconds": 30, "alert_max_age_hours": 12}
+
+    def telegram_setting(self, key: str) -> float:
+        """A number from the ``telegram:`` section."""
+        value = (self.data.get("telegram") or {}).get(key)
+        return float(self.TELEGRAM_DEFAULTS[key] if value is None else value)
+
+    @property
+    def telegram_user_id(self) -> int | None:
+        """The only Telegram user Nightshift writes to and listens to; None: alerts off."""
+        return _telegram_user_id(self.data)
+
     def usage(self, key: str) -> float:
         """A ``usage:`` setting (pauses and resume, §2.6)."""
         value = (self.data.get("usage") or {}).get(key)
         return float(self.USAGE_DEFAULTS[key] if value is None else value)
+
+
+def _telegram_user_id(data: dict[str, Any]) -> int | None:
+    uid = (data.get("telegram") or {}).get("user_id")
+    return None if uid is None else int(uid)
 
 
 def _positive_int(value: Any) -> bool:
@@ -388,6 +414,16 @@ def _validate(data: dict[str, Any]) -> None:
     dirs = tex.get("readable_dirs") or []
     if not isinstance(dirs, list) or not all(isinstance(d, str) for d in dirs):
         raise ConfigError("templates.latex.readable_dirs must be a list of paths")
+    telegram = data.get("telegram") or {}
+    if not isinstance(telegram, dict):
+        raise ConfigError("config section 'telegram' must be a mapping")
+    if telegram.get("user_id") is not None and not _positive_int(telegram["user_id"]):
+        # The value itself is never echoed: it must not reach logs.
+        raise ConfigError("telegram.user_id must be your numeric Telegram user ID (or null)")
+    for key in Config.TELEGRAM_DEFAULTS:
+        num = telegram.get(key, Config.TELEGRAM_DEFAULTS[key])
+        if isinstance(num, bool) or not isinstance(num, (int, float)) or num <= 0:
+            raise ConfigError(f"telegram.{key} must be a positive number")
     poll = (data.get("daemon") or {}).get("poll_seconds", 5)
     if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("daemon.poll_seconds must be a positive number")
@@ -427,4 +463,6 @@ def load_config(
     secrets = Secrets.from_env_file(
         cdir / ENV_FILENAME, host=host if host is not None else MacHost(), keychain_service=service
     )
+    if (uid := _telegram_user_id(data)) is not None:
+        secrets.also_redact(str(uid))
     return Config(data=data, config_dir=cdir, secrets=secrets, source=source)

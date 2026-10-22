@@ -286,6 +286,33 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX failovers_task ON failovers(task_id, id);
     """,
+    # 9: Telegram alerts (§2.12).
+    """
+    -- One row per Telegram alert, made from the transition that caused it.
+    -- sent_at stays NULL until the Bot API accepted it; dropped_at is set
+    -- when it was never delivered and grew too old. `text` is already
+    -- redacted, and a comedy Task's is a status line only.
+    CREATE TABLE alerts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        transition_id  INTEGER NOT NULL UNIQUE REFERENCES transitions(id),
+        task_id        TEXT NOT NULL REFERENCES tasks(id),
+        kind           TEXT NOT NULL,
+        text           TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        sent_at        TEXT,
+        tries          INTEGER NOT NULL DEFAULT 0,
+        last_error     TEXT,
+        dropped_at     TEXT
+    );
+    CREATE INDEX alerts_pending ON alerts(sent_at, dropped_at, id);
+
+    -- Small named values Nightshift keeps between daemon runs (e.g. the
+    -- last transition alerts were made for, the Telegram update offset).
+    CREATE TABLE meta (
+        key    TEXT PRIMARY KEY,
+        value  TEXT NOT NULL
+    );
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -793,3 +820,48 @@ class Database:
         """A Task's agent switches, oldest first."""
         return self.conn.execute("SELECT * FROM failovers WHERE task_id = ? ORDER BY id",
                                  (task_id,)).fetchall()
+
+    # -- Telegram alerts (§2.12) --------------------------------------------------
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row["value"])
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.tx() as c:
+            c.execute("INSERT INTO meta (key, value) VALUES (?, ?) "
+                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+    def transitions_after(self, transition_id: int) -> list[sqlite3.Row]:
+        """Every Task's transitions with an id above ``transition_id``, oldest first."""
+        return self.conn.execute("SELECT * FROM transitions WHERE id > ? ORDER BY id",
+                                 (transition_id,)).fetchall()
+
+    def last_transition_id(self) -> int:
+        return int(self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM transitions").fetchone()[0])
+
+    def insert_alert(self, *, transition_id: int, task_id: str, kind: str, text: str,
+                     at: str) -> None:
+        with self.tx() as c:
+            c.execute("INSERT OR IGNORE INTO alerts (transition_id, task_id, kind, text, "
+                      "created_at) VALUES (?, ?, ?, ?, ?)",
+                      (transition_id, task_id, kind, text, at))
+
+    def pending_alerts(self) -> list[sqlite3.Row]:
+        """Alerts not yet sent or dropped, oldest first."""
+        return self.conn.execute("SELECT * FROM alerts WHERE sent_at IS NULL AND dropped_at "
+                                 "IS NULL ORDER BY id").fetchall()
+
+    def alerts(self, task_id: str | None = None) -> list[sqlite3.Row]:
+        if task_id is None:
+            return self.conn.execute("SELECT * FROM alerts ORDER BY id").fetchall()
+        return self.conn.execute("SELECT * FROM alerts WHERE task_id = ? ORDER BY id",
+                                 (task_id,)).fetchall()
+
+    def mark_alert(self, alert_id: int, *, sent_at: str | None = None,
+                   error: str | None = None, dropped_at: str | None = None) -> None:
+        """Record one delivery try: sent, failed with ``error``, or dropped."""
+        with self.tx() as c:
+            c.execute("UPDATE alerts SET tries = tries + ?, sent_at = COALESCE(?, sent_at), "
+                      "last_error = COALESCE(?, last_error), "
+                      "dropped_at = COALESCE(?, dropped_at) WHERE id = ?",
+                      (0 if dropped_at else 1, sent_at, error, dropped_at, alert_id))

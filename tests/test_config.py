@@ -163,3 +163,14 @@ def test_config_repr_hides_secrets(tmp_path):
     os.chmod(env, 0o600)
     cfg = load_config(tmp_path, host=FakeHost())
     assert "very-secret-token" not in repr(cfg)
+
+
+def test_telegram_user_id_is_validated_and_redacted(tmp_path):
+    (tmp_path / "config.yaml").write_text("telegram: {user_id: '@not-a-number'}\n")
+    with pytest.raises(ConfigError) as err:
+        load_config(tmp_path, host=FakeHost())
+    assert "@not-a-number" not in str(err.value)
+    (tmp_path / "config.yaml").write_text("telegram: {user_id: 424242424}\n")
+    cfg = load_config(tmp_path, host=FakeHost())
+    assert cfg.telegram_user_id == 424242424
+    assert cfg.secrets.redact("sent to 424242424") == "sent to [REDACTED]"

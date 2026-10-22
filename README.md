@@ -71,6 +71,12 @@ then 30, and is retried on the same agent; after 2 retries it is `failed`.
 `orch retry <id>` requeues a failed Task with a fresh budget (or ends a
 `retry_wait` early), and `orch cancel <id>` cancels any unfinished Task.
 
+With `telegram.user_id` in config and the bot token in `.env` (or the
+Keychain) as `TELEGRAM_BOT_TOKEN`, the daemon sends you a Telegram message when
+a Task finishes (its one-line Result), fails, or needs you; usage pauses stay
+silent, and comedy Tasks get status lines only. It only long-polls the Bot
+API, so no port is opened, and it ignores (and logs) messages from anyone else.
+
 A Schedule creates pre-approved Occurrences of a template on a cron-style
 rule (local time), each an ordinary Task in
 `~/agents/recurring/<name>/YYYY-MM-DD/`. Fires missed while the Mac slept (or

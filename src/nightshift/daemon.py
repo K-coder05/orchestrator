@@ -29,6 +29,7 @@ from typing import IO, Any
 import nightshift
 
 from . import failover, failures, pauses, schedules, usage
+from .alerts import AlertService
 from .adapters import get_adapter
 from .config import Config
 from .db import Database
@@ -269,6 +270,7 @@ class QueueRunner:
         clock: Callable[[], datetime] | None = None,
         post_hooks_for: Callable[[Config, Any], Any] | None = None,
         prober: Callable[[str], Any] | None = None,
+        alerts: AlertService | None = None,
     ):
         self.cfg = cfg
         self.db = db
@@ -284,6 +286,8 @@ class QueueRunner:
         # Minimal probe requests for agents out of usage with no reset time.
         self.prober = prober or (lambda agent: usage.probe(
             self.cfg, self.db, agent, adapter_provider=self.adapter_provider, clock=self.clock))
+        # Telegram alerts (§2.12); kicked after each Attempt so they go out at once.
+        self.alerts = alerts
         self.current: str | None = None
         self.control: AttemptControl | None = None
         self._wake_mark: tuple[datetime, float] | None = None
@@ -422,6 +426,8 @@ class QueueRunner:
             self.current = None
             self.control = None
             self.write_state()
+            if self.alerts is not None:
+                self.alerts.kick()
         return task_id
 
     def drain(self) -> list[str]:

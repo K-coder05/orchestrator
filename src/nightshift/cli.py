@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from . import daemon, failures, pauses, planning, queries, schedules, templates, views
+from . import alerts, daemon, failures, pauses, planning, queries, schedules, templates, views
 from . import usage as usage_mod
 from . import priority as prio
 from .adapters import get_adapter
@@ -834,11 +834,19 @@ def daemon_run(ctx, exit_when_idle):
             f"another daemon is already running (lock {daemon.lock_path(cfg)})"
         )
     db = Database(cfg.db_path, tz=cfg.timezone)
-    runner = daemon.QueueRunner(cfg, db, host, log=lambda m: click.echo(m))
+    def log(msg: str) -> None:
+        click.echo(cfg.secrets.redact(f"{iso(now(cfg.timezone))} {msg}"))
+
+    service = alerts.service_from_config(cfg, log=log, interval=daemon.poll_seconds(cfg))
+    runner = daemon.QueueRunner(cfg, db, host, log=lambda m: click.echo(m), alerts=service)
     old = {sig: signal.signal(sig, lambda *_: runner.stop()) for sig in (signal.SIGTERM, signal.SIGINT)}
+    if runner.alerts is not None:
+        runner.alerts.start()
     try:
         runner.serve(exit_when_idle=exit_when_idle)
     finally:
+        if runner.alerts is not None:
+            runner.alerts.stop()
         for sig, handler in old.items():
             signal.signal(sig, handler)
         db.close()

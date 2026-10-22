@@ -1226,3 +1226,38 @@ lasting consequences go in `docs/adr/` instead.
   plugin rendered every test's database with the old `views.py` and the
   new query + render path, at three different times: 2016 comparisons
   over 153 tests, no differences.
+
+## Phase 2, issue #18: Telegram alerts (outbound only)
+
+- **Alerts come from the `transitions` table, not from the code that moves
+  Tasks.** Every way a Task can end (the runner, retries running out, a
+  crash in Nightshift, an orphaned Task at start) already records a
+  transition, so one reader covers them all and no new path can forget to
+  alert. A cursor in the new `meta` table remembers the last transition
+  read; on the first start it begins at the newest one, so enabling
+  Telegram doesn't replay history.
+- **Outbox, then send.** Each alert is written to the `alerts` table (text
+  already redacted) and then sent from a daemon thread with its own DB
+  connection. A Telegram outage or hang only stalls that thread; the alert
+  is retried with backoff and dropped (and logged) once older than
+  `telegram.alert_max_age_hours` (12), since the 8am digest (#27) covers
+  the night anyway. The queue kicks the thread after each Attempt, so a
+  finished or failed Task alerts within a second; Tasks moved by the
+  scheduler or the CLI alert on the next `daemon.poll_seconds` tick. A
+  stopping daemon sends what is pending before it exits (bounded at 2s).
+- **Which transitions alert.** done/partial (finished, with the report's
+  one-line Result: the agent's own line, else Nightshift's verdict),
+  failed (with the reason), needs_you (with the first Needs you entry),
+  and paused_usage → awaiting_approval (a pause over 72h needs you to
+  re-approve: §2.12's "paused and needs me"). retry_wait, usage pauses,
+  cancels and everything else are silent.
+- **Comedy is decided by Task type** (`comedy`): its alerts carry the id
+  and state only, since the title, Result, reason or request may quote
+  material.
+- **Stdlib `urllib`, no Telegram library.** Two Bot API methods don't need
+  a dependency, and owning the request code means errors are built from
+  the method and status, never from the URL that holds the token.
+- **Incoming updates are long-polled and all ignored** (commands are
+  Phase 3). The offset is stored in `meta` so a restart doesn't log the
+  same strangers again. Telegram user ID is config (`telegram.user_id`),
+  not a secret, but it is redacted like one.
