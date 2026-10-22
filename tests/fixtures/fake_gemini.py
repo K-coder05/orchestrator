@@ -14,7 +14,8 @@ FAKE_GEMINI_RESULT (the result word in report.md). On the paid path (an
 API key) every model call is also written to the telemetry file:
 FAKE_GEMINI_CALL_TOKENS (JSON usage of each call), FAKE_GEMINI_CALL_MODEL.
 FAKE_PROPOSED (shared with fake_claude.py): a posting-scan agent's
-Proposed rows, copied to output/proposed_rows.csv.
+Proposed rows, copied to output/proposed_rows.csv. FAKE_PAGES (also
+shared): a company-rescrape agent's output/career_pages.json.
 """
 import json
 import os
@@ -138,6 +139,8 @@ Path("output").mkdir(exist_ok=True)
 Path("output/notes.md").write_text("# Notes\n")
 if os.environ.get("FAKE_PROPOSED"):
     Path("output/proposed_rows.csv").write_text(Path(os.environ["FAKE_PROPOSED"]).read_text())
+if os.environ.get("FAKE_PAGES"):
+    Path("output/career_pages.json").write_text(Path(os.environ["FAKE_PAGES"]).read_text())
 with open("progress.md", "a") as f:
     f.write("- gemini: wrote output/notes.md\n")
 result = os.environ.get("FAKE_GEMINI_RESULT", "done")

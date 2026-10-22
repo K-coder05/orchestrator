@@ -1,0 +1,114 @@
+# company-rescrape (§4 item 6): re-scrape the target companies' career
+# pages, snapshot them, diff against the previous snapshot, merge the matching
+# postings into the Tracker. Usage:
+#   orch schedule add company-rescrape  (the standard Schedule below: 2am
+#                                        every 2 days, catch-up run on next
+#                                        wake, overlap skip)
+#   orch add "Re-scrape the target career pages" --template company-rescrape
+#
+# The agent reads each career page in config (templates.posting_scan.
+# career_pages, the 15 target companies, shared with posting-scan) and
+# writes two files: output/career_pages.json, every internship posting each
+# page lists, and output/proposed_rows.csv, the ones matching §1.8. It never
+# sees data/. Nightshift's snapshot_pages post-hook writes the listing to
+# <data>/snapshots/company-rescrape/ and diffs it per page against the latest
+# Task where that page loaded; merge_tracker then validates, dedupes and
+# appends the Proposed rows. The report lists only New postings (from the
+# merge) and the diff as counts with the path to diff.md.
+#
+# A long Task (§2.3): an Occurrence caught up on wake waits for the
+# midnight-7am window. "*/2" is days 1, 3, 5, ..., 31 of each month, so a
+# 31-day month fires on the 31st and again on the 1st.
+name: company-rescrape
+description: Re-scrape the target career pages, snapshot and diff them, merge matching postings
+task_type: scraping
+agent: gemini
+estimated_minutes: 30
+max_runtime_minutes: 120
+long: true
+internet: "on"
+
+schedule:
+  cron: "0 2 */2 * *"
+  catch_up: next-wake
+  overlap: skip
+  request: Re-scrape the target companies' career pages
+
+values:
+  season: {config: templates.posting_scan.season}
+  career_pages: {config: templates.posting_scan.career_pages}
+
+post_hooks:
+  - hook: require_outputs
+    files: [output/career_pages.json, output/proposed_rows.csv]
+  - hook: snapshot_pages
+    pages: output/career_pages.json
+  - hook: merge_tracker
+    proposed: output/proposed_rows.csv
+
+prompt: |
+  Re-scrape my target companies' career pages, for Nightshift to snapshot
+  and to add matching postings to my application tracker. My request:
+  "{{request}}"
+
+  Read each of these career pages with your web fetch tool (follow the
+  page's own links to its job listings or job board, such as Greenhouse,
+  Lever, Ashby or Workday, and filter or search it for internships when it
+  offers that):
+  {{career_pages}}
+
+  If the list says "(none configured)", write `needs_you.json` asking me to
+  fill in `templates.posting_scan.career_pages` in my config, and stop.
+
+  1. Write `output/career_pages.json`, one entry per page above, in the
+     order given:
+
+         {"pages": [{"url": "<the career page URL as listed above>",
+                     "company": "<company name>",
+                     "loaded": true,
+                     "error": null,
+                     "postings": [{"title": "...", "location": "...", "url": "..."}]}]}
+
+     `postings` is every internship posting the page lists, whatever its
+     season, role or location (not only the ones that match below): the
+     title as shown, the location as shown, and the posting's own page URL
+     with tracking parameters removed. When a page can't be read (error,
+     login wall, blocked), set `loaded` to false, `error` to a short reason
+     and `postings` to []. Never guess postings for a page you couldn't read.
+
+  2. Write `output/proposed_rows.csv` with the postings from step 1 that
+     MATCH all of these rules:
+     - It is a {{season}} internship.
+     - The role is software engineering (SWE), backend, infrastructure or
+       ML engineering.
+     - It is located in the Bay Area, Seattle, NYC, or remote in the US.
+       A posting elsewhere that meets every other rule is kept, with notes
+       set to exactly `low-priority location`.
+     Screen OUT (never propose): MS/PhD-only roles, new-grad or full-time
+     roles, and roles needing a security clearance. Skip closed postings.
+     When the listing doesn't show the season, open the posting to check.
+
+     Its first line is exactly this header:
+
+         id,company,role,location,season,posting_url,source,date_found,deadline,status,resume_version,notes
+
+     One row per posting: leave `id`, `status` and `resume_version` empty
+     (Nightshift sets them). `season` is "{{season}}". `posting_url` is the
+     same URL as in step 1. `source` is the career page URL. `date_found`
+     is today as YYYY-MM-DD. `deadline` is the stated close date as
+     YYYY-MM-DD, or empty. Quote any field containing a comma. Write the
+     header even when nothing matches.
+
+  Keep `progress.md` current as you finish each page.
+
+  Never visit LinkedIn (linkedin.com, lnkd.in) or follow links to it, and
+  respect robots.txt and site terms. Never log in, create an account, apply
+  or fill in any form.
+
+  Don't try to work out what changed since my last re-scrape or which postings
+  are new: Nightshift compares your listing with its previous snapshot and
+  your rows with my tracker after you finish, then writes the new postings
+  and the changes into `report.md` itself. In your report, don't list
+  postings; in the Summary say how many pages you read, how many postings
+  you listed and proposed, and which pages failed to load (also under Open
+  issues).

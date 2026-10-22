@@ -172,7 +172,9 @@ templates:
     cover_letter_template: ~/Documents/career/resume/cover_letter_template.tex
   # Inputs of the posting-scan template (§1.8). Fill these in: the public
   # internship tracker repos (GitHub URLs) and your target companies' career
-  # page URLs the daily scan checks. Never LinkedIn.
+  # page URLs the daily scan checks. Never LinkedIn. company-rescrape
+  # re-scrapes the same career_pages every 2 days (snapshots and diffs in
+  # <agents_root>/data/snapshots/company-rescrape/).
   posting_scan:
     # Only postings for this season match; Nightshift rejects other rows.
     season: Summer 2027

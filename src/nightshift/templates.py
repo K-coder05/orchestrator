@@ -34,6 +34,9 @@ failing one is a Failed Attempt (§2.7). Hook names map to ``HOOKS``.
 a unified diff of each output against the pristine input to ``report.md``.
 A template with a ``merge_tracker`` post-hook (posting-scan) also gets a New
 postings section there, written from the Tracker merge result (§3.1 item 9).
+One with a ``snapshot_pages`` post-hook (company-rescrape) gets a Career pages
+snapshot section: the diff against the previous Task's snapshot as counts
+(``snapshots``).
 """
 
 from __future__ import annotations
@@ -51,7 +54,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from . import latex, trace, tracker
+from . import latex, snapshots, trace, tracker
 from .config import Config
 from .db import Database
 from .failures import PostHook, PostHookFailed
@@ -664,12 +667,42 @@ def _build_merge(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHook:
     return _named(hook, "merge_tracker")
 
 
+def _validate_snapshot(name: str, h: dict) -> None:
+    unknown = sorted(set(h) - {"hook", "pages"})
+    if unknown:
+        raise TemplateError(f"template {name!r}: snapshot_pages has unknown keys {', '.join(unknown)}")
+    _rel_path(name, "snapshot_pages pages", h.get("pages"))
+
+
+def snapshot_root(cfg: Config, template: str) -> Path:
+    """Where a template's career page snapshots go (agents can't reach it)."""
+    return cfg.data_dir / "snapshots" / template
+
+
+def _build_snapshot(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHook:
+    """Snapshot the agent's career page listing and diff it against the
+    previous Task's (``snapshots``). Nightshift code writes ``data/snapshots/``."""
+
+    def hook(folder: Path, row: Mapping[str, Any]) -> None:
+        path = _regular_file(folder, h["pages"])
+        try:
+            pages = snapshots.parse_pages(_read_text(path, h["pages"]))
+        except snapshots.SnapshotError as exc:
+            raise PostHookFailed(str(exc)) from None
+        rec = snapshots.record(snapshot_root(cfg, tpl.name), row["id"], pages,
+                               taken_at=now(cfg.timezone))
+        log_line(folder, f"snapshot of {len(pages)} career page(s) in {rec.folder}: "
+                 f"{rec.summary()}", cfg.secrets.redact, cfg.timezone)
+    return _named(hook, "snapshot_pages")
+
+
 HOOKS: dict[str, HookKind] = {
     "require_outputs": HookKind(_validate_require, _build_require),
     "compile_latex": HookKind(_validate_compile, _build_compile),
     "inputs_unchanged": HookKind(_validate_nothing, _build_unchanged),
     "trace_changes": HookKind(_validate_trace, _build_trace, file_keys=("master",)),
     "merge_tracker": HookKind(_validate_merge, _build_merge),
+    "snapshot_pages": HookKind(_validate_snapshot, _build_snapshot),
 }
 
 
@@ -712,6 +745,30 @@ def new_postings(cfg: Config, row: Mapping[str, Any]) -> str:
         tracker_path=Path(last["tracker_path"]))
 
 
+def snapshot_section(cfg: Config, row: Mapping[str, Any], template: str) -> str:
+    """The report's Career pages snapshot section: the diff against the
+    previous Task's snapshot as counts, with the path to its ``diff.md``.
+    Postings are listed only in New postings."""
+    title = "### Career pages snapshot"
+    rec = snapshots.load(snapshot_root(cfg, template), row["id"])
+    if rec is None:
+        return f"{title}\n\nNo snapshot was taken (see `logs/nightshift.log`)."
+    n = len(rec.pages)
+    lines = [title, "", f"{n} career page{'s' if n != 1 else ''} snapshotted in `{rec.folder}`."]
+    lines.append(rec.summary()[:1].upper() + rec.summary()[1:] + ".")
+    if rec.previous is not None:
+        lines.append(f"Counts are of any role or season. Full diff: "
+                     f"`{rec.folder / snapshots.DIFF_MD}`.")
+    first = [p for p in rec.pages if p.status == snapshots.FIRST]
+    if rec.previous is not None and first:
+        lines.append("First snapshot of: " + ", ".join(p.company or p.url for p in first) + ".")
+    if rec.failed:
+        lines.append("Failed to load: " + ", ".join(
+            (p.company or p.url) + (f" ({p.error})" if p.error else "") for p in rec.failed)
+            + ". Their postings are compared again the next time they load.")
+    return "\n".join(lines)
+
+
 def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
     """The Nightshift-written part of a template Task's ``report.md``: each
     ``report_diffs`` item as a unified diff of an output against the pristine
@@ -726,6 +783,8 @@ def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
     parts = []
     if any(h["hook"] == "merge_tracker" for h in tpl.post_hooks):
         parts.append(new_postings(cfg, row))
+    if any(h["hook"] == "snapshot_pages" for h in tpl.post_hooks):
+        parts.append(snapshot_section(cfg, row, tpl.name))
     if not tpl.report_diffs:
         return "\n\n".join(parts) or None
     folder = Path(row["folder"])

@@ -1413,3 +1413,52 @@ lasting consequences go in `docs/adr/` instead.
   `tests/test_gemini_real.py::test_posting_scan_on_gemini` is the opt-in
   check (`NIGHTSHIFT_REAL_AGENT=1 NIGHTSHIFT_SCAN_REPO=<repo URL>`); its
   logic was dry-run with a `gemini` wrapper around the fake on PATH.
+
+## Phase 2, issue #23: `company-rescrape` Schedule
+
+- **Template** `templates/company-rescrape.yaml`: `scraping` on Gemini,
+  `long: true` (so it starts only in the midnight-7am window unless
+  urgent), internet on, 30 min estimate (no plan approval for a one-off
+  `orch add --template company-rescrape`), 120 min cap. Its standard
+  Schedule is `0 2 */2 * *`, catch-up `next-wake`, overlap skip.
+  `*/2` in the day field is days 1, 3, ..., 31, so a 31-day month fires on
+  the 31st and the 1st: plain cron, accepted rather than adding an
+  "every N days" rule to the cron parser.
+- **Pages come from `templates.posting_scan.career_pages`**, the one list
+  of the 15 target companies (§1.8), shared with posting-scan rather than a
+  second copy to keep in sync.
+- **What the agent writes.** `output/career_pages.json` (per page: url,
+  company, loaded, error, and every internship posting listed, matching or
+  not) and `output/proposed_rows.csv` (the §1.8 matches, Tracker columns).
+  The agent never sees the previous snapshot and doesn't decide what is
+  new: snapshots and the Tracker live in `data/`, which agents can't reach.
+- **Snapshot and diff: `snapshot_pages` post-hook** (`nightshift.snapshots`),
+  Nightshift code. Writes
+  `data/snapshots/company-rescrape/<UTC stamp>_<task id>/{snapshot.json,
+  diff.json, diff.md}`; a later Attempt of the same Task replaces its folder
+  and is never diffed against itself. Each page is compared, by normalized
+  posting URL, with the latest earlier snapshot where that page loaded: a
+  page that fails to load is `failed` (its postings don't count as removed)
+  and is compared with its last good snapshot when it loads again; a page
+  never seen loading is `first`. `loaded` must be a real true/false (a
+  guessed one would diff an unread page as every posting removed). A bad
+  listing file is a Failed Attempt, before the merge runs. The diff files
+  sit apart from `snapshot.json` so Phase 4 retention can delete snapshots
+  and keep diffs (§2.13).
+- **New postings still come only from the Tracker merge**, not from the
+  diff: a matching posting already in the Tracker is not new even if it is
+  new on the page, and one missed by an earlier run is still added. The
+  report has the usual New postings section, then a Career pages snapshot
+  section with counts only (added/removed since Task X, pages that failed,
+  path to `diff.md`), so postings are listed only as New postings.
+- **Catch-up on wake** is the existing Schedule machinery: missed fires
+  collapse into one Occurrence when the daemon sees the wake. Being long,
+  that Occurrence waits for the overnight window (the scheduled 01:55 wake,
+  §1.9, normally makes the 2am fire run on time).
+- **Tests.** `tests/test_snapshots.py` (parse, diff, failed pages, reruns);
+  `tests/test_company_rescrape.py`: two runs through the fake `gemini` CLI
+  (which now writes `FAKE_PAGES` to `output/career_pages.json`, as the fake
+  `claude` does), a bad listing, long-task gating, and the Schedule on the
+  fake clock (missed 2am fire caught up once on wake and run at 00:45; three
+  missed fires collapse into one). Not run on the real Gemini CLI (not
+  installed on this Mac).

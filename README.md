@@ -29,6 +29,7 @@ orch list --status running
 orch logs <id> -f
 orch report <id>
 orch schedule add posting-scan   # daily 6:30am, catch-up within 12h else skip, overlap skip
+orch schedule add company-rescrape  # 2am every 2 days, catch-up on next wake, overlap skip
 orch schedule list           # also enable | disable | run-now | remove <name>
 ```
 

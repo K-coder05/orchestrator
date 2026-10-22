@@ -152,6 +152,9 @@ if os.environ.get("FAKE_PROPOSED"):
     # What a posting-scan agent writes (templates/posting-scan.yaml): the
     # file named by FAKE_PROPOSED, copied to output/proposed_rows.csv.
     Path("output/proposed_rows.csv").write_text(Path(os.environ["FAKE_PROPOSED"]).read_text())
+if os.environ.get("FAKE_PAGES"):
+    # A company-rescrape agent's career page listing (FAKE_PAGES names it).
+    Path("output/career_pages.json").write_text(Path(os.environ["FAKE_PAGES"]).read_text())
 
 result = os.environ.get("FAKE_RESULT", "done")
 if result != "none":
