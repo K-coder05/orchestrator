@@ -374,6 +374,21 @@ MIGRATIONS: list[str] = [
         dropped_at             TEXT
     );
     """,
+    # 13: manual interventions with no other record (Gate 2's clean week).
+    """
+    -- Commands that change things by hand and leave no transition, approval
+    -- or Schedule decision behind: orch priority, orch schedule
+    -- enable|disable|remove, orch raise-cap. The clean-week check lists them.
+    CREATE TABLE interventions (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        at             TEXT NOT NULL,
+        command        TEXT NOT NULL,
+        task_id        TEXT,
+        schedule_name  TEXT,
+        detail         TEXT NOT NULL
+    );
+    CREATE INDEX interventions_at ON interventions(at);
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -1022,3 +1037,20 @@ class Database:
                       "last_error = COALESCE(?, last_error), "
                       "dropped_at = COALESCE(?, dropped_at) WHERE id = ?",
                       (0 if dropped_at else 1, sent_at, error, dropped_at, digest_id))
+
+    # -- Interventions (Gate 2) -----------------------------------------------------
+    def record_intervention(self, *, at: str, command: str, detail: str,
+                            task_id: str | None = None,
+                            schedule_name: str | None = None) -> None:
+        with self.tx() as c:
+            c.execute("INSERT INTO interventions (at, command, task_id, schedule_name, detail) "
+                      "VALUES (?, ?, ?, ?, ?)", (at, command, task_id, schedule_name, detail))
+
+    def interventions(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM interventions ORDER BY id").fetchall()
+
+    def all_transitions(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM transitions ORDER BY id").fetchall()
+
+    def all_attempts(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM runs ORDER BY id").fetchall()

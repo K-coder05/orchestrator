@@ -1793,3 +1793,48 @@ lasting consequences go in `docs/adr/` instead.
   percentage without a Baseline (Claude and Codex), today/month/per-Task
   against the caps, a cap pause, no spend, escaping and read-only
   (`tests/test_dashboard.py`).
+
+## Phase 2, issue #32: Gate 2 tooling, the clean-week check
+
+- **`orch clean-week`** (`nightshift.cleanweek`) checks a period (the last
+  7 days by default; `--days`, `--until`) from Nightshift's own records and
+  prints the three conditions of Gate 2 with every item behind each, then
+  `Clean week: yes.` or `no (...)`. It exits 1 if any condition fails.
+- **Scheduled runs.** Each fire of each Schedule in the period (from its
+  cron rule, `cron.Cron.fires_in`, never before the Schedule was added) is
+  matched to the decision in `schedule_runs` that handled it: a decision
+  covers every fire after the previous decision's fire up to its own, as
+  `apply_catch_up` collapses them. `run-now` decisions handle no cron fire.
+  A fire *ran* when its Occurrence was created within 10 minutes; it *caught
+  up* when created later within its Catch-up rule, or collapsed into a later
+  fire's Occurrence; it was *skipped* by its Overlap rule or (more than N
+  hours late) its Catch-up rule. Problems: no decision (the daemon never
+  handled it; a fire under 10 minutes old is left to the next poll), an
+  error, a catch-up outside the rule or a skip inside it, an Occurrence
+  cancelled other than by the Overlap rule `replace`, or one still
+  unfinished 24 hours after it was created. A failed Occurrence ran; it is
+  judged under failures.
+- **Disabled Schedules.** Fires while a Schedule was disabled don't count.
+  `orch schedule enable|disable` are now recorded (see below), so the
+  disabled spans are known; with no record, a Schedule disabled now counts
+  as disabled since its last change.
+- **Failures.** Every Failed Attempt that ended in the period, plus every
+  Task that failed in it without one (the agent's report said failed, or a
+  Nightshift error before an Attempt). A reason explains a failure unless it
+  is a crash with no error message (`agent exited with code N` and nothing
+  more) or the daemon dying mid-Attempt: both say what happened, not why.
+  An agent-reported failure is explained by its `report.md`: section 1
+  beyond the result word, else Open issues, else Summary.
+- **Manual interventions.** Transitions a person caused (reasons with "by
+  hand", `(orch <command>)` or Ctrl-C: cancel, retry, pause, resume, approve,
+  deny), `orch schedule run-now` decisions, and a new `interventions` table
+  (migration 13) for commands that left no other record: `orch priority`,
+  `orch schedule enable|disable|remove` and `orch raise-cap`. Approving a
+  plan at `orch add`'s y/n prompt is not an intervention: it is part of
+  asking for the work, like `orch add` itself and `orch schedule add`.
+- **Tests** (`tests/test_cleanweek.py`) on fixture data written straight
+  into the database with a week's timestamps: a clean week, the period,
+  catch-up collapsing, Catch-up and Overlap skips, next-wake, replace, each
+  kind of scheduled-run problem, disabled spans, each failure kind with and
+  without an explanation, every intervention source, and `orch clean-week`
+  exiting 0, or 1 for each condition alone.

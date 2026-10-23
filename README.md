@@ -31,6 +31,7 @@ orch report <id>
 orch schedule add posting-scan   # daily 6:30am, catch-up within 12h else skip, overlap skip
 orch schedule add company-rescrape  # 2am every 2 days, catch-up on next wake, overlap skip
 orch schedule list           # also enable | disable | run-now | remove <name>
+orch clean-week              # Gate 2: were the last 7 days clean? exits 1 if not
 orch dashboard install       # read-only web dashboard: its own launchd agent on
                              # 127.0.0.1 and the Tailscale address, port 8765
 ```
@@ -147,3 +148,13 @@ only if the latest missed fire is at most N hours old, `--catch-up next-wake`
 always runs it. `--overlap skip` (default) skips a fire while the previous
 Occurrence is unfinished; `--overlap replace` cancels that one and starts
 fresh. `orch schedule run-now <name>` fires once by hand.
+
+`orch clean-week` checks the last 7 days (`--days N`, `--until WHEN`) against
+Gate 2: every Schedule fire either ran, caught up within its Catch-up rule, or
+was skipped by its rules (each fire is listed with its Occurrence); every
+Failed Attempt and failed Task has an explanation (a crash with no error
+message, a daemon that died mid-Attempt, or an agent that reported failed
+without saying why is listed as unexplained); and nothing was done by hand
+(`orch cancel|retry|pause|resume|approve|deny|priority|raise-cap`, `orch
+schedule run-now|enable|disable|remove`; approving a plan while `orch add`
+asks doesn't count). It exits 1 if any of the three fails.

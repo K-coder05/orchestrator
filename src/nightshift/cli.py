@@ -5,11 +5,14 @@ from __future__ import annotations
 import signal
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import click
 
-from . import alerts, daemon, failures, pauses, planning, queries, schedules, spend, templates, views
+from . import alerts, cleanweek, daemon, failures, pauses, planning, queries, schedules, spend
+from . import templates, views
 from . import usage as usage_mod
 from . import priority as prio
 from .adapters import get_adapter
@@ -272,6 +275,8 @@ def set_priority(ctx, task_id, level):
             raise click.ClickException(f"Task {task_id} is {row['state']}; its priority is final")
         old = row["priority"]
         db.set_priority(task_id, level)
+        db.record_intervention(at=iso(_clock(cfg)), command="orch priority", task_id=task_id,
+                               detail=f"priority {old} -> {level}")
         folder = Path(row["folder"])
         if (folder / "task.yaml").exists():
             spec = read_task_yaml(folder)
@@ -566,6 +571,35 @@ def usage_cmd(ctx, probe_agents):
         db.close()
 
 
+@main.command("clean-week")
+@click.option("--days", type=click.IntRange(min=1), default=cleanweek.DAYS, show_default=True,
+              help="Length of the period checked.")
+@click.option("--until", "until", default=None, metavar="WHEN",
+              help="End of the period (ISO 8601, local time if no offset). Default: now.")
+@click.pass_context
+def clean_week(ctx, days, until):
+    """Check the last 7 days against Gate 2 (a clean week): every scheduled
+    fire ran, caught up or was skipped by its rules; every failure has an
+    explanation; nothing was done by hand. Exits 1 if any of them fails."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        end = _clock(cfg)
+        if until:
+            try:
+                end = datetime.fromisoformat(until)
+            except ValueError:
+                raise click.BadParameter(f"not an ISO 8601 time: {until!r}",
+                                         param_hint="--until") from None
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=ZoneInfo(cfg.timezone))
+        week = cleanweek.check(cfg, db, end, days=days)
+        click.echo(cleanweek.format_check(week, cfg.timezone))
+    finally:
+        db.close()
+    if not week.clean:
+        ctx.exit(1)
+
+
 @main.command("raise-cap")
 @click.argument("usd", type=float)
 @click.pass_context
@@ -579,6 +613,8 @@ def raise_cap(ctx, usd):
             old = spend.raise_month_cap(cfg, db, at, usd)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from None
+        db.record_intervention(at=iso(at), command="orch raise-cap",
+                               detail=f"monthly spend cap ${old:.2f} -> ${usd:.2f} for {at:%Y-%m}")
         click.echo(f"Monthly spend cap raised from ${old:.2f} to ${usd:.2f} for "
                    f"{at:%Y-%m} (spend.per_month_usd applies again next month).")
     finally:
@@ -673,6 +709,9 @@ def _set_enabled(ctx, name: str, enabled: bool) -> None:
         if not changed:
             click.echo(f"Schedule {name} is already {word}.")
             return
+        db.record_intervention(at=iso(_clock(cfg)), schedule_name=name,
+                               command=f"orch schedule {'enable' if enabled else 'disable'}",
+                               detail=f"Schedule {name} {word}")
         click.echo(f"Schedule {name} {word}." + (
             " Fires from now on count; fires while it was disabled don't catch up."
             if enabled else ""))
@@ -738,6 +777,8 @@ def schedule_remove(ctx, name):
             left = schedules.remove(db, name)
         except schedules.ScheduleError as exc:
             raise _schedule_error(exc) from None
+        db.record_intervention(at=iso(_clock(cfg)), command="orch schedule remove",
+                               schedule_name=name, detail=f"Schedule {name} removed")
         click.echo(f"Schedule {name} removed.")
         if left:
             click.echo(f"Its unfinished Occurrence{'s' if len(left) > 1 else ''} "

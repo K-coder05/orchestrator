@@ -146,6 +146,17 @@ class Cron:
                     break
         return best
 
+    def fires_in(self, after: datetime, until: datetime, tz: ZoneInfo) -> list[datetime]:
+        """Every fire in ``(after, until]``, in order (for a bounded span,
+        e.g. the clean-week check's 7 days)."""
+        out: list[datetime] = []
+        d = after.astimezone(tz).date() - timedelta(days=1)
+        last = until.astimezone(tz).date() + timedelta(days=1)
+        while d <= last:
+            out += [i for i in self.day_fires(d, tz) if after < i <= until]
+            d += timedelta(days=1)
+        return out
+
     def fires_between(self, after: datetime, until: datetime,
                       tz: ZoneInfo) -> tuple[int, datetime | None]:
         """How many fires fall in ``(after, until]`` and the latest of them.
