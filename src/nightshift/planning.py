@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from . import report
-from .adapters import get_adapter
+from .adapters import get_adapter, load_api_key
 from .adapters.base import AgentAdapter, PlanningReply, Usage
 from .config import Config
 from .db import Database
@@ -112,7 +112,11 @@ def call(
     failures: a failed call is a ``PlanningReply`` with ``ok=False``."""
     agent = planning_agent(cfg)
     adapter = adapter_provider(agent, cfg.agent(agent))
-    command = adapter.planning_command(prompt, system=system, schema=schema)
+    load_api_key(adapter, cfg.secrets)
+    try:
+        command = adapter.planning_command(prompt, system=system, schema=schema)
+    except ValueError as exc:  # e.g. no API key to sign in with
+        return agent, PlanningReply(ok=False, error=cfg.secrets.redact(str(exc)))
     timeout = float(cfg.planning("timeout_seconds") or 180)
     try:
         proc = subprocess.run(

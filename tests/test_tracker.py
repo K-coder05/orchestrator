@@ -22,6 +22,7 @@ from nightshift.host import FakeHost
 from nightshift.permissions import build_policy
 from nightshift.states import TaskState
 
+from conftest import write_test_env
 from test_gemini import fake_gemini
 from test_gemini import genv  # noqa: F401  (pytest fixture)
 from test_runner import env, fake_provider  # noqa: F401  (pytest fixture)
@@ -386,6 +387,7 @@ def scfg_dir(tmp_path):
         "templates": {"posting_scan": {"tracker_repos": REPOS, "career_pages": PAGES}},
         "retries": {"max_retries": 1, "wait_minutes": [0]},
     }))
+    write_test_env(d)
     return d
 
 

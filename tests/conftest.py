@@ -12,6 +12,18 @@ from nightshift.host import FakeHost
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+#: The free-tier Gemini key every test config has in its .env.
+TEST_GEMINI_KEY = "test-gemini-free-key"
+
+
+def write_test_env(config_dir: Path) -> None:
+    """The test config's .env: Gemini signs in with an API key by default
+    (agents.gemini.auth)."""
+    env = config_dir / ".env"
+    env.write_text(f"GEMINI_API_KEY={TEST_GEMINI_KEY}\n")
+    env.chmod(0o600)
+
+
 @pytest.fixture
 def config_dir(tmp_path: Path) -> Path:
     d = tmp_path / "config"
@@ -19,6 +31,7 @@ def config_dir(tmp_path: Path) -> Path:
     (d / "config.yaml").write_text(
         yaml.safe_dump({"paths": {"agents_root": str(tmp_path / "agents")}})
     )
+    write_test_env(d)
     return d
 
 

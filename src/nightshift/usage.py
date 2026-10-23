@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from .adapters import get_adapter
+from .adapters import get_adapter, load_api_key
 from .adapters.base import AgentAdapter, ProbeReply, RateLimit, WindowInfo
 from .config import Config
 from .db import Database
@@ -343,11 +343,12 @@ def probe(
     adapter = adapter_provider(agent, cfg.agent(agent))
     if hasattr(adapter, "clock"):
         adapter.clock = clock
-    command = adapter.probe_command()
+    load_api_key(adapter, cfg.secrets)
     workdir = cfg.data_dir / "probe"  # empty and Nightshift-owned, like planning calls
     workdir.mkdir(parents=True, exist_ok=True)
     timeout = cfg.usage("probe_timeout_seconds")
     try:
+        command = adapter.probe_command()
         proc = subprocess.run(
             command.argv, input=command.stdin, capture_output=True, text=True, cwd=workdir,
             env=os.environ.copy() | command.env, timeout=timeout,
@@ -355,6 +356,8 @@ def probe(
         reply = adapter.parse_probe_output(proc.stdout, proc.returncode)
         if reply.error and proc.stderr.strip():
             reply.error += ": " + proc.stderr.strip()[-300:]
+    except ValueError as exc:  # e.g. no API key to sign in with
+        reply = ProbeReply(available=False, error=str(exc))
     except OSError as exc:
         reply = ProbeReply(available=False, error=f"could not start {command.argv[0]}: {exc}")
     except subprocess.TimeoutExpired:

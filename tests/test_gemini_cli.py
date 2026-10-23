@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -35,9 +36,11 @@ from nightshift.daemon import QueueRunner
 from nightshift.db import Database
 from nightshift.host import FakeHost
 from nightshift.permissions import build_policy
-from nightshift.runner import create_task
+from nightshift.runner import create_task, run_attempt
 from nightshift.states import TaskState
 from nightshift.timeutil import now
+
+from conftest import write_test_env
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("NIGHTSHIFT_GEMINI_CLI") != "1" or shutil.which("gemini") is None,
@@ -76,6 +79,7 @@ class Scripted(GeminiAdapter):
     def __init__(self, settings, scripts: list[list[dict]], folder: Path, home: Path):
         super().__init__({"model": MODEL, **settings})
         self.home = home  # sign-in files would be linked from here: none needed
+        self.api_key = "scripted-responses-need-no-real-key"
         self.scripts, self.folder = scripts, folder
 
     def _scripted(self, cmd):
@@ -104,6 +108,7 @@ def setup(tmp_path):
         "paths": {"agents_root": str(tmp_path / "agents")},
         "agents": {"gemini": {"model": MODEL}},
         "permissions": {"read_only_dirs": [str(ro)]}}))
+    write_test_env(config_dir)
     cfg = load_config(config_dir, host=FakeHost())
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     (cfg.data_dir / "applications.csv").write_text("DATA-SECRET\n")
@@ -199,7 +204,8 @@ def test_shell_sandbox_has_no_home_data_or_network(setup):
             sh("cat $GEMINI_CLI_HOME/.gemini/settings.json; true"),
             sh(f"ls {Path.home()}/.gemini 2>&1; true"),
             sh("curl -sS https://example.com 2>&1 | head -1; true"),
-            sh("echo ok > output.txt && cat output.txt")), text("Done.")])
+            sh("echo ok > output.txt && cat output.txt"),
+            sh("echo key=${GEMINI_API_KEY:-unset}; true")), text("Done.")])
         res = _results(events)
         assert not any(f for f, _ in res), res
         assert "HOME-CANARY" not in out and "DATA-SECRET" not in out
@@ -207,6 +213,7 @@ def test_shell_sandbox_has_no_home_data_or_network(setup):
         assert out.count("Operation not permitted") >= 4
         assert "Could not resolve host" in out
         assert '"output":"ok"' in out  # PATH reaches bash, redirection allowed
+        assert "key=unset" in out  # the CLI's API key never reaches a command
         assert cli_home.is_dir()
     finally:
         canary.unlink()
@@ -220,6 +227,36 @@ def test_a_denied_command_that_fails_hangs_the_cli(setup):
     _, events, _ = _run(cfg, home, [calls(sh(f"cat {Path.home()}/.zshrc")), text("Done.")],
                         timeout=20)
     assert not any(e.kind == EventKind.RESULT for e in events)
+
+
+def test_the_stall_guard_ends_the_hang(setup):
+    """Through Nightshift the hang above is stopped by the stall guard (a
+    Failed Attempt), not the runtime cap; a long silent command is not."""
+    cfg, home, _ = setup
+    db = Database(cfg.db_path, tz=cfg.timezone)
+    cfg.data["agents"]["gemini"]["stall_minutes"] = 0.1  # 6 s
+    try:
+        hang = create_task(cfg, db, "hang", agent="gemini", long=False)
+        busy = create_task(cfg, db, "busy", agent="gemini", long=False)
+        scripts = [[calls(sh(f"cat {Path.home()}/.zshrc")), text("Done.")],
+                   [calls(sh("sleep 12; echo slept")), text("Done.")]]
+
+        def provider(name, settings):
+            return Scripted(settings, scripts, hang.folder.parent, home)
+
+        start = time.monotonic()
+        res = run_attempt(cfg, db, hang.spec.id, adapter_provider=provider,
+                          max_runtime_seconds=120)
+        assert time.monotonic() - start < 60
+        [a] = db.attempts(hang.spec.id)
+        assert res.state == TaskState.RETRY_WAIT and "stalled" in a["end_reason"], a["end_reason"]
+        res = run_attempt(cfg, db, busy.spec.id, adapter_provider=provider,
+                          max_runtime_seconds=120)
+        [b] = db.attempts(busy.spec.id)
+        assert "stalled" not in (b["end_reason"] or ""), b["end_reason"]
+        assert '"output":"slept"' in Path(b["log_path"]).read_text()
+    finally:
+        db.close()
 
 
 def test_workspace_settings_never_load_and_resume_keeps_the_session(setup):

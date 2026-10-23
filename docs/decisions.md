@@ -1838,3 +1838,38 @@ lasting consequences go in `docs/adr/` instead.
   kind of scheduled-run problem, disabled spans, each failure kind with and
   without an explanation, every intervention source, and `orch clean-week`
   exiting 0, or 1 for each condition alone.
+
+## Phase 2, issue #17: Gemini on a real model
+
+- **Gemini signs in with an AI Studio API key by default**
+  (`agents.gemini.auth: gemini-api-key`). Google refuses the gemini CLI for
+  the AI Pro account (`IneligibleTierError`), so the plan path can't make a
+  model call; the free tier of a key can. `oauth-personal` stays available.
+  The key's free-tier quota is treated as Gemini's usage Window (daily
+  quotas per model; no spend, no cost-equivalent). The key is a secret like
+  the others: `.env` or the Keychain, loaded by the runner, planning calls
+  and probes (`adapters.load_api_key`), never read from the shell
+  environment (the launchd daemon wouldn't see it anyway).
+- **Separate secrets for the free and the paid path.** `gemini-api` now
+  defaults to `GEMINI_PAID_API_KEY`. With one shared `GEMINI_API_KEY` the
+  paid-credit rule would have moved Tasks to "paid credits" that are really
+  the same free key, recording made-up spend and hitting the same quota.
+- **`limit: 0` is not a limit hit.** A model with no quota on the key's
+  tier answers with the same 429 as a used-up quota but `limit: 0`;
+  pausing until the reset and probing would never succeed, so the Attempt
+  fails with the API's text instead.
+- **Stall guard** (`AgentAdapter.stall_seconds`, `agents.gemini.stall_minutes`,
+  default 5): a Step in flight, no output for that long and no process
+  under the agent but its own means the agent waits for something that
+  never comes (0.65.0's headless sandbox-expansion question). The Attempt
+  stops as a Failed Attempt, so the retry budget bounds it. "Its own"
+  processes are those under it at its first line (the relaunched `node`),
+  so a running command, which is always a new process, keeps the Attempt
+  alive however quiet it is, and model retries (no Step in flight) never
+  count. This is narrower than §2.7's Phase 3 stuck detection (15 minutes,
+  file changes, repeated tool calls), which it doesn't replace.
+- **Agents run in their own process group.** `gemini` relaunches itself
+  and doesn't forward SIGTERM; SIGKILL of the parent orphaned the real CLI,
+  which kept writing to the Task folder after the Attempt ended (seen).
+  Stops now signal the group and the group is SIGKILLed when the Attempt
+  ends, for every agent.

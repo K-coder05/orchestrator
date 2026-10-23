@@ -33,6 +33,16 @@ def paid_path(agent: str) -> str | None:
                 None)
 
 
+def load_api_key(adapter: AgentAdapter, secrets: Any, *, required: bool = False) -> None:
+    """Give ``adapter`` the API key it signs in with (the secret named by its
+    ``api_key_secret``, if any); loading it registers it for redaction. With
+    ``required`` a missing key raises ``ConfigError``; otherwise the adapter
+    refuses to build a command without it."""
+    if adapter.api_key_secret:
+        adapter.api_key = (secrets.require(adapter.api_key_secret) if required
+                           else secrets.get(adapter.api_key_secret))
+
+
 def get_adapter(name: str, settings: dict[str, Any] | None = None) -> AgentAdapter:
     try:
         factory = REGISTRY[name]

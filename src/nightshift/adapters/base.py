@@ -183,6 +183,10 @@ class AgentAdapter(ABC):
     subscription: str | None = None
     api_key_secret: str | None = None
     api_key: str | None = None
+    #: The stall guard: an Attempt with a Step in flight, no command running
+    #: (no process under the agent's own) and no output for this many
+    #: seconds is stopped as a Failed Attempt. None: no guard.
+    stall_seconds: float | None = None
 
     @abstractmethod
     def build_command(

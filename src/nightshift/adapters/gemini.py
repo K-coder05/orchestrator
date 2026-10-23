@@ -1,10 +1,14 @@
-"""Gemini CLI adapter (``gemini`` headless, Google AI Pro sign-in), Phase 2.
+"""Gemini CLI adapter (``gemini`` headless), Phase 2.
+
+Signs in with an AI Studio API key (``agents.gemini.auth: gemini-api-key``,
+the default: the free-tier quota is the usage Window) or with Google
+(``oauth-personal``, the AI Pro plan, which Google refuses for this client
+since 2026-10: "IneligibleTierError").
 
 Written from the gemini-cli 0.65.0 source (the npm bundle) on 2026-10-22,
-then checked against the installed 0.65.0: the real CLI ran Nightshift's
-commands with scripted model responses (``--fake-responses``), because the
-signed-in account gets no model access ("IneligibleTierError"). What was
-seen how, and what is still unverified, is in docs/adapters.md.
+checked against the installed 0.65.0 with scripted model responses
+(``--fake-responses``), then with real model calls on the API key
+(2026-10-23). What was seen how is in docs/adapters.md.
 
 Shape of an Attempt::
 
@@ -13,7 +17,8 @@ Shape of an Attempt::
       --allowed-mcp-server-names nightshift-none \
       [--include-directories <read-only dir> ...] [-m <model>]
     # env GEMINI_CLI_HOME=<settings_dir>/gemini-home (its .gemini/settings.json
-    #     is Nightshift's; your sign-in files are linked in),
+    #     is Nightshift's; on oauth-personal your sign-in files are linked in),
+    #     GEMINI_API_KEY (the key on gemini-api-key, else empty),
     #     GEMINI_CLI_TRUST_WORKSPACE=false, GEMINI_SANDBOX=false, TMPDIR, PATH
     # stdin: the agent protocol, then the prompt; cwd = Task folder
 
@@ -70,6 +75,14 @@ FORBIDDEN_ARGS = (
     "--raw-output", "--accept-raw-output-risk", "--fake-responses",
     "--fake-responses-non-strict", "--record-responses",
 )
+
+#: ``security.auth.selectedType`` values Nightshift supports.
+AUTH_API_KEY = "gemini-api-key"  # an AI Studio API key (GEMINI_API_KEY)
+AUTH_GOOGLE = "oauth-personal"  # Sign in with Google (the AI Pro plan)
+AUTH_TYPES = (AUTH_API_KEY, AUTH_GOOGLE)
+#: Minutes without output, a Step in flight and no command running, after
+#: which an Attempt counts as stalled (the 0.65.0 sandbox-expansion hang).
+DEFAULT_STALL_MINUTES = 5.0
 
 PROBE_SYSTEM = "Answer with the single word OK."
 PROBE_PROMPT = "OK?"
@@ -162,6 +175,15 @@ class GeminiAdapter(AgentAdapter):
         self.model: str | None = settings.get("model")
         self.planning_model: str | None = settings.get("planning_model") or self.model
         self.extra_args: list[str] = list(settings.get("extra_args") or [])
+        self.auth_type: str = str(settings.get("auth") or AUTH_API_KEY)
+        if self.auth_type not in AUTH_TYPES:
+            raise ValueError(f"agents.{self.name}.auth must be one of {list(AUTH_TYPES)}, "
+                             f"not {self.auth_type!r}")
+        # The runner (and planning calls, probes) set ``api_key`` from this secret.
+        self.api_key_secret = ((settings.get("api_key_secret") or "GEMINI_API_KEY")
+                               if self.auth_type == AUTH_API_KEY else None)
+        stall = settings.get("stall_minutes", DEFAULT_STALL_MINUTES)
+        self.stall_seconds = float(stall) * 60 if stall else None
         self._session_id: str | None = None
         self._model_seen: str | None = None
         self._stats: dict[str, Any] | None = None  # the result line's stats
@@ -197,9 +219,10 @@ class GeminiAdapter(AgentAdapter):
             # sandboxed one by one (security.toolSandboxing).
             "GEMINI_SANDBOX": "false",
             "PATH": safe_path(os.environ.get("PATH", ""), private_roots, tool_dirs),
-            # The plan path never sees an API key (which would bill credits).
-            # The CLI treats an empty value as unset.
-            "GEMINI_API_KEY": "",
+            # Only Nightshift's key, never one from your shell: GOOGLE_API_KEY
+            # would win over GEMINI_API_KEY, and on Google sign-in no key is
+            # passed at all. The CLI treats an empty value as unset.
+            "GEMINI_API_KEY": self._key(),
             "GOOGLE_API_KEY": "",
         }
         if tmpdir is not None:
@@ -224,6 +247,14 @@ class GeminiAdapter(AgentAdapter):
                         [Path(p) for p in sb.get("private_roots") or []])
         return Command(argv=argv + extra + self.extra_args, stdin=stdin, env=env)
 
+    def _key(self) -> str:
+        if self.auth_type != AUTH_API_KEY:
+            return ""
+        if not self.api_key:
+            raise ValueError(f"agents.{self.name} signs in with an API key: put "
+                             f"{self.api_key_secret} in .env or the Keychain")
+        return self.api_key
+
     @staticmethod
     def _with_protocol(task: TaskContext | None, prompt: str) -> str:
         # Gemini has no "append to the system prompt" flag: the protocol goes
@@ -247,9 +278,6 @@ class GeminiAdapter(AgentAdapter):
             raise ValueError("a resumed Attempt needs the Task's permissions too")
         return self._task_command(permissions, ["--resume", session_id],
                                   self._with_protocol(task, prompt))
-
-    #: ``security.auth.selectedType``: beats an API key in the environment.
-    auth_type = "oauth-personal"  # Sign in with Google (the AI Pro plan)
 
     def _settings(self, tools: list[str]) -> dict[str, Any]:
         return {
@@ -307,7 +335,9 @@ class GeminiAdapter(AgentAdapter):
         gem.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in self.SIGN_IN_FILES:
             src, link = self.home / ".gemini" / name, gem / name
-            if src.exists() and not link.exists():
+            if self.auth_type != AUTH_GOOGLE:
+                link.unlink(missing_ok=True)  # an API key needs no Google sign-in
+            elif src.exists() and not link.exists():
                 link.unlink(missing_ok=True)  # a dangling link
                 link.symlink_to(src)
         settings_file = gem / "settings.json"
@@ -517,6 +547,12 @@ class GeminiAdapter(AgentAdapter):
         if etype == "RetryableQuotaError" or (etype != "TerminalQuotaError"
                                               and not _LIMIT_TEXT.search(text)):
             return None
+        limits = [int(n) for n in _QUOTA_LIMIT.findall(text)]
+        if limits and not any(limits):
+            # "limit: 0": the model has no quota on this key's tier at all
+            # (seen: a pro model on a free-tier key). Waiting won't help, so
+            # this is a failure to fix in config, not a Window running out.
+            return None
         window = "daily" if re.search(r"\bdaily\b|PerDay", text, re.IGNORECASE) else None
         return RateLimit(limit_type=window, reset_at=parse_reset_text(text, self.clock()))
 
@@ -570,7 +606,7 @@ class GeminiAdapter(AgentAdapter):
 
     # -- planning and probes -----------------------------------------------
     def _replay(self, stdout: str) -> tuple["GeminiAdapter", RateLimit | None]:
-        run = GeminiAdapter({"model": self.model})
+        run = GeminiAdapter({"model": self.model, "auth": self.auth_type})
         run.clock = self.clock
         limit = None
         for line in stdout.splitlines():
@@ -611,7 +647,8 @@ class GeminiAdapter(AgentAdapter):
 class GeminiApiAdapter(GeminiAdapter):
     """The paid Gemini API path (AI Studio credits, §1.5): the same CLI and
     per-Task settings, signed in with an API key (``security.auth.selectedType``
-    ``gemini-api-key``, the key in ``GEMINI_API_KEY``).
+    ``gemini-api-key``, the key in ``GEMINI_API_KEY``, from the secret
+    ``GEMINI_PAID_API_KEY``).
 
     Every model call is read from the CLI's local telemetry file
     (``GEMINI_TELEMETRY_OUTFILE``, in the Nightshift-owned settings folder):
@@ -624,23 +661,21 @@ class GeminiApiAdapter(GeminiAdapter):
     name = "gemini-api"
     paid = True
     subscription = "gemini"
-    auth_type = "gemini-api-key"
     TELEMETRY_FILE = "gemini-api-calls.json"
 
     def __init__(self, settings: dict[str, Any] | None = None):
-        super().__init__(settings)
-        self.api_key_secret = (settings or {}).get("api_key_secret") or "GEMINI_API_KEY"
+        settings = settings or {}
+        # A billed project's key, never the free-tier key of agents.gemini.
+        super().__init__({**settings, "auth": AUTH_API_KEY, "api_key_secret":
+                          settings.get("api_key_secret") or "GEMINI_PAID_API_KEY"})
         self._telemetry: Path | None = None
         self._telemetry_pos = 0
         self._telemetry_buf = ""
 
     def _task_command(self, permissions: Permissions, extra: list[str], stdin: str) -> Command:
-        if not self.api_key:
-            raise ValueError(f"the Gemini API path needs the {self.api_key_secret} secret")
         command = super()._task_command(permissions, extra, stdin)
         self._telemetry = Path(permissions.sandbox["telemetry_file"])
         command.env |= {
-            "GEMINI_API_KEY": self.api_key,
             # Telemetry to a local file only (an outfile turns OTLP export off),
             # without prompts. Env beats every settings layer.
             "GEMINI_TELEMETRY_ENABLED": "true",
@@ -714,10 +749,16 @@ class GeminiApiAdapter(GeminiAdapter):
 _LIMIT_TEXT = re.compile(
     r"exhausted your (?:daily )?quota|exhausted your capacity|capacity exceeded"
     r"|MODEL_CAPACITY_EXHAUSTED|QUOTA_EXHAUSTED|quota exceeded|usage limit reached"
-    # The CLI's own suffix on any HTTP 429 under Google sign-in.
-    r"|Possible quota limitations in place",
+    # The Gemini API's 429 on an API key (seen 2026-10-23: "You exceeded your
+    # current quota, ... * Quota exceeded for metric: ..., limit: N, model: M").
+    r"|exceeded your current quota"
+    # The CLI's own suffixes on an HTTP 429: under Google sign-in, and on an
+    # API key ("Please wait and try again later. To increase your limits, ...").
+    r"|Possible quota limitations in place|To increase your limits, request a quota increase",
     re.IGNORECASE,
 )
+#: The "limit: N" of each quota the Gemini API says was exceeded.
+_QUOTA_LIMIT = re.compile(r"Quota exceeded for metric: [^\n]*?, limit: (\d+)", re.IGNORECASE)
 _RETRY_IN = re.compile(r"(?:retry in|retry after|reset after|resets? in)\s+"
                        r"(?:(?P<h>\d+)h\s*)?(?:(?P<m>\d+)m(?!s)\s*)?(?:(?P<s>[\d.]+)(?P<unit>ms|s))?",
                        re.IGNORECASE)

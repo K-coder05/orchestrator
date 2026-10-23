@@ -85,18 +85,19 @@ Planning calls and probes on Codex use `--ephemeral`, the built-in
 
 ## How Gemini Tasks are confined
 
-> **Checked on the installed gemini-cli 0.65.0 with scripted model
-> responses** (`tests/test_gemini_cli.py`, docs/adapters.md): the real CLI
-> ran Nightshift's commands and its policy engine, tools and shell sandbox
-> did what the rows say. "(seen)" marks what was observed that way. No real
-> model has driven a Task yet (the account gets no model access), so a
-> model trying its own escapes is still to see. Re-check after every Gemini
-> CLI upgrade.
+> **Verified on gemini-cli 0.65.0**: first with scripted model responses
+> (`tests/test_gemini_cli.py`), then with a real model on a free-tier AI
+> Studio key (`tests/test_gemini_real.py`, 2026-10-23; docs/adapters.md).
+> "(seen)" marks what was observed that way. In the real run the model
+> carried out the audit's escape attempts and the rows held (the known
+> relative-write gap included). Re-check after every Gemini CLI upgrade.
 
 `GeminiAdapter.write_permissions` maps the same `PermissionPolicy` to a
 per-Task CLI home (`GEMINI_CLI_HOME`, its settings file is the user layer),
 an admin-tier policy file and a few env vars and flags (exact shape in
-docs/adapters.md).
+docs/adapters.md). It signs in with an AI Studio API key
+(`agents.gemini.auth: gemini-api-key`, the default; the key comes from
+`.env` or the Keychain) or with Google (`oauth-personal`).
 
 **Technically enforced:**
 
@@ -104,7 +105,7 @@ docs/adapters.md).
 |---|---|---|
 | No blanket skip-permissions | **Enforced by Nightshift** | Never `--yolo`/`--approval-mode yolo`; `security.disableYoloMode`; the adapter refuses to build a command without a policy and refuses `agents.gemini.extra_args` with `--yolo`, `--approval-mode`, `--sandbox`, `--policy`, `--include-directories`, `--skip-trust`, `-e`, `--fake-responses`, ... |
 | Only the Task's tools exist; anything else is denied | **Enforced (seen)** | `tools.core` lists the only built-in tools (others are "not found"); the admin policy denies `*` and allows those; headless, every "ask" becomes deny. |
-| Your Gemini settings, policies and the Task folder's own settings can't widen this | **Enforced (seen)**, with one refusal | `GEMINI_CLI_HOME` makes Nightshift's file the user settings layer: your `~/.gemini` settings, policies and extensions aren't read (only the sign-in files are linked in). The only layer above it is a root-owned system settings file. `GEMINI_CLI_TRUST_WORKSPACE=false` keeps the agent-writable `.gemini/settings.json` in the Task folder from loading (seen: one switching the sandbox off changed nothing) and project hooks off. The policy is admin tier. `-e none`, `--allowed-mcp-server-names nightshift-none`, `hooksConfig.enabled: false`. Nightshift **refuses to run** a Gemini Attempt if `~/.gemini/policies/sandbox.toml` exists (read from your real home even under `GEMINI_CLI_HOME`: persistent shell-sandbox grants, including network). |
+| Your Gemini settings, policies and the Task folder's own settings can't widen this | **Enforced (seen)**, with one refusal | `GEMINI_CLI_HOME` makes Nightshift's file the user settings layer: your `~/.gemini` settings, policies and extensions aren't read (on Google sign-in only the sign-in files are linked in; on the API key nothing is). The only layer above it is a root-owned system settings file. `GEMINI_CLI_TRUST_WORKSPACE=false` keeps the agent-writable `.gemini/settings.json` in the Task folder from loading (seen: one switching the sandbox off changed nothing) and project hooks off. The policy is admin tier. `-e none`, `--allowed-mcp-server-names nightshift-none`, `hooksConfig.enabled: false`. Nightshift **refuses to run** a Gemini Attempt if `~/.gemini/policies/sandbox.toml` exists (read from your real home even under `GEMINI_CLI_HOME`: persistent shell-sandbox grants, including network). |
 | Writes only in the Task folder | **Enforced (seen)** for file tools and shell, except the gaps below | File tools only reach the workspace (Task folder + include dirs) and the CLI home's project temp dir; shell commands run under a per-command Seatbelt profile with `(deny default)`; a shell write outside is "Operation not permitted". |
 | Read-only folders readable, never written | **Enforced (seen)** for file tools; **best effort** for shell | Added with `--include-directories`; `read_file` reads them. Admin rules deny `write_file`/`replace` into them and any write path with `..` (seen). **Gap (seen):** Gemini's sandbox makes include dirs writable to shell commands; commands that *name* a read-only folder are denied (absolute, `~/`, `$HOME/` forms), but `cd` then a relative path got through. |
 | `~/agents/data/`, no-access dirs, the rest of home and `~/agents/` unreadable | **Enforced (seen)** | Not in the workspace (file tools refuse them); the shell profile is deny-by-default (seen: a file in `~`, `~/.gemini`, the CLI home with the linked sign-in, and `data/` through a relative path all refused). `PATH` is filtered so no entry opens home, `agents_root` or `/` (`~/bin` or `/bin` would); `/bin`'s programs are reached through links. Shell commands naming a no-access dir are also denied by policy. |
@@ -119,9 +120,10 @@ docs/adapters.md).
 |---|---|---|
 | Shell can read/write `/tmp` and `/private/tmp` | **Gap (seen)** | The base profile always allows them. `TMPDIR` points into the Task folder, but `/tmp` stays shared. (`~/.gemini/tmp` is no longer one: sessions live in the per-Task CLI home, which the shell can't read.) |
 | The Task's own session transcripts | **Gap (minor)** | File tools may read and write the CLI home's project temp dir (`gemini-home/.gemini/tmp/<project>`), which holds this Task's own sessions; an agent could edit what a later resume replays. Other Tasks' and your sessions are elsewhere. |
-| A failing command that the sandbox stopped hangs the Attempt | **Gap (seen, CLI bug)** | After a sandbox denial with a non-zero exit, 0.65.0 waits forever for a "sandbox expansion" answer it can't get headless. Nothing is granted, but the Attempt stalls until its runtime cap (a Failed Attempt). The agent protocol doesn't mention it yet; no stall guard exists. |
+| A failing command that the sandbox stopped hangs the Attempt | **Gap (seen, CLI bug), bounded by Nightshift** | After a sandbox denial with a non-zero exit, 0.65.0 waits forever for a "sandbox expansion" answer it can't get headless. Nothing is granted. Nightshift's **stall guard** (`agents.gemini.stall_minutes`, default 5) stops an Attempt with a Step in flight, no command running and no output for that long, as a Failed Attempt (seen on the real CLI); before, it ran to its runtime cap. The retry may hit the same hang if the agent repeats the command. |
+| Stopping an Attempt reaches every agent process | **Enforced by Nightshift (seen)** | `gemini` relaunches itself as a child process and doesn't pass SIGTERM on; killing only the parent left the child working on the Task folder after the Attempt had ended (seen). Every agent now runs in its own process group: stops signal the group, and the group is SIGKILLed when the Attempt ends. |
 | Bash network-command deny-list (`curl`, `wget`, ...) | **Not mapped** | The shell has no network at all; the deny-list adds nothing there. |
-| Secrets in the environment | **Best effort** | `security.environmentVariableRedaction.enabled` and Gemini's own sanitizing of the shell environment; API keys are blanked on the plan path. |
+| Secrets in the environment | **Enforced for the API key (seen)**, best effort otherwise | The CLI process holds `GEMINI_API_KEY` (only Nightshift's key from `.env`/Keychain; a key in your shell is overwritten, `GOOGLE_API_KEY` blanked); shell commands don't get it (seen: `echo $GEMINI_API_KEY` prints nothing), and the shell sandbox can't read `~/.config/nightshift`. `security.environmentVariableRedaction.enabled` and Gemini's own sanitizing cover other variables. The paid path's key is a separate secret, never given to the free path. Nightshift masks every loaded key in logs and reports. |
 | What the agent does inside the Task folder, report.md honesty, not retrying denied actions | **Instruction-only** | The agent protocol, as for every agent. |
 | Model fallback rotates the session | **Gap (to verify)** | On a quota/capacity error the CLI may switch model silently and start a new session id; a later resume would miss the last turns. |
 
@@ -280,7 +282,8 @@ dedupes and appends them (`nightshift.tracker`).
   rather than run it), so those rows rest on the sandbox check. Codex
   sessions are still saved under `~/.codex/sessions` (needed for resume).
   Shell commands run as `/bin/zsh -lc`. Re-check after Codex upgrades.
-- **Gemini was checked on 0.65.0 with scripted model responses**, not yet
-  with a real model (the signed-in account gets no model access). Its shell
-  sandbox has a hang bug on failing denied commands (see the table), and git
-  is unavailable to Gemini Tasks.
+- **Gemini was verified on 0.65.0** with scripted model responses and with
+  a real model on a free-tier AI Studio key (Google sign-in is refused for
+  the AI Pro account). Its shell sandbox has a hang bug on failing denied
+  commands, which the stall guard turns into a Failed Attempt after 5
+  minutes (see the table), and git is unavailable to Gemini Tasks.

@@ -59,11 +59,21 @@ agents:
     # Extra flags for `codex exec`. Flags that change the sandbox, approvals
     # or config (-c, --sandbox, --add-dir, --profile, ...) are refused.
     extra_args: []
-  # Gemini CLI (`gemini`, headless with stream-json), signed in with the
-  # Google AI Pro plan (run `gemini` once and pick "Sign in with Google").
+  # Gemini CLI (`gemini`, headless with stream-json). Its usage Window is
+  # the quota of what it signs in with:
+  #   gemini-api-key  an AI Studio API key (free tier: daily and per-minute
+  #                   quotas per model, no spend). The key is a secret: put
+  #                   it in .env or the Keychain under api_key_secret (a key
+  #                   in your shell profile doesn't reach the launchd daemon).
+  #   oauth-personal  Sign in with Google (the AI Pro plan; run `gemini` once
+  #                   and pick "Sign in with Google"). Google refuses this
+  #                   client for AI Pro accounts since 2026-10.
   gemini:
     binary: gemini
-    # null uses the CLI's own default model.
+    auth: gemini-api-key
+    api_key_secret: GEMINI_API_KEY
+    # null uses the CLI's own default model ("auto": it picks a model per
+    # turn). A model with no quota on the key's tier ("limit: 0") fails.
     model: null
     # Model for planning calls when planning.agent is gemini; null uses `model`.
     planning_model: null
@@ -71,18 +81,24 @@ agents:
     # workspace or policies (--yolo, --approval-mode, --sandbox, --policy,
     # --include-directories, -e, ...) are refused.
     extra_args: []
+    # An Attempt with a Step in flight, no command running and no output for
+    # this long is stopped as stalled (a Failed Attempt): gemini-cli 0.65.0
+    # waits forever for a "sandbox expansion" answer after a denied command
+    # fails. null turns the guard off.
+    stall_minutes: 5
   # The paid Gemini API path (AI Studio credits, §1.5): the same Gemini CLI,
   # signed in with an API key instead of the plan. Runs Tasks given
   # `--agent gemini-api`, and Tasks on `gemini` the paid-credit rule moves
   # here while Gemini is out of usage (only if urgent, or the reset falls
   # after their Catch-up window). Every model call is recorded as spend and counts
   # toward spend.per_task_usd. The key is a secret: put it in .env or the
-  # Keychain under the name below, never here.
+  # Keychain under the name below, never here. It is the key of a billed
+  # project, not the free-tier key of agents.gemini.
   gemini-api:
     binary: gemini
     # null uses the CLI's own default model.
     model: null
-    api_key_secret: GEMINI_API_KEY
+    api_key_secret: GEMINI_PAID_API_KEY
     # Same refused flags as agents.gemini.extra_args.
     extra_args: []
 
@@ -142,8 +158,9 @@ usage:
     # Codex (ChatGPT plan): a 5-hour Window plus a weekly cap. Its limit
     # messages don't name the Window, so a hit counts as the shortest one.
     codex: {five_hour: 5, seven_day: 168}
-    # Gemini (Google AI Pro): a daily Window per model. A hit that doesn't
-    # say "daily" also counts as this Window.
+    # Gemini (an AI Studio key's free tier, or Google AI Pro): daily quotas
+    # per model, reset at midnight Pacific. A hit that doesn't say "daily"
+    # also counts as this Window (the CLI retries per-minute quotas itself).
     gemini: {daily: 24}
 
 planning:

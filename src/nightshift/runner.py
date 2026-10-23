@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -14,7 +15,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from . import failover, failures, pauses, report, spend, templates, usage
-from .adapters import get_adapter
+from .adapters import get_adapter, load_api_key
 from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
 from .config import Config
 from .db import Database
@@ -145,9 +146,22 @@ STOP_USAGE_LIMIT = "usage_limit"  # a (possibly simulated) rate limit: the Task 
 STOP_PAUSE = "pause"  # orch pause: the Task pauses until orch resume
 STOP_SPEND_CAP = "spend_cap"  # the Task reached its per-Task spend cap: needs you
 STOP_SPEND_PAUSE = "spend_pause"  # the daily/monthly spend cap: the Task pauses
+STOP_STALLED = "stalled"  # the stall guard: a Failed Attempt
 
 #: Seconds between SIGTERM and SIGKILL when an agent ignores a stop.
 KILL_GRACE_SECONDS = 15.0
+
+
+def signal_agent(proc: subprocess.Popen, sig: int) -> None:
+    """Send ``sig`` to the agent's whole process group (it is started in a
+    session of its own). gemini relaunches itself as a child node process and
+    does not pass SIGTERM on; killing only the parent left that child running
+    the Task on its own (seen on gemini-cli 0.65.0)."""
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        if proc.poll() is None:
+            proc.send_signal(sig)
 
 
 class AttemptControl:
@@ -177,6 +191,11 @@ class AttemptControl:
         #: On a real limit, how long the agent may take to end the session
         #: itself (and report its usage) before it is stopped.
         self.limit_wait_seconds: float = 0.0
+        #: When the agent last wrote a line (``time.monotonic()``).
+        self.last_output: float = time.monotonic()
+        #: The agent's own processes (its CLI and any relaunch of it), taken
+        #: at its first line; any other process under it is a running command.
+        self.own_pids: set[int] | None = None  # None: not taken yet
 
     def stop_after_step(self, reason: str, kind: str, limit: RateLimit | None = None) -> None:
         if self.pending is None:
@@ -206,26 +225,70 @@ class AttemptControl:
         self.stop_requested = True
         proc = self.proc
         if proc is not None and proc.poll() is None:
-            proc.terminate()
+            signal_agent(proc, signal.SIGTERM)
+
+
+def descendant_pids(pid: int) -> set[int]:
+    """Every process below ``pid`` (children, their children, ...), from one
+    ``ps`` listing; empty if ``ps`` fails."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    children: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found: set[int] = set()
+    todo = [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            if child not in found:
+                found.add(child)
+                todo.append(child)
+    return found
 
 
 class _Watchdog(threading.Thread):
     """Watches a running Attempt: stops it at its runtime cap or when
     ``orch cancel`` asked for it (read through its own DB connection, since
     SQLite connections stay in their thread), and kills an agent that
-    ignores SIGTERM for ``KILL_GRACE_SECONDS``."""
+    ignores SIGTERM for ``KILL_GRACE_SECONDS``.
+
+    With ``stall_seconds`` it is also the stall guard: a Step in flight, no
+    output for that long and no process under the agent but its own (no
+    command running) means the agent waits for something that never comes,
+    e.g. gemini-cli 0.65.0's headless "sandbox expansion" question. Model
+    retries (no Step in flight) and long commands (a process runs) are
+    never stalls."""
 
     def __init__(self, control: AttemptControl, proc: subprocess.Popen, *, cap_seconds: float,
-                 db_path: Path, task_id: str):
+                 db_path: Path, task_id: str, stall_seconds: float | None = None,
+                 descendants: Callable[[int], set[int]] = descendant_pids):
         super().__init__(daemon=True)
         self.control = control
         self.proc = proc
         self.cap_seconds = cap_seconds
         self.db_path = db_path
         self.task_id = task_id
+        self.stall_seconds = stall_seconds
+        self.descendants = descendants
         self.started = time.monotonic()
         self.done = threading.Event()
-        self.interval = min(1.0, max(0.05, cap_seconds / 20))
+        limits = [cap_seconds] + ([stall_seconds] if stall_seconds else [])
+        self.interval = min(1.0, max(0.05, min(limits) / 20))
+
+    def _stalled(self) -> bool:
+        c = self.control
+        if not self.stall_seconds:
+            return False
+        if not c.inflight or c.own_pids is None:
+            return False
+        if time.monotonic() - c.last_output < self.stall_seconds:
+            return False
+        return not (self.descendants(self.proc.pid) - c.own_pids)
 
     def _requests(self, conn: sqlite3.Connection | None) -> tuple[bool, bool]:
         """(cancel requested, pause requested) by ``orch cancel``/``orch pause``."""
@@ -256,10 +319,13 @@ class _Watchdog(threading.Thread):
                 c = self.control
                 if c.stop_requested:
                     if c.stop_requested_at and time.monotonic() - c.stop_requested_at > KILL_GRACE_SECONDS:
-                        self.proc.kill()
+                        signal_agent(self.proc, signal.SIGKILL)
                     continue
                 if time.monotonic() - self.started >= self.cap_seconds:
                     c.request_stop(STOP_RUNTIME_CAP)
+                    continue
+                if self._stalled():
+                    c.request_stop(STOP_STALLED)
                     continue
                 cancel, pause = self._requests(conn)
                 if cancel:
@@ -366,6 +432,7 @@ def run_attempt(
     control.limit_wait_seconds = cfg.usage("limit_exit_wait_seconds")
     control.inflight.clear()
     control.pending = control.pending_since = None
+    control.own_pids = None
     row = db.get_task(task_id)
     if row is None:
         raise KeyError(task_id)
@@ -376,9 +443,9 @@ def run_attempt(
     if hasattr(adapter, "clock"):
         adapter.clock = clock  # reset times given as a clock time ("resets 3pm")
     paid = adapter.paid
-    if paid and adapter.api_key_secret:
-        # A paid path's API key (§1.5); loading it registers it for redaction.
-        adapter.api_key = cfg.secrets.require(adapter.api_key_secret)
+    # The API key an agent signs in with (a paid path's, §1.5, or Gemini's
+    # free-tier key); loading it registers it for redaction.
+    load_api_key(adapter, cfg.secrets, required=True)
 
     # A fresh policy every Attempt, so config changes apply and nothing the
     # agent did to an earlier one carries over.
@@ -466,6 +533,9 @@ def run_attempt(
                 stderr=subprocess.PIPE,
                 text=True,
                 env=env,
+                # Its own process group: a stop reaches every process of the
+                # agent (signal_agent), and nothing of it outlives the Attempt.
+                start_new_session=True,
             )
         except OSError as exc:
             errors.append(f"could not start {command.argv[0]}: {exc}")
@@ -474,10 +544,12 @@ def run_attempt(
     if proc is not None:
         control.proc = proc
         if control.stop_requested:
-            proc.terminate()
+            signal_agent(proc, signal.SIGTERM)
         cap = max_runtime_seconds if max_runtime_seconds is not None else (
             failures.runtime_cap_seconds(cfg, row))
-        watchdog = _Watchdog(control, proc, cap_seconds=cap, db_path=db.path, task_id=task_id)
+        control.last_output = time.monotonic()
+        watchdog = _Watchdog(control, proc, cap_seconds=cap, db_path=db.path, task_id=task_id,
+                             stall_seconds=adapter.stall_seconds)
         watchdog.start()
     spend_watcher: _SpendWatcher | None = None
     if paid and proc is not None:
@@ -505,6 +577,12 @@ def run_attempt(
                 pass
             with open(stream_log, "w") as out:
                 for line in proc.stdout:
+                    control.last_output = time.monotonic()
+                    if adapter.stall_seconds and control.own_pids is None:
+                        # The agent is up (its first line) and no Step runs
+                        # yet: what runs under it now is its own (gemini
+                        # relaunches itself as a child node process).
+                        control.own_pids = descendant_pids(proc.pid)
                     out.write(redact(line))
                     out.flush()
                     for ev in adapter.parse_stream(line):
@@ -533,12 +611,15 @@ def run_attempt(
             exit_code = proc.wait()
         except KeyboardInterrupt:
             interrupted = True
-            proc.terminate()
+            signal_agent(proc, signal.SIGTERM)
             try:
                 exit_code = proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                signal_agent(proc, signal.SIGKILL)
                 exit_code = proc.wait()
+        # Whatever the agent left running in its group (an orphaned child,
+        # a background command) ends with the Attempt.
+        signal_agent(proc, signal.SIGKILL)
         t.join(timeout=5)
         if watchdog is not None:
             watchdog.done.set()
@@ -646,6 +727,10 @@ def run_attempt(
         cap_min = (max_runtime_seconds / 60 if max_runtime_seconds is not None
                    else failures.runtime_cap_seconds(cfg, row) / 60)
         failed_attempt = f"Attempt {attempt_no} hit its runtime cap of {cap_min:g} min"
+    elif stop == STOP_STALLED:
+        stall_min = (adapter.stall_seconds or 0) / 60
+        failed_attempt = (f"Attempt {attempt_no} stalled: a Step was in flight with no command "
+                          f"running and no output for {stall_min:g} min (stall guard)")
     elif interrupted:
         state, outcome = TaskState.CANCELLED, "cancelled"
         end_reason = "interrupted from the terminal (Ctrl-C)"

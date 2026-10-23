@@ -5,9 +5,9 @@ All agents sit behind `nightshift.adapters.base.AgentAdapter` (§2.9):
 `resume_command`, `usage_from_run`, `write_permissions`, plus
 `planning_command`/`parse_planning_output` and
 `probe_command`/`parse_probe_output`. Registered: `claude` (verified),
-`codex` (verified on codex-cli 0.163.0) and `gemini` (checked against the
-installed gemini-cli 0.65.0 with scripted model responses; no real model
-call yet, see its section). One adapter instance
+`codex` (verified on codex-cli 0.163.0) and `gemini` (verified on
+gemini-cli 0.65.0 with real model calls on an AI Studio API key, see its
+section). One adapter instance
 is created per Attempt, so `session_id()` and `usage_from_run()` report what
 that Attempt's stream contained. Adapters are looked up by name in
 `nightshift.adapters.REGISTRY`; core code never names an agent.
@@ -578,25 +578,22 @@ with the single word OK."; a `turn.completed` -> available, a limit message
 
 ## Gemini CLI
 
-> **Checked against the installed gemini-cli 0.65.0 (2026-10-22), with
-> scripted model responses; no real model call has succeeded yet.** The
+> **Verified on gemini-cli 0.65.0 (2026-10-23) with real model calls**,
+> signed in with an **AI Studio API key on the free tier**
+> (`agents.gemini.auth: gemini-api-key`, the default). Google sign-in
+> (`oauth-personal`, the AI Pro plan) still exists in the adapter, but
+> Google refuses this client for that account: every run stops at sign-in
+> with `IneligibleTierError: This client is no longer supported for Gemini
+> Code Assist for individuals ... migrate to the Antigravity suite`. The
 > adapter was first written from the 0.65.0 npm bundle (`// packages/...`
-> source markers kept). The CLI is now installed and signed in with the
-> Google AI Pro account, but **Google refuses this client for that account**:
-> every run, plain `gemini -p` included, stops at sign-in with
-> `IneligibleTierError: This client is no longer supported for Gemini Code
-> Assist for individuals. To continue using Gemini, please migrate to the
-> Antigravity suite of products` (`loadCodeAssist` returns no current or paid
-> tier, only `free-tier` with reason `UNSUPPORTED_CLIENT`). So everything up
-> to the model call was checked on the real CLI by running Nightshift's own
-> commands with the hidden `--fake-responses-non-strict <file>` flag: the
-> CLI replays model responses from a file instead of calling Google, and the
-> rest (flags, settings layers, folder trust, policy engine, the per-command
-> Seatbelt sandbox, tools, stream-json, sessions, resume, usage stats) is the
-> real thing. `tests/test_gemini_cli.py` (opt-in, `NIGHTSHIFT_GEMINI_CLI=1`,
-> no sign-in needed) repeats those checks; re-run it after every Gemini CLI
-> upgrade. What a real model, real usage counts and a real quota hit look
-> like is still unverified ("Still to verify" below).
+> source markers kept), then checked on the installed CLI with scripted
+> model responses (the hidden `--fake-responses-non-strict <file>` flag:
+> everything but the model is the real CLI), then end to end with the key
+> ("Verification log" below). Two opt-in suites repeat the checks; re-run
+> both after every Gemini CLI upgrade: `tests/test_gemini_cli.py`
+> (`NIGHTSHIFT_GEMINI_CLI=1`, scripted, no key or quota needed) and
+> `tests/test_gemini_real.py` (`NIGHTSHIFT_REAL_AGENT=1`, real calls on
+> `GEMINI_API_KEY`).
 
 ### Invocation Nightshift uses
 
@@ -607,8 +604,10 @@ gemini --output-format stream-json --approval-mode default \
   [--include-directories <read-only dir> ...] [-m <agents.gemini.model>]
 # env: GEMINI_CLI_HOME=<same dir>/gemini-home   (its .gemini/settings.json is Nightshift's)
 #      GEMINI_CLI_TRUST_WORKSPACE=false  GEMINI_SANDBOX=false
-#      GEMINI_API_KEY=""  GOOGLE_API_KEY=""
+#      GEMINI_API_KEY=<secret agents.gemini.api_key_secret>  GOOGLE_API_KEY=""
+#        (Google sign-in: both "")
 #      TMPDIR=<task folder>/.tmp  PATH=<filtered, see below>
+# process: its own process group (start_new_session); stops signal the group
 # stdin: <agent protocol> \n\n---\n\n <prompt>        cwd = Task folder
 # resume: the same, plus --resume <session_id>
 ```
@@ -621,6 +620,18 @@ are hidden.
   appends to the system prompt (`GEMINI_SYSTEM_MD` *replaces* it), so the
   agent protocol goes in front of the prompt on every Attempt, resumes
   included (the `user` message line echoes it).
+- **Sign-in** (`agents.gemini.auth`). `gemini-api-key` (default): the
+  settings pin `security.auth.selectedType: "gemini-api-key"` and
+  `GEMINI_API_KEY` carries the key from the secret named by
+  `agents.gemini.api_key_secret` (default `GEMINI_API_KEY`, in
+  `~/.config/nightshift/.env` or the Keychain; a key in your shell profile
+  doesn't reach the launchd daemon). `GOOGLE_API_KEY` is blanked (the CLI
+  would prefer it). Without the key the adapter refuses to build the
+  command (Attempts, planning calls and probes). No Google sign-in files
+  are linked in. `oauth-personal`: Google sign-in as below, both key
+  variables blanked. The paid `gemini-api` path has its own secret
+  (`GEMINI_PAID_API_KEY`), so the free key is never priced as spend nor
+  the paid key used on the free path.
 - **Settings: a per-Task CLI home** (changed after the real check). The
   plan was a *system* settings file via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`;
   the real CLI **skips** it ("Security Warning: Skipping system settings
@@ -629,8 +640,8 @@ are hidden.
   the CLI at `<settings dir>/gemini-home`, whose `.gemini/settings.json`
   (Nightshift's, rewritten each Attempt) becomes the *user* layer. Your
   `~/.gemini/settings.json`, policies, extensions, skills and history are
-  then not read at all; `oauth_creds.json` and `google_accounts.json` are
-  symlinked in from your `~/.gemini` so the sign-in still works (seen: the
+  then not read at all; on Google sign-in `oauth_creds.json` and
+  `google_accounts.json` are symlinked in from your `~/.gemini` (seen: the
   run reaches Google's tier check with your account). The home is kept
   between Attempts, since the Task's sessions live in it. The only layer
   above it is a root-owned system settings file
@@ -668,10 +679,16 @@ are hidden.
   "Error resuming session: No previous sessions found for this project." (or
   "Invalid session identifier"); Nightshift then starts a fresh session.
   Planning calls and probes leave a session in the private temp CLI home.
-- **Stops.** The CLI **ignores SIGTERM while a shell command runs** (seen:
-  still running 20 s later). Nightshift's SIGKILL after
-  `KILL_GRACE_SECONDS` (15 s) ends it; such an Attempt has no `result` line,
-  so no usage is recorded for it, but the session resumes fine.
+- **Stops.** `gemini` relaunches itself as a child `node` process and the
+  parent **does not pass SIGTERM on** (seen: after SIGTERM the child ran the
+  rest of its turns to the end; after SIGKILL of the parent the orphaned
+  child kept working on the Task folder until it finished). So Nightshift
+  starts every agent in its own process group and signals the group: on
+  SIGTERM the real CLI exits within a second (seen: exit 0, no `result`
+  line), and whatever is left in the group is SIGKILLed when the Attempt
+  ends. An Attempt stopped this way has no `result` line, so **no usage is
+  recorded for it** (a pause loses the stopped Attempt's tokens; recorded
+  usage undercounts), but the session resumes fine.
 - **PATH.** `safe_path` drops entries whose readable folder would contain
   your home or `agents_root` (the sandbox opens each `PATH` entry, the
   *parent* of a `.../bin` one). That drops `/bin` too (its parent is `/`),
@@ -694,7 +711,7 @@ are hidden.
 file and `gemini-home/.gemini/settings.json`, fresh each Attempt:
 
 ```json
-{"security": {"auth": {"selectedType": "oauth-personal"},
+{"security": {"auth": {"selectedType": "gemini-api-key"},
               "toolSandboxing": true, "folderTrust": {"enabled": false},
               "disableYoloMode": true, "disableAlwaysAllow": true,
               "enablePermanentToolApproval": false, "autoAddToPolicyByDefault": false,
@@ -758,10 +775,21 @@ network error such as "Could not resolve host"), the CLI asks for a
 "Sandbox Expansion Request" and **waits for an answer that never comes in
 headless mode**: no more output, the process never exits (seen; the
 scheduler calls `resolveConfirmation` directly, past the policy engine).
-The confinement holds (nothing is granted), but the Attempt only ends at its
-runtime cap, as a Failed Attempt. Commands whose last step succeeds (`...;
-true`) don't hang. Nightshift has no stall detection yet; see the open item
-under "Still to verify".
+The confinement holds (nothing is granted). Commands whose last step
+succeeds (`...; true`) don't hang.
+
+**The stall guard** (`agents.gemini.stall_minutes`, default 5; `null` turns
+it off) ends such an Attempt: when a Step is in flight (a `tool_use`
+without its `tool_result`), the agent has written nothing for that long, and
+no process runs under the agent other than its own (taken at its first
+line: the CLI and its relaunched `node` child), the runner stops it as a
+**Failed Attempt** ("stalled ... (stall guard)"), charged to the retry
+budget. Silence without a Step in flight (the CLI retrying the model, seen
+for 3.5 minutes on HTTP 503s) and a long silent command (a process runs
+under the CLI) are never stalls. Seen on the real CLI: the hang ended by
+the guard, a silent `sleep 12` left alone
+(`test_the_stall_guard_ends_the_hang`). The guard is generic
+(`AgentAdapter.stall_seconds`); only Gemini sets it.
 
 The whole-CLI sandbox (`--sandbox`, `tools.sandbox`, `GEMINI_SANDBOX`) is
 off: it would put the CLI's own network access and the shell's in one box.
@@ -803,7 +831,11 @@ to stdout: the stack trace goes to stderr, exit 1.
 (Nightshift's settings, `auto` model, scripted responses: a failed
 `read_file`, a `write_file`, a `run_shell_command`, two text chunks), with
 the Task path and the prompt replaced; `tests/fixtures/fake_gemini.py`
-replays it.
+replays it. Real model streams (2026-10-23) have the same lines and fields;
+only the tool ids differ (`read_file__call_121276`), which Nightshift treats
+as opaque, so the recording was kept. Real models also call tools that
+don't exist here (`update_topic`, seen on `gemini-3.5-flash-lite`): a
+failed Step ("Tool ... not found"), harmless.
 
 ### Usage mapping
 
@@ -814,10 +846,52 @@ observations carry tokens but no cost-equivalent, and Baselines can't form,
 as for Codex: only an actual limit error pauses Gemini). Entries with no
 tokens at all are skipped. The stats are the process's own, so a resumed
 Attempt reports only its own tokens (seen). An Attempt stopped before its
-`result` line (SIGKILL) records no usage. The token numbers in the
-recording are scripted; the real model's counts are not yet seen.
+`result` line records no usage. **Real counts** (2026-10-23,
+`gemini-3.5-flash-lite`): a one-word probe is ~3,600 input tokens and a
+planning call ~5,900; a three-file Task was 36,388 uncached input, 109,382
+cached and 1,979 output tokens over about 12 model calls, the cached part
+growing turn by turn; thinking tokens appear only in `total_tokens`. With
+the default `auto` model the router's own call is listed as a second model
+(seen: `gemini-3.5-flash-lite` routing to `gemini-3.8-flash`).
 
-### Rate limits *(source; no real hit seen)*
+### Rate limits (real API-key format, recorded 2026-10-23)
+
+On the API key a quota error is the Gemini API's HTTP 429
+(`RESOURCE_EXHAUSTED`), as one `result` line and exit **173**, recorded in
+`tests/fixtures/gemini_api_key_quota.jsonl`:
+
+```
+{"type":"result","status":"error","error":{"type":"unknown","message":
+ "[API Error: You exceeded your current quota, please check your plan and billing
+ details. ... \n* Quota exceeded for metric:
+ generativelanguage.googleapis.com/generate_content_free_tier_input_token_count,
+ limit: 0, model: gemini-3.1-pro\n* Quota exceeded for metric:
+ ..._free_tier_requests, limit: 0, model: gemini-3.1-pro\n...
+ Please retry in 10h56m39.249192747s.]\nPlease wait and try again later. To
+ increase your limits, request a quota increase through AI Studio, or switch
+ to another /auth method"},"stats":{... all zeros ...}}
+```
+
+(stderr names it `TerminalQuotaError`; that type doesn't reach the stream).
+The quotas behind it (from the raw API answer) are per model:
+`GenerateRequestsPerDayPerProjectPerModel-FreeTier`,
+`GenerateContentInputTokensPerModelPerDay-FreeTier` and their PerMinute
+pairs; "retry in 10h56m" pointed at midnight Pacific, the daily reset. It
+was seen by asking for `gemini-3.1-pro-preview`, which has **no** free-tier
+quota (`limit: 0`): cheap to trigger, nothing spent. **A used-up quota
+(`limit: N`, N > 0) was not observed**: that would mean burning a day's
+free quota. Its text should differ only in the numbers; the fake CLI's
+limit text is this recording with `limit: 20` and a 2 h retry time.
+
+So `detect_rate_limit` also matches "exceeded your current quota" and the
+CLI's API-key suffix ("To increase your limits, request a quota
+increase"), and reads the reset time from "Please retry in 10h56m39.2s".
+**`limit: 0` on every quota listed is not a limit hit**: the model can't be
+used on this key's tier at all, so waiting can't help; the Attempt fails
+with the API's text (a Failed Attempt) and the fix is `agents.gemini.model`.
+The CLI retries per-minute 429s itself first.
+
+The rest of this section is from the source; it also covers Google sign-in.
 
 The CLI classifies Google API errors (`classifyGoogleError`):
 `TerminalQuotaError` for a daily quota ("You have exhausted your daily quota
@@ -838,11 +912,12 @@ gave up on will count as one (its reset is usually seconds away). The reset
 time is read from the text: "Please retry in 34.5s"/"500ms", "Suggested
 retry after 3600s.", "reset after 2h31m10s"; without one Nightshift probes.
 Window: `daily` when the text says so, else the shortest configured Gemini
-Window (`usage.windows.gemini: {daily: 24}`).
+Window (`usage.windows.gemini: {daily: 24}`, the free tier's daily quotas;
+the API-key text above doesn't say "daily", so it lands here too).
 
 **Model fallback.** On a quota error the CLI may switch model; with action
-`silent` it **rotates the session id**. Whether this happens headless on
-the plan is unverified.
+`silent` it **rotates the session id**. Not seen on the API key (the quota
+error above ended the run without a fallback); unverified on the plan.
 
 ### Planning calls and probes
 
@@ -852,16 +927,22 @@ policy that denies `*`; no include dirs, no `TMPDIR` change. Gemini has no
 JSON-schema flag, so the planner instructions and the schema go in the
 prompt and the answer is the reply text parsed as JSON (a ```json fence is
 stripped). The probe sends "Answer with the single word OK." / "OK?" on the
-Task model. Both ran on the real CLI (scripted replies) through `orch add`
-and `usage.probe`.
+Task model. Both ran with real model calls on the API key: `orch add` got
+an estimate and a Task type back as JSON, `usage.probe` found the Window
+"available". Both need the key like an Attempt (without it they fail
+cleanly). With the default `auto` model one test call took 3.5 minutes
+while the CLI retried HTTP 503 "This model is currently experiencing high
+demand" (`planning.timeout_seconds` is 180): pin `agents.gemini.model` /
+`planning_model` to a model with spare capacity.
 
 ### The paid API path (`gemini-api`, AI Studio credits)
 
 `GeminiApiAdapter`: the same invocation, settings and policy as above, plus
 
 ```
-# settings: security.auth.selectedType = "gemini-api-key"   (plan path: "oauth-personal")
-# env:      GEMINI_API_KEY=<secret agents.gemini-api.api_key_secret>  GOOGLE_API_KEY=""
+# settings: security.auth.selectedType = "gemini-api-key"   (always)
+# env:      GEMINI_API_KEY=<secret agents.gemini-api.api_key_secret, default GEMINI_PAID_API_KEY>
+#           GOOGLE_API_KEY=""
 #           GEMINI_TELEMETRY_ENABLED=true  GEMINI_TELEMETRY_TARGET=local
 #           GEMINI_TELEMETRY_OUTFILE=<settings dir>/gemini-api-calls.json
 #           GEMINI_TELEMETRY_LOG_PROMPTS=false  GEMINI_TELEMETRY_USE_COLLECTOR=false
@@ -871,7 +952,9 @@ and `usage.probe`.
   `security.auth.selectedType` first, else the env (`getAuthTypeFromEnv`:
   `GEMINI_API_KEY` -> `gemini-api-key`). With both `GOOGLE_API_KEY` and
   `GEMINI_API_KEY` set the CLI uses `GOOGLE_API_KEY`, so it is blanked.
-  The plan path blanks both and pins `oauth-personal`.
+  Seen on the free path: a key signs in headless with the settings pinned
+  to `gemini-api-key`. The paid path itself (billing, telemetry) is still
+  unverified.
 - **Per-call usage** *(source)*: 0.65.0 has no telemetry flags; settings
   `telemetry.*` lose to the `GEMINI_TELEMETRY_*` env. With an outfile the
   file exporters write (append) each span, log record and metric batch as
@@ -889,9 +972,9 @@ and `usage.probe`.
 - **No planning calls, no probes**; `detect_rate_limit` is always None (a
   quota or credit error is a Failed Attempt).
 
-### Verification log (gemini-cli 0.65.0, 2026-10-22)
+### Verification log (gemini-cli 0.65.0)
 
-Done on the installed CLI, signed in with the AI Pro account:
+2026-10-22, on the installed CLI with scripted model responses:
 
 1. `gemini --version` is 0.65.0; every flag Nightshift passes is in
    `gemini --help`.
@@ -906,44 +989,62 @@ Done on the installed CLI, signed in with the AI Pro account:
    the CLI home or `agents_root/data`, no network; `bash` starts (fixed:
    `/bin` links); read-only dirs readable with `read_file`, not writable
    with `write_file`/`replace`; LinkedIn fetches and searches denied.
-5. Resume by id after SIGTERM/SIGKILL keeps the session; a resumed Attempt
-   reports only its own tokens; SIGTERM is ignored while a shell command
-   runs (SIGKILL after 15 s ends it).
-6. End to end through Nightshift (throwaway config dir and agents root):
-   `orch add ... --agent gemini --yes --simulate-rate-limit-after 2` made a
-   real planning call, the Task paused after its Steps, the next Attempt
-   resumed the same session with `--resume`, the Task finished `done` with
-   report.md, `usage_events` got one row per model per Attempt, a probe
-   recorded "available", and `orch usage` shows the Gemini `daily` Window
-   ("not reported +N w/o cost", no Baseline). `test_pause_and_resume_through_nightshift`
-   in `tests/test_gemini_cli.py` repeats it.
+5. Resume by id after a stop keeps the session; a resumed Attempt reports
+   only its own tokens.
+6. `orch add ... --agent gemini --yes --simulate-rate-limit-after 2` paused
+   and resumed the same session and finished `done` (scripted replies).
 
-### Still to verify (needs model access)
+2026-10-23, **real model calls** on a free-tier AI Studio key
+(`auth: gemini-api-key`), throwaway config dir and agents root, model
+`gemini-3.5-flash-lite`:
 
-The account can't make model calls (`IneligibleTierError`, see the top of
-this section), so these remain. `tests/test_gemini_real.py`
-(`NIGHTSHIFT_REAL_AGENT=1`) runs them once it can; today every test there
-fails at sign-in.
+7. **Sign-in**: the key signs in headless; Google sign-in still fails with
+   `IneligibleTierError`. Shell commands don't see `GEMINI_API_KEY`
+   (`echo $GEMINI_API_KEY` prints nothing; scripted check).
+8. **End to end**: `orch add "<write a few small files, then report.md>" --agent
+   gemini --yes --simulate-rate-limit-after 1` made a real planning call
+   (estimate 2 min, Task type proposed), the daemon (`orch daemon run`)
+   started Attempt 1, paused it after the first Step (`paused_usage`),
+   resumed **the same session** (`--resume`, same `session_id`) a minute
+   later, and the Task finished **`done` with report.md** (Result `done`,
+   section 8: gemini, 2 Attempts). Run twice: the first time showed the
+   SIGTERM problem above (the CLI worked on for 17 s, killed with -9); after
+   the process-group fix the pause stopped Attempt 1 within a second (exit
+   0) and Attempt 2 resumed and finished.
+9. **Usage**: `usage_events` got one row per model per finished Attempt
+   (e.g. 36,388 input / 1,979 output / 109,382 cache read), planning calls
+   and the probe went to `planning_usage`, and `orch usage` shows the Gemini
+   `daily` Window with the tokens ("not reported +N w/o cost": no
+   cost-equivalent, no Baseline). The paused Attempt (stopped before its
+   `result` line) recorded none.
+10. **Probe**: `usage.probe` on the key: "available" (3,602 input tokens).
+11. **Quota error**: the real API-key format (above), seen with a model
+    that has no free quota; matched by `detect_rate_limit` (`limit: 0` is a
+    failure, `limit: N` a hit with its reset time). A used-up quota was not
+    triggered on purpose.
+12. `tests/test_gemini_real.py` with a real model: the Task couldn't write
+    outside its folder or into the read-only dir with file tools, couldn't
+    read the data dir or a canary in `~`, `web_fetch` was "not found" on an
+    internet-off Task, a relative shell write into the read-only dir got
+    through (known gap); on an internet-on Task a denied domain was refused
+    by policy, another fetched, `curl` had no network; pause and resume kept
+    the session; a planning call and a probe worked.
+13. **Stall guard** on the real CLI (scripted): the sandbox-expansion hang
+    ended as a Failed Attempt within seconds; a 12 s silent command was not
+    a stall.
 
-1. **Model access**: Google says this client is no longer supported for
-   "Gemini Code Assist for individuals" and points to Antigravity. Either
-   the AI Pro entitlement has to reach the CLI, or Gemini needs another way
-   in (a Google Cloud project with Code Assist, or the paid `gemini-api`
-   path). Not something Nightshift can fix.
-2. A real model's stream and usage counts (the recording's numbers are
-   scripted).
-3. A real quota hit: save the stream, compare with "Rate limits" above,
-   check that a Limit observation is recorded and whether the model
-   fallback rotates the session.
-4. The paid path (`gemini-api`): that the key signs in headless, that the
-   telemetry file gets one `api_response` record per call with the counts
-   above, and that recorded costs match AI Studio's billing.
-5. A real Claude -> Gemini failover (`test_claude_to_gemini_failover`) and
+### Still to verify
+
+1. A **used-up** free-tier quota (`limit: N` > 0) through Nightshift: that a
+   Limit observation is recorded with the reset time, and whether the CLI's
+   model fallback rotates the session. Not triggered on purpose (it would
+   burn a day's quota); the format is expected to match the recorded one.
+2. The paid path (`gemini-api`): a billed key, the telemetry file's
+   `api_response` records, and costs against AI Studio's billing.
+3. A real Claude -> Gemini failover (`test_claude_to_gemini_failover`) and
    a real `posting-scan` on Gemini (`test_posting_scan_on_gemini`, needs
    `NIGHTSHIFT_SCAN_REPO`).
-6. **The hang** (see "Known 0.65.0 bug"): until the CLI answers its own
-   sandbox-expansion request headless, an Attempt whose agent runs a failing
-   command against a denied path or the network stalls until its runtime
-   cap. Options: a stall guard in the runner (no output while no shell
-   process runs), or a newer CLI; `test_a_denied_command_that_fails_hangs_the_cli`
-   tells when it's fixed.
+4. Google sign-in (`oauth-personal`), should Google let this client back in.
+5. **The hang itself** stays until the CLI answers its own sandbox-expansion
+   request headless; `test_a_denied_command_that_fails_hangs_the_cli` tells
+   when a CLI upgrade fixes it (then the guard just never fires).

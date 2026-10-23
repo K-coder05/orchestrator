@@ -207,7 +207,7 @@ def test_spend_caps_still_apply_an_urgent_task_waits_while_the_daily_cap_holds(c
 
 def test_no_api_key_means_the_task_waits(cfg, db, genv):
     clock = Clock()
-    cfg.secrets._env.pop("GEMINI_API_KEY")
+    cfg.secrets._env.pop("GEMINI_PAID_API_KEY")
     _gemini_out(cfg, db, clock)
     new = _new(cfg, db, priority="urgent")
     assert _queue(cfg, db, clock).run_next() is None

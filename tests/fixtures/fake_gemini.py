@@ -11,7 +11,13 @@ FAKE_GEMINI_LIMIT=1 (a quota hit at the start; once per Task folder with
 FAKE_GEMINI_LIMIT_ONCE), FAKE_GEMINI_LIMIT_TEXT, FAKE_GEMINI_EXIT=<n> (a
 failed run), FAKE_GEMINI_RESUME_FAIL, FAKE_GEMINI_STEP_DELAY, FAKE_GEMINI_PROBE
 ok|limit|error, FAKE_GEMINI_PLAN (JSON answer of a planning call),
-FAKE_GEMINI_RESULT (the result word in report.md). On the paid path (an
+FAKE_GEMINI_RESULT (the result word in report.md). The stall guard:
+FAKE_GEMINI_HANG=1 (after the shell command's tool_use, wait forever with
+no command running: 0.65.0's headless sandbox-expansion hang),
+FAKE_GEMINI_BUSY=<s> (that command runs <s> seconds as a child process,
+silently), FAKE_GEMINI_ORPHAN=<file> (that command is left running when
+the agent exits; its pid goes to <file>), FAKE_GEMINI_QUIET=<s> (<s> seconds of silence before the first
+Step, like the CLI's own model retries). On the paid path (an
 API key) every model call is also written to the telemetry file:
 FAKE_GEMINI_CALL_TOKENS (JSON usage of each call), FAKE_GEMINI_CALL_MODEL.
 FAKE_PROPOSED (shared with fake_claude.py): a posting-scan agent's
@@ -20,19 +26,18 @@ shared): a company-rescrape agent's output/career_pages.json.
 """
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 prompt = sys.stdin.read()
 argv = sys.argv[1:]
-# An API error in a turn reaches the result line as type "unknown" with the
-# CLI's 429 note under Google sign-in (seen on 0.65.0); the quota text itself
-# is from the source (classifyGoogleError).
-LIMIT_TEXT = ("[API Error: You have exhausted your capacity on this model. "
-              "Your quota will reset after 2h0m0s.]\nPossible quota limitations in place or "
-              "slow response times detected. Switching to the gemini-2.5-flash model for the "
-              "rest of this session.")
+# An API error in a turn reaches the result line as type "unknown" (seen on
+# 0.65.0). The text is a real free-tier quota error on an API key (recorded
+# 2026-10-23, tests/fixtures/gemini_api_key_quota.jsonl) with a quota of 20
+# instead of 0 and a retry time of 2h.
+LIMIT_TEXT = '[API Error: You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 20, model: gemini-3.1-pro\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.1-pro\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.1-pro\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 20, model: gemini-3.1-pro\nPlease retry in 2h0m0s.]\nPlease wait and try again later. To increase your limits, request a quota increase through AI Studio, or switch to another /auth method'
 SID = "5fffc92d-5b30-4090-b661-67f3032f772e"  # the recording's
 STATS = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cached": 0, "input": 0,
          "duration_ms": 0, "tool_calls": 0, "models": {}}
@@ -133,7 +138,19 @@ for line in lines[:-1]:  # the result line is written below
     msg = json.loads(line)
     if msg["type"] == "tool_use" or (msg["type"] == "message" and msg["role"] == "user"):
         api_call()  # the model call that asked for this tool / the first answer
+    if msg["type"] == "tool_use" and msg["tool_name"] == "read_file":
+        time.sleep(float(os.environ.get("FAKE_GEMINI_QUIET") or 0))
     emit(msg)
+    if msg["type"] == "tool_use" and msg["tool_name"] == "run_shell_command":
+        if os.environ.get("FAKE_GEMINI_HANG"):
+            time.sleep(3600)
+        if os.environ.get("FAKE_GEMINI_ORPHAN"):
+            # A process left running when the agent exits (written: its pid).
+            child = subprocess.Popen(["/bin/sleep", "60"], stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+            Path(os.environ["FAKE_GEMINI_ORPHAN"]).write_text(str(child.pid))
+        if os.environ.get("FAKE_GEMINI_BUSY"):
+            subprocess.run(["/bin/sleep", os.environ["FAKE_GEMINI_BUSY"]], check=True)
     if delay:
         time.sleep(delay)
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -28,7 +29,7 @@ from nightshift.runner import create_task, run_attempt
 from nightshift.states import TaskState
 from nightshift.timeutil import now
 
-from conftest import FIXTURES
+from conftest import FIXTURES, TEST_GEMINI_KEY as KEY
 from test_planning import planner  # noqa: F401  (pytest fixture)
 
 LA = ZoneInfo("America/Los_Angeles")
@@ -123,6 +124,7 @@ def test_warnings_and_non_json_lines_are_not_errors():
 def _adapter(tmp_path, settings=None) -> GeminiAdapter:
     a = GeminiAdapter(settings or {})
     a.home = tmp_path / "home"  # the user's Gemini config lives here in tests
+    a.api_key = KEY  # the runner loads it from .env or the Keychain
     return a
 
 
@@ -183,7 +185,7 @@ def test_settings_file_pins_tools_sandbox_and_switches_off_extras(cfg, tmp_path)
     assert s["security"]["toolSandboxing"] is True  # every shell command in Seatbelt
     # Off so headless runs start; the folder stays untrusted through the env.
     assert s["security"]["folderTrust"]["enabled"] is False
-    assert s["security"]["auth"]["selectedType"] == "oauth-personal"
+    assert s["security"]["auth"]["selectedType"] == "gemini-api-key"  # the default
     assert s["security"]["disableYoloMode"] is True
     assert s["tools"]["sandbox"] is False
     assert s["tools"]["sandboxNetworkAccess"] is False
@@ -281,7 +283,7 @@ def test_refuses_unsafe_commands(cfg, tmp_path):
 
 
 def test_cli_home_links_the_sign_in_and_ignores_your_settings(cfg, tmp_path):
-    a = _adapter(tmp_path)
+    a = _adapter(tmp_path, {"auth": "oauth-personal"})
     gem = a.home / ".gemini"
     gem.mkdir(parents=True)
     (gem / "oauth_creds.json").write_text("{}")
@@ -297,6 +299,46 @@ def test_cli_home_links_the_sign_in_and_ignores_your_settings(cfg, tmp_path):
     (home / "tmp").mkdir()
     _perms(cfg, tmp_path, adapter=a)
     assert (home / "tmp").is_dir() and (home / "oauth_creds.json").is_symlink()
+    s = json.loads((home / "settings.json").read_text())
+    assert s["security"]["auth"]["selectedType"] == "oauth-personal"
+    cmd = a.build_command(_task(ws), ws, _perms(cfg, tmp_path, adapter=a)[2])
+    assert cmd.env["GEMINI_API_KEY"] == "" and cmd.env["GOOGLE_API_KEY"] == ""
+    assert a.api_key_secret is None  # Google sign-in loads no key
+
+
+def test_api_key_sign_in_passes_only_nightshifts_key(cfg, tmp_path):
+    a = _adapter(tmp_path)
+    gem = a.home / ".gemini"
+    gem.mkdir(parents=True)
+    (gem / "oauth_creds.json").write_text("{}")
+    ws, _, perms = _perms(cfg, tmp_path, adapter=a)
+    home = Path(perms.sandbox["cli_home"]) / ".gemini"
+    assert not (home / "oauth_creds.json").exists()  # no Google sign-in in reach
+    assert a.api_key_secret == "GEMINI_API_KEY"
+    cmd = a.build_command(_task(ws), ws, perms)
+    assert cmd.env["GEMINI_API_KEY"] == KEY
+    assert cmd.env["GOOGLE_API_KEY"] == ""  # it would win over GEMINI_API_KEY
+    assert KEY not in " ".join(cmd.argv)
+    assert GeminiAdapter({"api_key_secret": "MY_KEY"}).api_key_secret == "MY_KEY"
+    # A link left from an earlier Google sign-in is removed.
+    (home / "oauth_creds.json").symlink_to(gem / "oauth_creds.json")
+    _perms(cfg, tmp_path, adapter=a)
+    assert not (home / "oauth_creds.json").is_symlink()
+
+
+def test_api_key_sign_in_refuses_to_start_without_the_key(cfg, tmp_path):
+    a = _adapter(tmp_path)
+    a.api_key = None
+    ws, _, perms = _perms(cfg, tmp_path, adapter=a)
+    with pytest.raises(ValueError, match="GEMINI_API_KEY in .env or the Keychain"):
+        a.build_command(_task(ws), ws, perms)
+    with pytest.raises(ValueError, match="GEMINI_API_KEY"):
+        a.probe_command()
+
+
+def test_unknown_auth_is_refused():
+    with pytest.raises(ValueError, match="auth must be one of"):
+        GeminiAdapter({"auth": "vertex-ai"})
 
 
 def test_refuses_user_config_that_would_widen_a_task(cfg, tmp_path):
@@ -391,6 +433,33 @@ def test_api_error_in_a_turn_is_a_limit_hit_by_its_text():
     assert _hits([_limit_result("unknown", "[API Error: No more mock responses]")]) == []
 
 
+#: A real free-tier quota error on an API key (gemini-cli 0.65.0, 2026-10-23):
+#: a model with no free-tier quota at all ("limit: 0").
+API_KEY_QUOTA = (FIXTURES / "gemini_api_key_quota.jsonl").read_text().splitlines()
+
+
+def _with_limit(n: int) -> list[str]:
+    """The recording with a free-tier quota of ``n`` (the shape of a used-up
+    daily quota; only the number differs)."""
+    return [line.replace("limit: 0", f"limit: {n}") for line in API_KEY_QUOTA]
+
+
+def test_api_key_quota_error_is_a_limit_hit_with_its_reset():
+    [hit] = _hits(_with_limit(20))
+    # "Please retry in 10h56m39.249192747s." from 01:00
+    assert hit.reset_at == "2026-10-22T11:56:39-07:00"
+    assert hit.limit_type is None  # the shortest Gemini Window (daily)
+
+
+def test_a_model_with_no_quota_on_the_key_is_not_a_limit_hit():
+    # "limit: 0": waiting can't help; the Attempt fails with the API's text.
+    assert _hits(API_KEY_QUOTA) == []
+    a = GeminiAdapter({})
+    for line in API_KEY_QUOTA:
+        a.parse_stream(line)
+    assert a.result_ok() is False and "limit: 0" in a.result_error()
+
+
 def test_terminal_quota_error_is_a_limit_hit():
     [hit] = _hits([_limit_result(
         "TerminalQuotaError", "[API Error: You have exhausted your daily quota on this model.]")])
@@ -427,8 +496,10 @@ def test_throttling_and_tool_output_are_not_limit_hits():
 
 
 def test_planning_command_is_toolless_with_the_schema_in_the_prompt():
-    cmd = GeminiAdapter({"model": "pro", "planning_model": "flash"}).planning_command(
-        "Summarize lecture 3", system="You plan.", schema={"type": "object"})
+    a = GeminiAdapter({"model": "pro", "planning_model": "flash"})
+    a.api_key = KEY
+    cmd = a.planning_command("Summarize lecture 3", system="You plan.", schema={"type": "object"})
+    assert cmd.env["GEMINI_API_KEY"] == KEY
     assert _flag_values(cmd.argv, "-m") == ["flash"]
     s = json.loads((Path(cmd.env["GEMINI_CLI_HOME"]) / ".gemini" / "settings.json").read_text())
     assert s["tools"]["core"] == []
@@ -613,3 +684,92 @@ def test_free_form_estimate_on_gemini(cfg, genv):
     cfg.data["planning"]["agent"] = "gemini"
     prop = planning.estimate(cfg, "Summarize lecture 3", adapter_provider=provider)
     assert prop.estimated_minutes == 10 and prop.task_type == "research"
+
+
+# --------------------------------------------------------------------------
+# The stall guard (gemini-cli 0.65.0's headless sandbox-expansion hang)
+# --------------------------------------------------------------------------
+
+
+def _stall_task(cfg, db, minutes):
+    cfg.data["agents"]["gemini"]["stall_minutes"] = minutes
+    return create_task(cfg, db, "Summarize lecture 3", agent="gemini", task_type="summary")
+
+
+def test_stall_guard_stops_a_hung_step_as_a_failed_attempt(cfg, db, genv):
+    genv.setenv("FAKE_GEMINI_HANG", "1")
+    new = _stall_task(cfg, db, 0.02)  # 1.2 s
+    start = time.monotonic()
+    res = run_attempt(cfg, db, new.spec.id, adapter_provider=provider)
+    assert time.monotonic() - start < 15  # not the runtime cap
+    assert res.state == TaskState.RETRY_WAIT  # a Failed Attempt: charged to the retry budget
+    [a] = db.attempts(new.spec.id)
+    assert a["outcome"] == "failed" and a["session_id"] == SID
+    assert "stalled" in a["end_reason"] and "1.2 min" not in a["end_reason"]
+    assert "no output for 0.02 min (stall guard)" in a["end_reason"]
+    assert db.get_task(new.spec.id)["retries_used"] == 1
+    assert "stalled" in (new.folder / "logs" / "nightshift.log").read_text()
+
+
+def test_stall_guard_lets_a_long_silent_command_run(cfg, db, genv):
+    genv.setenv("FAKE_GEMINI_BUSY", "3")  # a command under the agent, silent for 3 s
+    # A model call's latency between the first line and the first Step, as on
+    # the real CLI: the agent's own processes are taken at its first line.
+    genv.setenv("FAKE_GEMINI_QUIET", "0.5")
+    new = _stall_task(cfg, db, 0.02)
+    res = run_attempt(cfg, db, new.spec.id, adapter_provider=provider)
+    assert res.state == TaskState.DONE, db.attempts(new.spec.id)[-1]["end_reason"]
+
+
+def test_stall_guard_ignores_silence_with_no_step_in_flight(cfg, db, genv):
+    genv.setenv("FAKE_GEMINI_QUIET", "3")  # the CLI retrying the model, no Step yet
+    new = _stall_task(cfg, db, 0.02)
+    res = run_attempt(cfg, db, new.spec.id, adapter_provider=provider)
+    assert res.state == TaskState.DONE
+
+
+def test_stall_guard_off_leaves_the_runtime_cap(cfg, db, genv):
+    genv.setenv("FAKE_GEMINI_HANG", "1")
+    new = _stall_task(cfg, db, None)
+    res = run_attempt(cfg, db, new.spec.id, adapter_provider=provider, max_runtime_seconds=2.5)
+    assert res.state == TaskState.RETRY_WAIT
+    [a] = db.attempts(new.spec.id)
+    assert "runtime cap" in a["end_reason"]
+
+
+def test_nothing_of_the_agent_outlives_its_attempt(cfg, db, genv, tmp_path):
+    # The agent runs in its own process group, which ends with the Attempt
+    # (gemini's relaunched child kept working after its parent was killed).
+    pidfile = tmp_path / "orphan.pid"
+    genv.setenv("FAKE_GEMINI_ORPHAN", str(pidfile))
+    new = create_task(cfg, db, "Summarize lecture 3", agent="gemini", task_type="summary")
+    assert run_attempt(cfg, db, new.spec.id, adapter_provider=provider).state == TaskState.DONE
+    pid = int(pidfile.read_text())
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, 9)
+        raise AssertionError("the agent's child outlived the Attempt")
+
+
+def test_stall_guard_is_on_by_default_for_gemini_only(cfg):
+    from nightshift.adapters import get_adapter
+    assert GeminiAdapter(cfg.agent("gemini")).stall_seconds == 300
+    assert get_adapter("claude", cfg.agent("claude")).stall_seconds is None
+    assert get_adapter("codex", cfg.agent("codex")).stall_seconds is None
+
+
+@pytest.mark.parametrize("gemini", [{"auth": "vertex-ai"}, {"stall_minutes": "5m"},
+                                    {"stall_minutes": 0}])
+def test_bad_gemini_config_is_rejected(tmp_path, gemini):
+    import yaml
+    from nightshift.config import ConfigError, load_config
+    d = tmp_path / "c"
+    d.mkdir()
+    (d / "config.yaml").write_text(yaml.safe_dump({"agents": {"gemini": gemini}}))
+    with pytest.raises(ConfigError, match="agents.gemini"):
+        load_config(d, host=FakeHost())

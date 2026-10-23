@@ -518,6 +518,14 @@ def _validate(data: dict[str, Any]) -> None:
     balance = gemini_plan.get("api_credit_balance_usd", 0)
     if isinstance(balance, bool) or not isinstance(balance, (int, float)) or balance < 0:
         raise ConfigError("plans.gemini.api_credit_balance_usd must be a number >= 0")
+    gemini_agent = (data.get("agents") or {}).get("gemini") or {}
+    if gemini_agent.get("auth", "gemini-api-key") not in ("gemini-api-key", "oauth-personal"):
+        raise ConfigError("agents.gemini.auth must be gemini-api-key or oauth-personal")
+    stall = gemini_agent.get("stall_minutes")
+    if stall is not None and (isinstance(stall, bool) or not isinstance(stall, (int, float))
+                              or stall <= 0):
+        raise ConfigError("agents.gemini.stall_minutes must be a positive number of minutes "
+                          "(or null: no stall guard)")
     if planning.get("agent") == "gemini-api":
         raise ConfigError("planning.agent may not be gemini-api: planning calls never spend")
     poll = (data.get("daemon") or {}).get("poll_seconds", 5)

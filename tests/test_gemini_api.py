@@ -27,7 +27,8 @@ from nightshift.states import TaskState
 
 from test_gemini import FAKE_GEMINI, _gemini_runs, fake_gemini, genv  # noqa: F401  (fixture)
 
-KEY = "AIzaFAKE-studio-key-0123456789"
+KEY = "AIzaFAKE-studio-key-0123456789"  # the billed project's key
+FREE_KEY = "AIzaFAKE-free-tier-key-987654"  # agents.gemini's free-tier key
 #: Simple prices so costs are easy to work out by hand (USD per million tokens).
 PRICES = {"gemini-3.1-pro": {"input": 1.0, "cached_input": 0.1, "output": 10.0}}
 
@@ -57,7 +58,7 @@ def config_dir(tmp_path: Path) -> Path:
         "spend": {"per_task_usd": 2, "gemini_api_prices": PRICES},
     }))
     env = d / ".env"
-    env.write_text(f"GEMINI_API_KEY={KEY}\n")
+    env.write_text(f"GEMINI_PAID_API_KEY={KEY}\nGEMINI_API_KEY={FREE_KEY}\n")
     env.chmod(0o600)
     return d
 
@@ -193,15 +194,14 @@ def test_subscription_path_runs_while_a_cap_holds(cfg, db, genv):
                        clock=lambda: NOON).state == TaskState.DONE
 
 
-def test_subscription_path_never_spends_or_sees_the_key(cfg, db, genv):
+def test_free_path_never_spends_or_sees_the_paid_key(cfg, db, genv):
     new = _task(cfg, db, agent="gemini")
     assert run_attempt(cfg, db, new.spec.id, adapter_provider=provider).state == TaskState.DONE
     assert db.spend_events() == []
     [run] = _gemini_runs(new.folder)
-    assert run["env"]["GEMINI_API_KEY"] == ""  # an empty key is no key to the CLI
+    assert run["env"]["GEMINI_API_KEY"] == FREE_KEY  # its own free-tier key, never the paid one
+    assert KEY not in json.dumps(run)
     assert "GEMINI_TELEMETRY_OUTFILE" not in run["env"]
-    settings = json.loads((Path(run["env"]["GEMINI_CLI_HOME"]) / ".gemini" / "settings.json").read_text())
-    assert settings["security"]["auth"]["selectedType"] == "oauth-personal"
 
 
 # --------------------------------------------------------------------------
@@ -232,7 +232,7 @@ def test_api_path_without_the_key_does_not_start(tmp_path, genv):
     cfg = load_config(cdir, host=FakeHost())
     db = Database(cfg.db_path, tz=cfg.timezone)
     new = _task(cfg, db)
-    with pytest.raises(ConfigError, match="GEMINI_API_KEY"):
+    with pytest.raises(ConfigError, match="GEMINI_PAID_API_KEY"):
         run_attempt(cfg, db, new.spec.id, adapter_provider=provider)
     assert db.attempts(new.spec.id) == []
     db.close()

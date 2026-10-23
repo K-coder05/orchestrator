@@ -109,8 +109,19 @@ At 8am Los Angeles time (`telegram.digest_time`) one digest sums up everything
 since the previous one, usage pauses included, and what is still waiting; if
 the laptop was asleep at 8am it is sent once on wake.
 
+`--agent gemini` runs a Task on the Gemini CLI signed in with an AI Studio
+API key (`agents.gemini.auth: gemini-api-key`): put the key in
+`~/.config/nightshift/.env` (mode 0600) or the Keychain as `GEMINI_API_KEY`;
+a key exported in your shell profile doesn't reach the daemon. The key's
+free-tier quota is Gemini's usage Window, so a quota error pauses the Task
+like any usage limit. An Attempt that stops producing output while a Step
+is in flight and no command runs is ended after `agents.gemini.stall_minutes`
+(5) as a Failed Attempt: gemini-cli 0.65.0 can hang after the sandbox
+blocks a command.
+
 `--agent gemini-api` runs a Task on paid AI Studio credits (the Gemini CLI
-with the API key from `.env` or the Keychain as `GEMINI_API_KEY`). Every model
+with a billed project's API key from `.env` or the Keychain as
+`GEMINI_PAID_API_KEY`). Every model
 call is priced (`spend.gemini_api_prices`) and recorded; a Task that reaches
 $2 (`spend.per_task_usd`) is stopped and moved to `needs_you`. `orch usage`
 shows the spend so far and the credit left (`plans.gemini.api_credit_*`).
