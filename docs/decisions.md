@@ -1300,6 +1300,37 @@ lasting consequences go in `docs/adr/` instead.
   takeover note, saw Claude's `progress.md`, and the Task ended `done` with
   both agents in the report. About 10s. The test's last check (all three
   part files) needs the real Gemini: docs/adapters.md item 8.
+- **A paused `resume` Task fails over once its deadline comes near.** A
+  `when: deadline` Task that paused because its deadline was still far
+  used to wait for Claude's reset even after the deadline came within 24
+  hours (a weekly-cap reset can be days away), which contradicts §2.8's
+  "wait for reset, unless the deadline is within 24 hours". Now
+  `pauses.promote_due` asks `failover.deadline_failover` on every pass for
+  Tasks paused on a usage limit (real or simulated, never by hand) whose
+  resume time hasn't come: once the deadline is within
+  `queue.deadline_urgent_hours` and another agent of the type isn't out,
+  the Task is requeued there with a fresh session (new Failover trigger
+  `deadline`, deadline-driven, so flagged in Needs you). If every agent is
+  out it keeps waiting for the first reset as before. Test:
+  `test_paused_resume_fails_over_once_the_deadline_comes_near`.
+- **Real Claude -> Gemini failover on both real CLIs (2026-10-23).**
+  Throwaway config dir and agents root in the scratchpad (`claude.model:
+  haiku`, `gemini.model: gemini-3.5-flash-lite`, `auth: gemini-api-key`
+  with the key in that dir's `.env`, `max_retries: 0`), real signed-in
+  Claude Code 2.1.309 and gemini-cli 0.65.0. `orch add "<study notes in
+  three parts, each written to output/ and recorded in progress.md>"
+  --type research --internet off --priority urgent --yes
+  --simulate-rate-limit-after 5`, then `orch daemon run --exit-when-idle`.
+  Task `jvhq`: Attempt 1 claude (Read, Read, Write `part1.md`, Edit
+  `progress.md`, Write `part2.md`) `paused` after 5 Steps (exit 143,
+  "progress.md was updated during this Attempt"); `running -> queued` on
+  gemini, Failovers `claude -> gemini (simulated)`; Attempt 2 gemini with
+  no `--resume`, its prompt carrying the takeover note, read `plan.md` and
+  `progress.md`, kept Claude's two files, wrote only `part3.md`, updated
+  `progress.md` and `report.md`, exit 0, Task `done` (Needs you: none, not
+  deadline-driven). Report section 8: claude 10s, gemini 23s (39k input,
+  2.7k output tokens). 33s in all, one planning call plus two Attempts, no
+  dollars (subscription and the key's free tier); no processes left.
 
 ## Phase 2, issue #20: Gemini API path, spend and the $2 per-Task cap
 

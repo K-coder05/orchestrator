@@ -1033,6 +1033,19 @@ demand" (`planning.timeout_seconds` is 180): pin `agents.gemini.model` /
     ended as a Failed Attempt within seconds; a 12 s silent command was not
     a stall.
 
+2026-10-23, **real Claude -> Gemini failover** (issue #19), real Claude Code
+2.1.309 (haiku) and gemini-cli 0.65.0 (`gemini-3.5-flash-lite`, API key),
+throwaway config and agents root:
+
+14. `orch add "<three small parts>" --type research --priority urgent --yes
+    --simulate-rate-limit-after 5` and `orch daemon run --exit-when-idle`:
+    Claude did Part 1 (and recorded it in `progress.md`) and wrote Part 2,
+    was stopped after 5 Steps; the Task moved to gemini (`simulated`), the
+    Gemini Attempt started a fresh session (no `--resume`) with the
+    takeover note, read `plan.md` + `progress.md`, wrote only Part 3 and
+    finished `done` with both agents in report section 8. Details in
+    docs/decisions.md (issue #19).
+
 ### Still to verify
 
 1. A **used-up** free-tier quota (`limit: N` > 0) through Nightshift: that a
@@ -1041,9 +1054,10 @@ demand" (`planning.timeout_seconds` is 180): pin `agents.gemini.model` /
    burn a day's quota); the format is expected to match the recorded one.
 2. The paid path (`gemini-api`): a billed key, the telemetry file's
    `api_response` records, and costs against AI Studio's billing.
-3. A real Claude -> Gemini failover (`test_claude_to_gemini_failover`) and
-   a real `posting-scan` on Gemini (`test_posting_scan_on_gemini`, needs
-   `NIGHTSHIFT_SCAN_REPO`).
+3. A real `posting-scan` on Gemini (`test_posting_scan_on_gemini`, needs
+   `NIGHTSHIFT_SCAN_REPO`). (The real Claude -> Gemini failover is item 14
+   above; it was run through `orch`, the same steps as
+   `test_claude_to_gemini_failover`.)
 4. Google sign-in (`oauth-personal`), should Google let this client back in.
 5. **The hang itself** stays until the CLI answers its own sandbox-expansion
    request headless; `test_a_denied_command_that_fails_hangs_the_cli` tells

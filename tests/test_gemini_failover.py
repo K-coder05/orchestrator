@@ -125,6 +125,30 @@ def test_resume_without_a_near_deadline_waits_for_claude(cfg, db, fake_clis, dea
     assert not db.failovers(tid)
 
 
+def test_paused_resume_fails_over_once_the_deadline_comes_near(cfg, db, fake_clis):
+    """Waiting for Claude's reset is right while the deadline is far; once it
+    comes within 24 hours the Task moves to Gemini instead of waiting on."""
+    clock = Clock()
+    fake_clis.setenv("FAKE_LIMIT_AT", "4")
+    fake_clis.setenv("FAKE_RESETS_AT", str(int((clock() + timedelta(hours=60)).timestamp())))
+    new = _new(cfg, db, "resume", "Tailor", deadline=iso(clock() + timedelta(hours=30)))
+    tid = new.spec.id
+    qr = _queue(cfg, db, clock)
+    assert qr.run_next() == tid
+    row = db.get_task(tid)
+    assert row["state"] == "paused_usage" and row["agent"] == "claude"
+    clock.advance(minutes=5 * 60)  # deadline 25h away: still waits
+    assert qr.run_next() is None and db.task_state(tid) == TaskState.PAUSED_USAGE
+    clock.advance(minutes=2 * 60)  # 23h away: fails over
+    assert qr.run_next() == tid and db.task_state(tid) == TaskState.DONE
+    [f] = db.failovers(tid)
+    assert (f["from_agent"], f["to_agent"], f["trigger"], f["deadline_driven"]) == (
+        "claude", "gemini", "deadline", 1)
+    [run] = _gemini_runs(new.folder)
+    assert "--resume" not in run["argv"] and "progress.md" in run["stdin"]
+    assert "claude to gemini" in _needs_you(new.folder)
+
+
 def test_comedy_always_waits_for_claude(cfg, db, fake_clis):
     clock = Clock()
     fake_clis.setenv("FAKE_LIMIT_AT", "4")

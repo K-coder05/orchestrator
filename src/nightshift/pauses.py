@@ -198,6 +198,14 @@ def promote_due(cfg: Config, db: Database, now: datetime,
                 _sync_yaml_unapproved(Path(row["folder"]))
                 _log(cfg, row, now, reason)
                 out.reapproval.append(tid)
+            elif not (row["resume_at"] and parse_iso(row["resume_at"]) <= now) and (
+                    near := _deadline_failover(cfg, db, row, now)) is not None:
+                # Waiting for a reset, but the deadline came near (§2.8).
+                from . import failover  # failover imports this module
+
+                failover.move_paused_for_deadline(cfg, db, row, near[0], near[1], now,
+                                                  dict(_CLEAR_PAUSE))
+                out.resumed.append(tid)
             elif row["resume_at"] and parse_iso(row["resume_at"]) <= now:
                 from . import failover  # failover imports this module
 
@@ -237,6 +245,13 @@ def promote_due(cfg: Config, db: Database, now: datetime,
         except StateChanged:
             continue  # resumed, cancelled or paused by hand meanwhile
     return out
+
+
+def _deadline_failover(cfg: Config, db: Database, row: Mapping[str, Any],
+                       now: datetime) -> Any:
+    from . import failover  # failover imports this module
+
+    return failover.deadline_failover(cfg, db, row, now)
 
 
 def _still_out(cfg: Config, db: Database, row: Mapping[str, Any], limit: RateLimit,

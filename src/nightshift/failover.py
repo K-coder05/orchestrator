@@ -18,7 +18,10 @@ the mechanism is per Task type and names no agent itself.
   another agent on the list (:func:`retry_agent`); the first never does.
 - **Deadline-driven.** A type with ``when: deadline`` fails over only while
   the Task's deadline is within ``queue.deadline_urgent_hours``; every such
-  failover is flagged in the report's Needs you list.
+  failover is flagged in the report's Needs you list. A Task of such a type
+  that paused to wait for its agent's reset fails over as soon as its
+  deadline comes that near (:func:`deadline_failover`), instead of waiting
+  on.
 
 A Task created with ``--agent`` (``agent_override``) never moves. Every
 switch is a row in ``failovers`` and a line in ``logs/nightshift.log``.
@@ -46,6 +49,7 @@ TRIGGER_LIMIT = "usage_limit"
 TRIGGER_SIMULATED = "simulated"
 TRIGGER_RESET = "reset"
 TRIGGER_RETRY = "retry"
+TRIGGER_DEADLINE = "deadline"  # a paused Task's deadline came near (``when: deadline``)
 
 #: The prompt note of an Attempt that starts on another agent.
 FAILOVER_NOTE = """
@@ -184,6 +188,32 @@ def resume_on(cfg: Config, db: Database, row: Mapping[str, Any], to_agent: str, 
            deadline_driven=r.deadline_driven, at=now, run_id=None, set_fields=set_fields,
            expect=TaskState.PAUSED_USAGE,
            reason=f"usage pause over: {to_agent} has reset while {row['agent']} is still out; "
+                   f"{_why(row, to_agent, r)}: fresh session on {to_agent} from plan.md + "
+                   "progress.md")
+
+
+def deadline_failover(cfg: Config, db: Database, row: Mapping[str, Any],
+                      now: datetime) -> tuple[str, Rule] | None:
+    """For a Task paused on a usage limit that is still waiting for its
+    agent's reset: another agent to move to now, because its type fails over
+    only near the deadline (``when: deadline``) and the deadline has come
+    within ``queue.deadline_urgent_hours`` while it waited (§2.8)."""
+    if row["pause_kind"] not in (pauses.KIND_LIMIT, pauses.KIND_SIMULATED):
+        return None
+    r = rule(cfg, row, now)
+    if r is None or not r.deadline_driven:
+        return None
+    free = available(cfg, db, r.agents, now, exclude=row["agent"])
+    return (free[0], r) if free else None
+
+
+def move_paused_for_deadline(cfg: Config, db: Database, row: Mapping[str, Any], to_agent: str,
+                             r: Rule, now: datetime, set_fields: dict[str, Any]) -> None:
+    """Requeue a paused Task on ``to_agent`` because its deadline is now near."""
+    switch(cfg, db, row, to_agent, to_state=TaskState.QUEUED, trigger=TRIGGER_DEADLINE,
+           deadline_driven=True, at=now, run_id=None, set_fields=set_fields,
+           expect=TaskState.PAUSED_USAGE,
+           reason=f"the deadline came near while waiting for {row['agent']}'s reset; "
                    f"{_why(row, to_agent, r)}: fresh session on {to_agent} from plan.md + "
                    "progress.md")
 
