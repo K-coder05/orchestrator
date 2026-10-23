@@ -1,10 +1,10 @@
 """Gemini CLI adapter (``gemini`` headless, Google AI Pro sign-in), Phase 2.
 
-Written from the gemini-cli 0.65.0 source (the npm bundle) on 2026-10-22:
-the flags, the ``--output-format stream-json`` events, resume by session
-UUID, the settings layers and merge rules, the policy engine and the
-per-command shell sandbox, and the quota errors. Not yet run against a
-signed-in CLI on this Mac; docs/adapters.md says what was checked how.
+Written from the gemini-cli 0.65.0 source (the npm bundle) on 2026-10-22,
+then checked against the installed 0.65.0: the real CLI ran Nightshift's
+commands with scripted model responses (``--fake-responses``), because the
+signed-in account gets no model access ("IneligibleTierError"). What was
+seen how, and what is still unverified, is in docs/adapters.md.
 
 Shape of an Attempt::
 
@@ -12,7 +12,8 @@ Shape of an Attempt::
       --admin-policy <settings_dir>/gemini-policy.toml -e none \
       --allowed-mcp-server-names nightshift-none \
       [--include-directories <read-only dir> ...] [-m <model>]
-    # env GEMINI_CLI_SYSTEM_SETTINGS_PATH=<settings_dir>/gemini-settings.json,
+    # env GEMINI_CLI_HOME=<settings_dir>/gemini-home (its .gemini/settings.json
+    #     is Nightshift's; your sign-in files are linked in),
     #     GEMINI_CLI_TRUST_WORKSPACE=false, GEMINI_SANDBOX=false, TMPDIR, PATH
     # stdin: the agent protocol, then the prompt; cwd = Task folder
 
@@ -124,33 +125,32 @@ def safe_path(path: str, private_roots: list[Path], tool_dirs: list[Path]) -> st
     return ":".join(out)
 
 
-def _strip_json_comments(text: str) -> str:
-    """Gemini settings files allow // and /* */ comments (outside strings)."""
-    out, i, n, in_str = [], 0, len(text), False
-    while i < n:
-        c = text[i]
-        if in_str:
-            out.append(c)
-            if c == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 1
-            elif c == '"':
-                in_str = False
-        elif c == '"':
-            in_str = True
-            out.append(c)
-        elif text.startswith("//", i):
-            while i < n and text[i] != "\n":
-                i += 1
+def link_system_bins(path: str, private_roots: list[Path], dest: Path) -> bool:
+    """Links to the programs of ``PATH`` entries that ``safe_path`` drops
+    although they hold no private data: ``/bin`` and ``/sbin``, whose
+    readable folder would be ``/``. Without them the shell sandbox can't
+    even start ``bash``; through links in ``dest`` it reads only ``dest``
+    (the programs themselves are readable in Gemini's base profile).
+    Returns whether ``dest`` should go on ``PATH``."""
+    def inside(p: Path, root: Path) -> bool:
+        return p == root or root in p.parents
+
+    found = False
+    for entry in path.split(":"):
+        if not entry.startswith("/"):
             continue
-        elif text.startswith("/*", i):
-            end = text.find("*/", i + 2)
-            i = n if end == -1 else end + 2
+        real = Path(os.path.realpath(entry))
+        readable = real.parent if real.name == "bin" else real
+        if not (real.is_dir() and any(inside(r, readable) for r in private_roots)
+                and not any(inside(real, r) for r in private_roots)):
             continue
-        else:
-            out.append(c)
-        i += 1
-    return "".join(out)
+        dest.mkdir(parents=True, exist_ok=True)
+        found = True
+        for prog in real.iterdir():
+            link = dest / prog.name
+            if not link.is_symlink() and not link.exists() and os.access(prog, os.X_OK):
+                link.symlink_to(prog)
+    return found
 
 
 class GeminiAdapter(AgentAdapter):
@@ -182,12 +182,16 @@ class GeminiAdapter(AgentAdapter):
                 "--allowed-mcp-server-names", NO_MCP]
         return argv + (["-m", model] if model else [])
 
-    def _env(self, settings_file: Path, tmpdir: Path | None, tool_dirs: list[Path],
+    def _env(self, cli_home: Path, tmpdir: Path | None, tool_dirs: list[Path],
              private_roots: list[Path]) -> dict[str, str]:
         env = {
-            # Top settings layer (beats user and workspace settings).
-            "GEMINI_CLI_SYSTEM_SETTINGS_PATH": str(settings_file),
-            # The folder is never trusted: its .gemini/settings.json never loads.
+            # The CLI's home: its user settings layer is Nightshift's file,
+            # your ~/.gemini settings, policies, extensions and sessions are
+            # not read (a system settings file would be skipped unless every
+            # folder above it is owned by root, seen on 0.65.0).
+            "GEMINI_CLI_HOME": str(cli_home),
+            # The folder is never trusted: its .gemini/settings.json never loads
+            # (headless runs anyway: security.folderTrust.enabled is false).
             "GEMINI_CLI_TRUST_WORKSPACE": "false",
             # No whole-CLI container/Seatbelt relaunch; shell commands are
             # sandboxed one by one (security.toolSandboxing).
@@ -200,6 +204,9 @@ class GeminiAdapter(AgentAdapter):
         }
         if tmpdir is not None:
             env["TMPDIR"] = str(tmpdir)
+        sysbin = cli_home / "sysbin"
+        if link_system_bins(os.environ.get("PATH", ""), private_roots, sysbin):
+            env["PATH"] = ":".join(p for p in (env["PATH"], str(sysbin)) if p)
         return env
 
     def _task_command(self, permissions: Permissions, extra: list[str], stdin: str) -> Command:
@@ -212,7 +219,7 @@ class GeminiAdapter(AgentAdapter):
         argv = self._base_argv(self.model, Path(sb["policy_file"]))
         for d in permissions.read_only_dirs:
             argv += ["--include-directories", str(d)]
-        env = self._env(permissions.settings_file, Path(sb["tmpdir"]),
+        env = self._env(Path(sb["cli_home"]), Path(sb["tmpdir"]),
                         [Path(p) for p in sb.get("tool_dirs") or []],
                         [Path(p) for p in sb.get("private_roots") or []])
         return Command(argv=argv + extra + self.extra_args, stdin=stdin, env=env)
@@ -249,7 +256,9 @@ class GeminiAdapter(AgentAdapter):
             "security": {
                 "auth": {"selectedType": self.auth_type},
                 "toolSandboxing": True,
-                "folderTrust": {"enabled": True},
+                # Off, so a headless run in the (untrusted) Task folder starts;
+                # GEMINI_CLI_TRUST_WORKSPACE=false still marks it untrusted.
+                "folderTrust": {"enabled": False},
                 "disableYoloMode": True,
                 "disableAlwaysAllow": True,
                 "enablePermanentToolApproval": False,
@@ -279,28 +288,31 @@ class GeminiAdapter(AgentAdapter):
         }
 
     def _user_config_problems(self) -> list[str]:
-        """User settings Nightshift can't override from the system layer:
-        ``context.includeDirectories`` (concatenated, so it would add
-        readable *and writable* folders) and ``~/.gemini/policies/sandbox.toml``
-        (persistent shell-sandbox grants and mode network settings)."""
-        problems = []
-        # As in the CLI: settings follow GEMINI_CLI_HOME, sandbox.toml is
-        # always under the real home (SandboxPolicyManager uses os.homedir()).
-        gem_home = Path(os.environ.get("GEMINI_CLI_HOME") or self.home) / ".gemini"
-        settings = gem_home / "settings.json"
-        if settings.exists():
-            try:
-                data = json.loads(_strip_json_comments(settings.read_text()))
-            except (OSError, ValueError) as e:
-                problems.append(f"{settings} can't be read ({e})")
-            else:
-                ctx = data.get("context") if isinstance(data, dict) else None
-                if isinstance(ctx, dict) and ctx.get("includeDirectories"):
-                    problems.append(f"{settings} sets context.includeDirectories")
+        """User config Nightshift can't switch off: ``~/.gemini/policies/sandbox.toml``
+        (persistent shell-sandbox grants and mode network settings). It is
+        read from the real home even under GEMINI_CLI_HOME
+        (SandboxPolicyManager uses os.homedir())."""
         sandbox_toml = self.home / ".gemini" / "policies" / "sandbox.toml"
-        if sandbox_toml.exists():
-            problems.append(f"{sandbox_toml} exists")
-        return problems
+        return [f"{sandbox_toml} exists"] if sandbox_toml.exists() else []
+
+    #: Sign-in files linked from your ~/.gemini into each CLI home.
+    SIGN_IN_FILES = ("oauth_creds.json", "google_accounts.json")
+
+    def _cli_home(self, home: Path, tools: list[str]) -> Path:
+        """A GEMINI_CLI_HOME: ``.gemini/settings.json`` (Nightshift's
+        settings as the user layer) and links to your sign-in files. Kept
+        between Attempts (the Task's sessions live in ``.gemini/tmp``);
+        the settings are rewritten each time. Returns the settings file."""
+        gem = home / ".gemini"
+        gem.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for name in self.SIGN_IN_FILES:
+            src, link = self.home / ".gemini" / name, gem / name
+            if src.exists() and not link.exists():
+                link.unlink(missing_ok=True)  # a dangling link
+                link.symlink_to(src)
+        settings_file = gem / "settings.json"
+        settings_file.write_text(json.dumps(self._settings(tools), indent=2) + "\n")
+        return settings_file
 
     def write_permissions(self, workspace: Path, policy: PermissionPolicy) -> Permissions:
         """Gemini settings for one Task: a system-layer settings file (tool
@@ -321,7 +333,9 @@ class GeminiAdapter(AgentAdapter):
         rules: list[dict[str, Any]] = [
             {"toolName": "*", "decision": "deny", "priority": 0,
              "denyMessage": "Not available in Nightshift Tasks."},
-            {"toolName": tools, "decision": "allow", "priority": 500},
+            # allowRedirection: else `>`/`2>&1` turn the allow into "ask",
+            # i.e. deny headless (seen on 0.65.0). Writes stay sandboxed.
+            {"toolName": tools, "decision": "allow", "priority": 500, "allowRedirection": True},
             # A relative path climbing out of the Task folder could land in a
             # read-only folder (it is in the workspace): no `..` in write paths.
             {"toolName": sorted(WRITE_TOOLS), "decision": "deny", "priority": 900,
@@ -338,8 +352,11 @@ class GeminiAdapter(AgentAdapter):
             rules.append({"toolName": sorted(WRITE_TOOLS), "decision": "deny", "priority": 900,
                           "argsPattern": f'"file_path":"{alt}(?:/|")',
                           "denyMessage": f"{d} is read-only or off limits."})
+            # `.*`, not "any char but an unescaped quote": the CLI drops rules
+            # with a group followed by a quantifier (its ReDoS check, seen on
+            # 0.65.0). It may also match the description; that only denies more.
             rules.append({"toolName": "run_shell_command", "decision": "deny", "priority": 900,
-                          "commandRegex": r'(?:[^"\\]|\\.)*' + alt,
+                          "commandRegex": ".*" + alt,
                           "denyMessage": f"Shell commands may not touch {d}; use read_file."})
         if policy.internet and policy.denied_domains:
             alt = "|".join(_anycase(dom) for dom in policy.denied_domains)
@@ -349,9 +366,8 @@ class GeminiAdapter(AgentAdapter):
         tmpdir = policy.workspace / ".tmp"
         tmpdir.mkdir(parents=True, exist_ok=True)
         policy.settings_dir.mkdir(parents=True, exist_ok=True)
-        settings_file = policy.settings_dir / "gemini-settings.json"
-        settings_file.write_text(json.dumps(self._settings(tools),
-                                            indent=2) + "\n")
+        cli_home = policy.settings_dir / "gemini-home"
+        settings_file = self._cli_home(cli_home, tools)
         policy_file = policy.settings_dir / "gemini-policy.toml"
         policy_file.write_text(policy_document(rules))
         return Permissions(
@@ -361,6 +377,7 @@ class GeminiAdapter(AgentAdapter):
                   if r["decision"] == "deny"],
             read_only_dirs=read_only,
             sandbox={"policy_file": str(policy_file), "tmpdir": str(tmpdir),
+                     "cli_home": str(cli_home),
                      "tool_dirs": [str(p) for p in policy.tool_dirs],
                      "private_roots": [str(p) for p in policy.private_roots]},
             settings_file=settings_file,
@@ -374,14 +391,18 @@ class GeminiAdapter(AgentAdapter):
         rewritten each call (their content never changes)."""
         d = Path(tempfile.gettempdir()) / f"nightshift-gemini-{os.getuid()}"
         d.mkdir(mode=0o700, exist_ok=True)
-        settings_file = d / "toolless-settings.json"
-        settings_file.write_text(json.dumps(self._settings([]), indent=2) + "\n")
+        self._cli_home(d / "home", [])
         policy_file = d / "toolless-policy.toml"
         policy_file.write_text(policy_document([
             {"toolName": "*", "decision": "deny", "priority": 0,
              "denyMessage": "No tools in planning calls and probes."}]))
         argv = self._base_argv(model, policy_file)
-        return Command(argv=argv, stdin=stdin, env=self._env(settings_file, None, [], [self.home]))
+        env = self._env(d / "home", None, [], [])
+        # No tools means no shell, so PATH needs no filtering; filtering it
+        # (as for a Task, without tool_dirs) would drop an nvm-installed
+        # `gemini` and its `node` (seen on the real CLI).
+        env["PATH"] = os.environ.get("PATH", "")
+        return Command(argv=argv, stdin=stdin, env=env)
 
     def planning_command(self, prompt: str, *, system: str, schema: dict[str, Any]) -> Command:
         """A tool-less one-shot call. Gemini has no JSON-schema flag, so the
@@ -476,12 +497,13 @@ class GeminiAdapter(AgentAdapter):
 
     # -- results -------------------------------------------------------------
     def detect_rate_limit(self, event_or_exit: Event | int) -> RateLimit | None:
-        """A quota hit: an agent error (never a tool's) that the CLI
-        classified as ``TerminalQuotaError`` (``classifyGoogleError`` in the
-        0.65.0 source: daily quota, ``QUOTA_EXHAUSTED``, model capacity, a
-        retry delay over 5 minutes), or whose text says a quota or capacity
-        is exhausted. ``RetryableQuotaError`` (per-minute throttling the CLI
-        already retried) is not a Window hit. The reset time comes from the
+        """A quota hit: an agent error (never a tool's) whose text says a
+        quota or capacity is exhausted, or that ends in the CLI's 429 note
+        ("Possible quota limitations in place..."), or that the CLI typed
+        ``TerminalQuotaError``. An API error during a turn reaches the
+        ``result`` line as ``error.type: "unknown"`` (seen on 0.65.0: the
+        turn passes a plain {message, status}), so the text is what counts;
+        ``RetryableQuotaError`` is excluded when it is typed. The reset time comes from the
         text ("Please retry in 34s", "Suggested retry after 3600s", "reset
         after 2h31m10s"); a daily quota with none is probed. The exit code
         alone says nothing."""
@@ -514,7 +536,10 @@ class GeminiAdapter(AgentAdapter):
             models = {self._model_seen or self.model or "unknown": self._stats}
         out = []
         for name, m in models.items():
-            if not isinstance(m, dict):
+            # The CLI lists every model it touched, e.g. the "auto" router's
+            # with all zeros when its call failed (seen on 0.65.0).
+            if not isinstance(m, dict) or not any(m.get(k) for k in (
+                    "total_tokens", "input_tokens", "output_tokens", "cached", "input")):
                 continue
             prompt = int(m.get("input_tokens") or 0)
             cached = int(m.get("cached") or 0)
@@ -688,7 +713,9 @@ class GeminiApiAdapter(GeminiAdapter):
 
 _LIMIT_TEXT = re.compile(
     r"exhausted your (?:daily )?quota|exhausted your capacity|capacity exceeded"
-    r"|MODEL_CAPACITY_EXHAUSTED|QUOTA_EXHAUSTED|quota exceeded|usage limit reached",
+    r"|MODEL_CAPACITY_EXHAUSTED|QUOTA_EXHAUSTED|quota exceeded|usage limit reached"
+    # The CLI's own suffix on any HTTP 429 under Google sign-in.
+    r"|Possible quota limitations in place",
     re.IGNORECASE,
 )
 _RETRY_IN = re.compile(r"(?:retry in|retry after|reset after|resets? in)\s+"

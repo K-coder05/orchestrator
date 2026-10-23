@@ -1,8 +1,9 @@
 """The Gemini CLI adapter (§2.9, Phase 2).
 
-The adapter was written from the gemini-cli 0.65.0 source (docs/adapters.md);
-these tests run it against the fake `gemini` in tests/fixtures/fake_gemini.py,
-which replays tests/fixtures/gemini_stream.jsonl.
+The adapter was written from the gemini-cli 0.65.0 source and checked
+against the installed CLI (docs/adapters.md); these tests run it against the
+fake `gemini` in tests/fixtures/fake_gemini.py, which replays
+tests/fixtures/gemini_stream.jsonl, a recording of the real CLI.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from conftest import FIXTURES
 from test_planning import planner  # noqa: F401  (pytest fixture)
 
 LA = ZoneInfo("America/Los_Angeles")
-SID = "3f2b9c1e-7a4d-4e8b-9c2f-1d5e6a7b8c9d"
+SID = "5fffc92d-5b30-4090-b661-67f3032f772e"  # the recording's
 FAKE_GEMINI = [sys.executable, str(FIXTURES / "fake_gemini.py")]
 
 
@@ -68,12 +69,25 @@ def test_parse_stream_fixture():
 
 def test_usage_from_result_stats():
     a, _ = _parse((FIXTURES / "gemini_stream.jsonl").read_text().splitlines())
-    [u] = a.usage_from_run()
+    # The "auto" model: the router's call, then the model it picked.
+    router, u = a.usage_from_run()
+    assert (router.model, router.input_tokens, router.output_tokens) == (
+        "gemini-3.1-flash-lite", 1180, 24)
     # `input_tokens` counts the cached prompt tokens; `input` is the rest.
     assert (u.model, u.input_tokens, u.output_tokens, u.cache_read_tokens) == (
-        "gemini-3.1-pro", 6100, 410, 18000)
+        "gemini-3.5-flash", 6100, 410, 18000)
     assert u.cost_usd is None  # Gemini reports no cost
-    assert u.raw["total_tokens"] == 24810
+    assert u.raw["total_tokens"] == 24810  # thinking tokens are in here, not in output
+
+
+def test_models_with_no_tokens_are_not_usage():
+    # Seen on 0.65.0: a failed router call still lists its model, all zeros.
+    zero = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cached": 0, "input": 0}
+    a, _ = _parse([json.dumps({"type": "result", "status": "success", "stats": {"models": {
+        "gemini-3.1-flash-lite": zero,
+        "gemini-2.5-pro": {**zero, "total_tokens": 101, "input_tokens": 100, "input": 100,
+                           "output_tokens": 1}}}})])
+    assert [u.model for u in a.usage_from_run()] == ["gemini-2.5-pro"]
 
 
 def test_no_result_line_means_no_usage_and_no_verdict():
@@ -95,7 +109,7 @@ def test_error_result_fails_the_attempt():
 
 def test_warnings_and_non_json_lines_are_not_errors():
     a, events = _parse([
-        "Loaded cached credentials.",
+        "Ripgrep is not available. Falling back to GrepTool.",
         json.dumps({"type": "error", "severity": "warning", "message": "Loop detected"}),
     ])
     assert not any(e.kind == EventKind.ERROR for e in events)
@@ -152,7 +166,11 @@ def test_build_command_is_headless_stream_json_with_the_per_task_policy(cfg, tmp
     assert cmd.stdin.startswith("# Nightshift agent protocol\nline 2")
     assert cmd.stdin.endswith("-rm everything")
     env = cmd.env
-    assert env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] == str(perms.settings_file)
+    # Nightshift's settings are the CLI's user layer (a system settings file
+    # is skipped unless root owns every folder above it).
+    assert env["GEMINI_CLI_HOME"] == str(policy.settings_dir / "gemini-home")
+    assert perms.settings_file == policy.settings_dir / "gemini-home" / ".gemini" / "settings.json"
+    assert "GEMINI_CLI_SYSTEM_SETTINGS_PATH" not in env
     assert env["GEMINI_CLI_TRUST_WORKSPACE"] == "false"  # workspace settings never load
     assert env["GEMINI_SANDBOX"] == "false"
     assert env["TMPDIR"] == str(ws / ".tmp") and (ws / ".tmp").is_dir()
@@ -160,10 +178,12 @@ def test_build_command_is_headless_stream_json_with_the_per_task_policy(cfg, tmp
 
 def test_settings_file_pins_tools_sandbox_and_switches_off_extras(cfg, tmp_path):
     ws, policy, perms = _perms(cfg, tmp_path)
-    assert perms.settings_file.parent == policy.settings_dir  # agent-inaccessible data dir
+    assert policy.settings_dir in perms.settings_file.parents  # agent-inaccessible data dir
     s = json.loads(perms.settings_file.read_text())
     assert s["security"]["toolSandboxing"] is True  # every shell command in Seatbelt
-    assert s["security"]["folderTrust"]["enabled"] is True
+    # Off so headless runs start; the folder stays untrusted through the env.
+    assert s["security"]["folderTrust"]["enabled"] is False
+    assert s["security"]["auth"]["selectedType"] == "oauth-personal"
     assert s["security"]["disableYoloMode"] is True
     assert s["tools"]["sandbox"] is False
     assert s["tools"]["sandboxNetworkAccess"] is False
@@ -245,7 +265,7 @@ def test_resume_command(cfg, tmp_path):
     cmd = a.resume_command(SID, "continue", task=_task(ws), permissions=perms)
     assert _flag_values(cmd.argv, "--resume") == [SID]
     assert cmd.stdin.startswith("# Nightshift agent protocol") and cmd.stdin.endswith("continue")
-    assert cmd.env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] == str(perms.settings_file)
+    assert cmd.env["GEMINI_CLI_HOME"] == perms.sandbox["cli_home"]  # the Task's sessions
     with pytest.raises(ValueError):
         a.resume_command(SID, "continue", task=_task(ws))
 
@@ -260,14 +280,29 @@ def test_refuses_unsafe_commands(cfg, tmp_path):
             _adapter(tmp_path, {"extra_args": bad}).build_command(_task(ws), ws, perms)
 
 
+def test_cli_home_links_the_sign_in_and_ignores_your_settings(cfg, tmp_path):
+    a = _adapter(tmp_path)
+    gem = a.home / ".gemini"
+    gem.mkdir(parents=True)
+    (gem / "oauth_creds.json").write_text("{}")
+    (gem / "google_accounts.json").write_text("{}")
+    # Not read at all: GEMINI_CLI_HOME moves the user settings layer.
+    (gem / "settings.json").write_text('{"context": {"includeDirectories": ["~/"]}}')
+    ws, policy, perms = _perms(cfg, tmp_path, adapter=a)
+    home = Path(perms.sandbox["cli_home"]) / ".gemini"
+    assert (home / "oauth_creds.json").resolve() == (gem / "oauth_creds.json").resolve()
+    assert (home / "google_accounts.json").is_symlink()
+    assert "context" not in json.loads((home / "settings.json").read_text())
+    # A second Attempt keeps the home (the Task's sessions) and rewrites the settings.
+    (home / "tmp").mkdir()
+    _perms(cfg, tmp_path, adapter=a)
+    assert (home / "tmp").is_dir() and (home / "oauth_creds.json").is_symlink()
+
+
 def test_refuses_user_config_that_would_widen_a_task(cfg, tmp_path):
     a = _adapter(tmp_path)
     gem = a.home / ".gemini"
     gem.mkdir(parents=True)
-    (gem / "settings.json").write_text('{\n  // a comment\n  "context": {"includeDirectories": ["~/"]}\n}')
-    with pytest.raises(ValueError, match="includeDirectories"):
-        _perms(cfg, tmp_path, adapter=a)
-    (gem / "settings.json").write_text('{"ui": {"theme": "x"}}')
     (gem / "policies").mkdir()
     (gem / "policies" / "sandbox.toml").write_text("[modes.default]\nnetwork = true\n")
     with pytest.raises(ValueError, match="sandbox.toml"):
@@ -284,6 +319,41 @@ def test_path_keeps_tool_dirs_and_drops_entries_that_expose_home(cfg, tmp_path, 
     # ~/bin would make the sandbox allow reading all of ~ (it opens the parent of a bin dir).
     assert path == [str(home / ".nvm" / "versions" / "node" / "v24" / "bin"),
                     "/opt/homebrew/bin", "/usr/bin"]
+
+
+def test_bin_and_sbin_are_reached_through_links(cfg, tmp_path, monkeypatch):
+    """/bin on PATH would make the shell sandbox allow reading all of `/`
+    (it opens the parent of a bin dir); without it the sandbox can't start
+    bash (seen on 0.65.0). Links to its programs go on PATH instead."""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin:/sbin")
+    ws, policy, perms = _perms(cfg, tmp_path)
+    path = _adapter(tmp_path).build_command(_task(ws), ws, perms).env["PATH"].split(":")
+    sysbin = Path(perms.sandbox["cli_home"]) / "sysbin"
+    assert path == ["/usr/bin", "/sbin", str(sysbin)]
+    assert (sysbin / "bash").resolve() == Path("/bin/bash").resolve()
+    assert not (sysbin / "bash").is_dir()
+
+
+def _cli_safe_regex(pattern: str) -> bool:
+    """gemini-cli 0.65.0's isSafeRegExp: a policy rule whose pattern fails it
+    is dropped (with only a warning on stderr), so every rule must pass."""
+    import re
+    return len(pattern) <= 2048 and not re.search(r"\([^)]*[*+?{].*\)[*+?{]", pattern)
+
+
+def test_every_policy_pattern_passes_the_cli_redos_check(cfg, tmp_path):
+    ws, policy, perms = _perms(cfg, tmp_path, internet="on")
+    for r in _rules(perms):
+        pat = r.get("argsPattern") or (
+            '"command":"' + r["commandRegex"] if "commandRegex" in r else None)
+        assert pat is None or _cli_safe_regex(pat), pat
+
+
+def test_shell_allow_rule_allows_redirection(cfg, tmp_path):
+    # Else `>` or `2>&1` turns the allow into "ask", which headless is a deny.
+    ws, policy, perms = _perms(cfg, tmp_path)
+    [allow] = [r for r in _rules(perms) if r["decision"] == "allow"]
+    assert "run_shell_command" in allow["toolName"] and allow["allowRedirection"] is True
 
 
 def test_registered():
@@ -308,6 +378,17 @@ def _hits(lines):
     a.clock = lambda: NOW
     return [h for line in lines for ev in a.parse_stream(line)
             if (h := a.detect_rate_limit(ev)) is not None]
+
+
+def test_api_error_in_a_turn_is_a_limit_hit_by_its_text():
+    # As 0.65.0 writes it: the turn's error is untyped ("unknown"), and a 429
+    # under Google sign-in gets the CLI's note.
+    [hit] = _hits([_limit_result(
+        "unknown", "[API Error: Resource has been exhausted (e.g. check quota).]\nPossible quota "
+        "limitations in place or slow response times detected. Switching to the "
+        "gemini-2.5-flash model for the rest of this session.")])
+    assert hit.reset_at is None  # probed
+    assert _hits([_limit_result("unknown", "[API Error: No more mock responses]")]) == []
 
 
 def test_terminal_quota_error_is_a_limit_hit():
@@ -349,8 +430,9 @@ def test_planning_command_is_toolless_with_the_schema_in_the_prompt():
     cmd = GeminiAdapter({"model": "pro", "planning_model": "flash"}).planning_command(
         "Summarize lecture 3", system="You plan.", schema={"type": "object"})
     assert _flag_values(cmd.argv, "-m") == ["flash"]
-    s = json.loads(Path(cmd.env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"]).read_text())
+    s = json.loads((Path(cmd.env["GEMINI_CLI_HOME"]) / ".gemini" / "settings.json").read_text())
     assert s["tools"]["core"] == []
+    assert cmd.env["PATH"] == os.environ["PATH"]  # no tools, no shell: nvm's node stays
     import tomllib
     [rule] = tomllib.loads(Path(_flag_values(cmd.argv, "--admin-policy")[0]).read_text())["rule"]
     assert (rule["toolName"], rule["decision"]) == ("*", "deny")
@@ -449,9 +531,10 @@ def test_orch_add_agent_gemini_runs_to_done_with_a_report(config_dir, cfg, db, g
     [run] = _gemini_runs(folder)
     assert run["env"]["GEMINI_CLI_TRUST_WORKSPACE"] == "false"
     assert "Nightshift" in run["stdin"] and run["stdin"].endswith("Summarize lecture 3")
-    [u] = db.usage_for_task(tid)
+    router, u = db.usage_for_task(tid)  # "auto": the router's call and the picked model's
+    assert (router["agent"], router["model"]) == ("gemini", "gemini-3.1-flash-lite")
     assert (u["agent"], u["model"], u["input_tokens"], u["cache_read_tokens"]) == (
-        "gemini", "gemini-3.1-pro", 6100, 18000)
+        "gemini", "gemini-3.5-flash", 6100, 18000)
     text = (folder / "report.md").read_text()
     assert "**done**" in text and "| gemini | 1 |" in text
     assert (folder / "output" / "notes.md").exists()

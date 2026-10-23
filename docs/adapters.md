@@ -5,8 +5,9 @@ All agents sit behind `nightshift.adapters.base.AgentAdapter` (§2.9):
 `resume_command`, `usage_from_run`, `write_permissions`, plus
 `planning_command`/`parse_planning_output` and
 `probe_command`/`parse_probe_output`. Registered: `claude` (verified),
-`codex` (verified on codex-cli 0.163.0) and `gemini` (written from the
-gemini-cli 0.65.0 source; real runs pending). One adapter instance
+`codex` (verified on codex-cli 0.163.0) and `gemini` (checked against the
+installed gemini-cli 0.65.0 with scripted model responses; no real model
+call yet, see its section). One adapter instance
 is created per Attempt, so `session_id()` and `usage_from_run()` report what
 that Attempt's stream contained. Adapters are looked up by name in
 `nightshift.adapters.REGISTRY`; core code never names an agent.
@@ -577,20 +578,25 @@ with the single word OK."; a `turn.completed` -> available, a limit message
 
 ## Gemini CLI
 
-> **Written from the gemini-cli 0.65.0 source (2026-10-22), not yet run
-> against a signed-in CLI.** The CLI is not installed on this Mac yet. The
-> npm package (`@google/gemini-cli@0.65.0`, the bundle keeps
-> `// packages/...` source markers) was read for: `gemini --help` (the
-> yargs options in `packages/cli/src/config/config.ts`), the stream-json
-> events (`nonInteractiveCli.ts`, `output/stream-json-formatter.js`),
-> resume (`utils/sessions.ts`, `sessionUtils.ts`), the settings layers and
-> merge rules (`config/settings.ts`), folder trust, the policy engine
-> (`policy/toml-loader.js`, `policy-engine.js`), the per-command shell
-> sandbox (`sandbox/macos/*`, `services/sandboxManager.js`) and quota
-> errors (`utils/googleQuotaErrors.js`, `errorParsing.js`). `--version`
-> and `--help` ran from the unpacked package (0.65.0); no model call was
-> made. Everything marked *(source)* below is still to be checked for
-> real (see "Still to verify").
+> **Checked against the installed gemini-cli 0.65.0 (2026-10-22), with
+> scripted model responses; no real model call has succeeded yet.** The
+> adapter was first written from the 0.65.0 npm bundle (`// packages/...`
+> source markers kept). The CLI is now installed and signed in with the
+> Google AI Pro account, but **Google refuses this client for that account**:
+> every run, plain `gemini -p` included, stops at sign-in with
+> `IneligibleTierError: This client is no longer supported for Gemini Code
+> Assist for individuals. To continue using Gemini, please migrate to the
+> Antigravity suite of products` (`loadCodeAssist` returns no current or paid
+> tier, only `free-tier` with reason `UNSUPPORTED_CLIENT`). So everything up
+> to the model call was checked on the real CLI by running Nightshift's own
+> commands with the hidden `--fake-responses-non-strict <file>` flag: the
+> CLI replays model responses from a file instead of calling Google, and the
+> rest (flags, settings layers, folder trust, policy engine, the per-command
+> Seatbelt sandbox, tools, stream-json, sessions, resume, usage stats) is the
+> real thing. `tests/test_gemini_cli.py` (opt-in, `NIGHTSHIFT_GEMINI_CLI=1`,
+> no sign-in needed) repeats those checks; re-run it after every Gemini CLI
+> upgrade. What a real model, real usage counts and a real quota hit look
+> like is still unverified ("Still to verify" below).
 
 ### Invocation Nightshift uses
 
@@ -599,47 +605,82 @@ gemini --output-format stream-json --approval-mode default \
   --admin-policy <agents_root>/data/permissions/<task-id>/gemini-policy.toml \
   -e none --allowed-mcp-server-names nightshift-none \
   [--include-directories <read-only dir> ...] [-m <agents.gemini.model>]
-# env: GEMINI_CLI_SYSTEM_SETTINGS_PATH=<same dir>/gemini-settings.json
+# env: GEMINI_CLI_HOME=<same dir>/gemini-home   (its .gemini/settings.json is Nightshift's)
 #      GEMINI_CLI_TRUST_WORKSPACE=false  GEMINI_SANDBOX=false
+#      GEMINI_API_KEY=""  GOOGLE_API_KEY=""
 #      TMPDIR=<task folder>/.tmp  PATH=<filtered, see below>
 # stdin: <agent protocol> \n\n---\n\n <prompt>        cwd = Task folder
 # resume: the same, plus --resume <session_id>
 ```
 
+All flags exist in the installed `gemini --help` (0.65.0); `--fake-responses*`
+are hidden.
+
 - **Headless and the prompt.** With stdin not a TTY the CLI runs headless;
-  the input is stdin (`-p` text would be appended after it). Nightshift
-  passes no `-p`, so the prompt is only on stdin. Gemini has no flag that
+  the input is stdin. Nightshift passes no `-p`. Gemini has no flag that
   appends to the system prompt (`GEMINI_SYSTEM_MD` *replaces* it), so the
   agent protocol goes in front of the prompt on every Attempt, resumes
-  included.
-- **Settings.** `GEMINI_CLI_SYSTEM_SETTINGS_PATH` makes the per-Task file
-  the *system* layer, which wins over user (`~/.gemini/settings.json`) and
-  workspace settings key by key (`mergeSettings`: defaults < system
-  defaults < user < workspace < system). Some keys merge instead of
-  replacing: `context.includeDirectories` and `hooks.*` concatenate,
-  `mcpServers` shallow-merges, `tools.exclude` and policy paths union.
-  Hence the flags and switches below, and the refusal described in
-  docs/safety.md (user `context.includeDirectories`).
-- **Workspace settings never load.** `GEMINI_CLI_TRUST_WORKSPACE=false`
-  makes `checkPathTrust` return untrusted, so `.gemini/settings.json` in
-  the Task folder (agent-writable) is ignored, and approval mode can't
-  leave `default`. `--skip-trust` (which sets it to `true`) is never
-  passed and is refused in `extra_args`.
-- **Approvals.** `--approval-mode default` in headless mode: the policy
-  engine turns every "ask user" into **deny** (`nonInteractive`). The
-  admin-tier policy file allows exactly the Task's tools.
+  included (the `user` message line echoes it).
+- **Settings: a per-Task CLI home** (changed after the real check). The
+  plan was a *system* settings file via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`;
+  the real CLI **skips** it ("Security Warning: Skipping system settings
+  file ... is not owned by root (uid 0)": every folder above a system
+  settings file must be owned by root). Instead `GEMINI_CLI_HOME` points
+  the CLI at `<settings dir>/gemini-home`, whose `.gemini/settings.json`
+  (Nightshift's, rewritten each Attempt) becomes the *user* layer. Your
+  `~/.gemini/settings.json`, policies, extensions, skills and history are
+  then not read at all; `oauth_creds.json` and `google_accounts.json` are
+  symlinked in from your `~/.gemini` so the sign-in still works (seen: the
+  run reaches Google's tier check with your account). The home is kept
+  between Attempts, since the Task's sessions live in it. The only layer
+  above it is a root-owned system settings file
+  (`/Library/Application Support/GeminiCli/settings.json`), which only an
+  admin can write.
+- **Workspace settings never load; headless still runs.** With
+  `GEMINI_CLI_TRUST_WORKSPACE=false` the Task folder is untrusted, so its
+  agent-writable `.gemini/settings.json` is ignored (checked: one that
+  switches the shell sandbox off had no effect on the next Attempt) and
+  "Project hooks disabled because the folder is not trusted". But 0.65.0
+  refuses to run headless in an untrusted folder ("Gemini CLI is not
+  running in a trusted directory", exit 55) **unless** folder trust is off,
+  so the settings set `security.folderTrust.enabled: false`; the env var
+  still marks the folder untrusted. Side effect: **git commands are denied**
+  ("Git command evaluated in untrusted workspace", ask, i.e. deny headless),
+  and `.git` isn't writable from the sandbox anyway.
+- **Approvals.** `--approval-mode default` headless: every "ask user"
+  decision becomes **deny** (seen: "Tool execution denied by policy.").
+  The admin-tier policy file (not subject to the root-ownership check) allows
+  exactly the Task's tools. The shell allow rule needs `allowRedirection =
+  true`: without it any `>`, `>>` or `2>&1` turns the allow into ask, i.e.
+  deny (seen). The CLI still asks, so denies, for `rm -f/-rf`, `ln -s`,
+  `find -exec/-delete` and commands run outside the workspace
+  (`applyShellHeuristics`).
 - **No extensions, MCP servers, hooks, skills or subagents.** `-e none`;
-  `--allowed-mcp-server-names nightshift-none` (an allow-list no server
-  matches: `isBlockedBySettings`); `hooksConfig.enabled`, `skills.enabled`,
-  `experimental.enableAgents` false; `tools.discoveryCommand`,
-  `tools.callCommand`, `mcp.serverCommand` empty.
-- **Sessions** are stored per project (working directory) under
-  `~/.gemini/tmp/<project>/chats/`. `--resume <uuid>` resolves the session
-  by id and **keeps the same session id** (`resolveSessionId`). A resume of
-  an unknown id fails before the session starts ("Invalid session
-  identifier"), which Nightshift treats as a failed resume (fresh session).
-  Planning calls and probes also leave a session behind (there is no
-  ephemeral flag); they run in `<agents_root>/data/planning` and `.../probe`.
+  `--allowed-mcp-server-names nightshift-none`; `hooksConfig.enabled`,
+  `skills.enabled`, `experimental.enableAgents` false;
+  `tools.discoveryCommand`, `tools.callCommand`, `mcp.serverCommand` empty.
+- **Sessions** are stored in the CLI home,
+  `gemini-home/.gemini/tmp/<project>/chats/session-<time>-<id>.jsonl`.
+  `--resume <uuid>` keeps the **same session id** and appends to the same
+  file (seen: one session file, same `init.session_id`, earlier turns
+  kept), also after the previous Attempt was SIGKILLed mid-tool. A resume
+  that can't find the session fails before any event with exit **42** and
+  "Error resuming session: No previous sessions found for this project." (or
+  "Invalid session identifier"); Nightshift then starts a fresh session.
+  Planning calls and probes leave a session in the private temp CLI home.
+- **Stops.** The CLI **ignores SIGTERM while a shell command runs** (seen:
+  still running 20 s later). Nightshift's SIGKILL after
+  `KILL_GRACE_SECONDS` (15 s) ends it; such an Attempt has no `result` line,
+  so no usage is recorded for it, but the session resumes fine.
+- **PATH.** `safe_path` drops entries whose readable folder would contain
+  your home or `agents_root` (the sandbox opens each `PATH` entry, the
+  *parent* of a `.../bin` one). That drops `/bin` too (its parent is `/`),
+  and the real sandbox then couldn't start a shell at all
+  ("sandbox-exec: execvp() of 'bash' failed"). So the programs of `/bin`
+  are symlinked into `gemini-home/sysbin`, which goes on `PATH` instead
+  (the base profile already lets the shell read `/bin`). Planning calls and
+  probes keep your `PATH` unfiltered: they have no tools, and filtering it
+  without `tool_dirs` dropped an nvm-installed `gemini`/`node`.
 - `agents.gemini.extra_args` may not contain `--yolo`/`-y`,
   `--approval-mode`, `--sandbox`, `--policy`, `--admin-policy`,
   `--include-directories`, `--allowed-tools`, `--allowed-mcp-server-names`,
@@ -648,12 +689,13 @@ gemini --output-format stream-json --approval-mode default \
 
 ### Per-Task settings and policy
 
-`GeminiAdapter.write_permissions` writes both files to
-`<agents_root>/data/permissions/<task-id>/` (agent-inaccessible), fresh each
-Attempt. Settings (system layer):
+`GeminiAdapter.write_permissions` writes both to
+`<agents_root>/data/permissions/<task-id>/` (agent-inaccessible): the policy
+file and `gemini-home/.gemini/settings.json`, fresh each Attempt:
 
 ```json
-{"security": {"toolSandboxing": true, "folderTrust": {"enabled": true},
+{"security": {"auth": {"selectedType": "oauth-personal"},
+              "toolSandboxing": true, "folderTrust": {"enabled": false},
               "disableYoloMode": true, "disableAlwaysAllow": true,
               "enablePermanentToolApproval": false, "autoAddToPolicyByDefault": false,
               "environmentVariableRedaction": {"enabled": true}},
@@ -670,72 +712,98 @@ Attempt. Settings (system layer):
  "ide": {"enabled": false}}
 ```
 
-`tools.core` is the list of built-in tools that exist at all; internet-on
-Tasks add `web_fetch` and `google_web_search`. The policy file (TOML,
-loaded as **admin** tier, which beats user and workspace policies; within a
-tier the higher `priority` wins):
+`tools.core` is the list of built-in tools that exist at all (seen: a call
+to `web_fetch` on an internet-off Task is `Tool "web_fetch" not found`);
+internet-on Tasks add `web_fetch` and `google_web_search`. The policy file
+(TOML, loaded as **admin** tier, which beats user and workspace policies;
+within a tier the higher `priority` wins):
 
 | Rule | Priority |
 |---|---|
 | `toolName = "*"`, deny | 0 |
-| the Task tools, allow | 500 |
+| the Task tools, allow (`allowRedirection = true`) | 500 |
 | `write_file`/`replace` whose `file_path` contains `..`, deny | 900 |
 | `write_file`/`replace` into a read-only or no-access dir (absolute, `~/`, `$HOME/`), deny | 900 |
 | `run_shell_command` whose command names such a dir, deny | 900 |
 | `web_fetch`/`google_web_search` whose arguments mention a denied domain (any case), deny | 900 |
 
 `argsPattern` is a JS regex matched against the arguments as compact JSON
-with sorted keys (`stableStringify`: `"file_path":"/abs/path"`);
-`commandRegex` is matched as `"command":"<regex>` (anchored at the start of
-the command). The tests pin the patterns.
+with sorted keys (`"file_path":"/abs/path"`); `commandRegex` is matched as
+`"command":"<regex>`. **The CLI drops any rule whose pattern looks like a
+ReDoS risk** (`isSafeRegExp`: a group with a quantifier inside, followed
+by a quantifier), printing only "Unsafe regex pattern (potential ReDoS)" on
+stderr. The first shell rules (`(?:[^"\\]|\\.)*<dir>`) were all dropped
+that way on the real CLI; they now use `.*<dir>` (which may also match the
+`description` argument: that only denies more), and a unit test runs every
+pattern through the same check. Seen on the real CLI: writes into a
+read-only dir and shell commands naming the data dir are denied with
+Nightshift's messages; LinkedIn fetches and searches too.
 
-**Shell sandbox** (`security.toolSandboxing`): on macOS every
-`run_shell_command` (and, with it on, file-tool reads/writes through
-`SandboxedFileSystemService`) runs under `sandbox-exec` with a profile
-built per command (`buildSeatbeltProfile`): `(deny default)`, read of
-system paths (`/System`, `/usr`, `/bin`, `/opt/homebrew`, `/Library`, ...),
-read of the Task folder, the include dirs and each `PATH` entry (the
-*parent* of a `.../bin` entry), read+write of the Task folder (default
-mode), the include dirs, `/tmp`, `$TMPDIR` and `~/.gemini/tmp`, `.env`
-files denied, **no network** unless the mode or a per-command grant allows
-it (`sandbox-default.toml`: `network = false` in every mode but yolo).
-Nightshift sets `TMPDIR` inside the Task folder and filters `PATH`
-(`safe_path`): entries whose readable folder would contain your home or
-`agents_root` (e.g. `~/bin` opens all of `~`) are dropped, and entries
-under home are kept only inside `permissions.tool_dirs`.
+**Shell sandbox** (`security.toolSandboxing`): every `run_shell_command`
+runs under `sandbox-exec` with a profile built per command: `(deny
+default)`, read of system paths (`/System`, `/usr`, `/bin`, `/sbin`,
+`/opt/homebrew`, `/Library`, ...), of node's install, of each `PATH` entry,
+read+write of the Task folder, the include dirs, `$TMPDIR` (Nightshift's,
+inside the Task folder), `/tmp` and `/private/tmp`, `.env` files denied,
+`.git`/`.gitignore`/`.geminiignore` not writable, **no network**. Seen on
+the real CLI: reads of a file in `~`, of `~/.gemini`, of the CLI home (the
+linked sign-in) and of `agents_root/data` through a relative path all fail
+with "Operation not permitted"; `curl` can't resolve hosts; a relative
+write into a read-only dir succeeds (the known gap); `/tmp` is writable.
 
-The whole-CLI sandbox (`--sandbox`, `tools.sandbox`, `GEMINI_SANDBOX`:
-relaunch of the CLI in Docker/Seatbelt) is switched off: it would put the
-CLI's own network access and the shell's in the same box.
+**Known 0.65.0 bug: a stopped command that fails hangs the run.** When a
+shell command fails (non-zero exit) and its output looks like a sandbox
+denial (a path outside the workspace with "Operation not permitted", or a
+network error such as "Could not resolve host"), the CLI asks for a
+"Sandbox Expansion Request" and **waits for an answer that never comes in
+headless mode**: no more output, the process never exits (seen; the
+scheduler calls `resolveConfirmation` directly, past the policy engine).
+The confinement holds (nothing is granted), but the Attempt only ends at its
+runtime cap, as a Failed Attempt. Commands whose last step succeeds (`...;
+true`) don't hang. Nightshift has no stall detection yet; see the open item
+under "Still to verify".
 
-### stream-json output format *(source)*
+The whole-CLI sandbox (`--sandbox`, `tools.sandbox`, `GEMINI_SANDBOX`) is
+off: it would put the CLI's own network access and the shell's in one box.
 
-One JSON object per line (`StreamJsonFormatter`), each with `timestamp`:
+### stream-json output format (seen on 0.65.0)
+
+One JSON object per line, each with `timestamp`. Non-JSON noise
+("Ripgrep is not available. Falling back to GrepTool.", startup metrics,
+policy warnings) goes to stderr.
 
 | `type` | Fields | Normalized to |
 |---|---|---|
-| `init` | `session_id`, `model` | `session` |
+| `init` | `session_id`, `model` (the `-m` model, or `auto`) | `session` |
 | `message` | `role` (`user` echoes the input; `assistant`), `content`, `delta: true` (assistant text arrives in chunks) | `text` (assistant) / `other` |
-| `tool_use` | `tool_name`, `tool_id`, `parameters` | `tool_call` (one Step) |
-| `tool_result` | `tool_id`, `status` `success`/`error`, `output`, `error: {type, message}` | `tool_result`; `error` (tool error) on failure; `file_change` for a successful `write_file`/`replace` (`file_path`) |
-| `error` | `severity` `warning`/`error`, `message` (loop detected, max turns, invalid stream, blocked by hook) | `error` if severity is error, else `other` |
+| `tool_use` | `tool_name`, `tool_id` (`<tool>__<tool>_<ms>_<n>`), `parameters` | `tool_call` (one Step) |
+| `tool_result` | `tool_id`, `status` `success`/`error`, `output` (absent for `write_file`; the error text on failure), `error: {type, message}` (`invalid_tool_params`, `policy_violation`, `file_not_found`, `tool_not_registered`, ...) | `tool_result`; `error` (tool error) on failure; `file_change` for a successful `write_file`/`replace` (`file_path`) |
+| `error` | `severity` `warning`/`error`, `message` (loop detected, ...) | `error` if severity is error, else `other` |
 | `result` | `status` `success`/`error`, `error: {type, message}` on error, `stats` | `usage`, `result`, `error` |
 
-`stats`: `total_tokens`, `input_tokens` (prompt, cached included),
-`output_tokens` (candidates), `cached`, `input` (prompt minus cached),
-`duration_ms`, `tool_calls`, `models: {<model>: {total_tokens,
-input_tokens, output_tokens, cached, input}}`. A fatal error (auth, quota,
-config) goes through `handleError`: one `result` line with `status:
-"error"`, `error.type` = the error's class name (e.g. `TerminalQuotaError`,
-`FatalAuthenticationError`), `error.message` formatted by
-`parseAndFormatApiError` (`[API Error: <message>]`, plus a "Please wait
-and try again later..." suffix for a 429), then `process.exit(<code>)`
-where the code is the error's `exitCode`, else its `code`/`status`, else
-1 (a quota error's status 429 exits as **173**, 429 & 0xff).
+Several tool calls of one model turn come as consecutive `tool_use` lines,
+then their `tool_result`s. `stats`: `total_tokens`, `input_tokens`
+(prompt, cached included), `output_tokens` (candidates), `cached`, `input`
+(prompt minus cached), `duration_ms`, `tool_calls`, `models: {<model>:
+{total_tokens, input_tokens, output_tokens, cached, input}}`. Thinking
+tokens are in `total_tokens` only. With the default `auto` model the
+router's call is its own entry (e.g. `gemini-3.1-flash-lite`) next to the
+model it picked (`gemini-3.5-flash` in the recording); a failed router call
+is listed with all zeros.
 
-`tests/fixtures/gemini_stream.jsonl` is shaped from the source, **not a
-recording**; `tests/fixtures/fake_gemini.py` replays it. Replace it with a
-recorded stream once the CLI is signed in.
+An API error during a turn ends the run with one `result` line,
+`status: "error"`, `error.type: "unknown"` (the turn passes a plain
+`{message, status}`, not an Error class) and `error.message`
+`[API Error: <message>]`, then exit 1, or 173 for an HTTP 429 (429 & 0xff,
+from the source). Errors thrown outside a turn keep their class name as
+`error.type`. A sign-in failure (`IneligibleTierError`) writes **nothing**
+to stdout: the stack trace goes to stderr, exit 1.
+
+`tests/fixtures/gemini_stream.jsonl` is a recording of the real CLI
+(Nightshift's settings, `auto` model, scripted responses: a failed
+`read_file`, a `write_file`, a `run_shell_command`, two text chunks), with
+the Task path and the prompt replaced; `tests/fixtures/fake_gemini.py`
+replays it.
 
 ### Usage mapping
 
@@ -743,52 +811,49 @@ Per model from `result.stats.models`: input = `input` (uncached prompt
 tokens), cache read = `cached`, output = `output_tokens`; no cache-write
 count, no request count, **no cost** (`cost_usd` NULL, so Gemini Limit
 observations carry tokens but no cost-equivalent, and Baselines can't form,
-as for Codex: the proactive thresholds never apply to Gemini either; only an
-actual limit error pauses it). Thinking tokens are in `total_tokens` but not
-`output_tokens`; `raw` keeps the whole per-model object. The stats come
-from the process's own telemetry (`uiTelemetryService`), so a resumed
-Attempt should report only its own tokens *(to verify)*. An Attempt stopped
-before its `result` line records no usage.
+as for Codex: only an actual limit error pauses Gemini). Entries with no
+tokens at all are skipped. The stats are the process's own, so a resumed
+Attempt reports only its own tokens (seen). An Attempt stopped before its
+`result` line (SIGKILL) records no usage. The token numbers in the
+recording are scripted; the real model's counts are not yet seen.
 
 ### Rate limits *(source; no real hit seen)*
 
 The CLI classifies Google API errors (`classifyGoogleError`):
-
-- **`TerminalQuotaError`**: a daily quota (`QuotaFailure` with a
-  `PerDay`/`Daily` quota id -> "You have exhausted your daily quota on this
-  model."), `QUOTA_EXHAUSTED`, `MODEL_CAPACITY_EXHAUSTED`, insufficient
-  credits, "exhausted your capacity", or any retry delay over 300 s. Ends
-  the run.
-- **`RetryableQuotaError`**: per-minute quotas and short retry delays; the
-  CLI retries these itself (backoff) before giving up.
+`TerminalQuotaError` for a daily quota ("You have exhausted your daily quota
+on this model."), `QUOTA_EXHAUSTED`, `MODEL_CAPACITY_EXHAUSTED`,
+"exhausted your capacity", or a retry delay over 300 s;
+`RetryableQuotaError` for per-minute quotas, which it retries itself first.
+As seen above, such an error raised in a turn reaches the stream untyped
+(`"unknown"`), so the text decides. Under Google sign-in the CLI appends to
+any 429: "Possible quota limitations in place or slow response times
+detected. Switching to the <flash> model for the rest of this session."
 
 `detect_rate_limit` counts an agent error (never a tool's) as a hit when
-its `error.type` is `TerminalQuotaError`, or its text says a quota or
-capacity is exhausted ("exhausted your (daily) quota", "exhausted your
-capacity", "quota exceeded", "usage limit reached", ...).
-`RetryableQuotaError` is **not** a Window hit (per-minute throttling): the
-Attempt fails and is retried. The reset time is read from the text:
-"Please retry in 34.5s"/"500ms" (Google's message), "Suggested retry after
-3600s." (the CLI's, from `RetryInfo`), "reset after 2h31m10s". A daily
-quota usually has none: Nightshift probes. Window: `daily` when the text
-says so, else the shortest configured Gemini Window (`usage.windows.gemini:
-{daily: 24}`; AI Pro quotas are per model per day).
+its text says a quota or capacity is exhausted ("exhausted your (daily)
+quota", "exhausted your capacity", "quota exceeded", "QUOTA_EXHAUSTED",
+...) or carries that 429 note, or its type is `TerminalQuotaError`. A typed
+`RetryableQuotaError` is not a hit; an untyped per-minute 429 that the CLI
+gave up on will count as one (its reset is usually seconds away). The reset
+time is read from the text: "Please retry in 34.5s"/"500ms", "Suggested
+retry after 3600s.", "reset after 2h31m10s"; without one Nightshift probes.
+Window: `daily` when the text says so, else the shortest configured Gemini
+Window (`usage.windows.gemini: {daily: 24}`).
 
-**Model fallback.** On a quota or capacity error the CLI may switch to a
-fallback model (`handleFallback`). With action `silent` it does so without
-asking and **rotates the session id** (`config.rotateSessionId`), so the
-`init` session id would no longer name the session that holds the later
-turns. Whether this happens headless on the AI Pro plan is to be verified;
-until then a resume after such a fallback may miss the last turns.
+**Model fallback.** On a quota error the CLI may switch model; with action
+`silent` it **rotates the session id**. Whether this happens headless on
+the plan is unverified.
 
 ### Planning calls and probes
 
-The same base flags with an empty `tools.core` and a policy that denies
-`*`, written to a fresh temp folder; no include dirs, no `TMPDIR` change.
-Gemini has no JSON-schema flag, so the planner instructions and the schema
-go in the prompt and the answer is the reply text parsed as JSON (a ```json
-fence is stripped). The probe sends "Answer with the single word OK." /
-"OK?" on the Task model.
+The same base flags in a private temp CLI home
+(`$TMPDIR/nightshift-gemini-<uid>/home`) with an empty `tools.core` and a
+policy that denies `*`; no include dirs, no `TMPDIR` change. Gemini has no
+JSON-schema flag, so the planner instructions and the schema go in the
+prompt and the answer is the reply text parsed as JSON (a ```json fence is
+stripped). The probe sends "Answer with the single word OK." / "OK?" on the
+Task model. Both ran on the real CLI (scripted replies) through `orch add`
+and `usage.probe`.
 
 ### The paid API path (`gemini-api`, AI Studio credits)
 
@@ -824,40 +889,61 @@ fence is stripped). The probe sends "Answer with the single word OK." /
 - **No planning calls, no probes**; `detect_rate_limit` is always None (a
   quota or credit error is a Failed Attempt).
 
-### Still to verify (needs the CLI installed and signed in)
+### Verification log (gemini-cli 0.65.0, 2026-10-22)
 
-Paid path (`gemini-api`): that the key signs in headless, that the
-telemetry file gets one `api_response` record per call with the counts
-above, and that the recorded costs match AI Studio's billing.
+Done on the installed CLI, signed in with the AI Pro account:
 
-`tests/test_gemini_real.py` (opt-in: `NIGHTSHIFT_REAL_AGENT=1 .venv/bin/python
--m pytest tests/test_gemini_real.py`, model from `NIGHTSHIFT_GEMINI_MODEL`)
-covers item 4 (escapes, data dir, home, read-only dirs, shell network,
-web fetch per internet setting), "tools run in an untrusted folder" of item
-3, a resume of the same session after Nightshift stops an Attempt (item 5,
-usage printed, not judged), a real Task to `done` with a report (item 7,
-through `create_task`/`run_attempt`, not the `orch add` CLI), and a real
-planning call and probe. The rest of item 3 (no warnings, tool list, MCP,
-extensions and hooks off) and items 1, 2 and 6 are by hand.
+1. `gemini --version` is 0.65.0; every flag Nightshift passes is in
+   `gemini --help`.
+2. **Recording**: `tests/fixtures/gemini_stream.jsonl` is a real stream
+   (scripted model responses, see above).
+3. Settings and policy: the per-Task CLI home's settings load (the system
+   settings path didn't, fixed); admin policy rules load once they pass the
+   ReDoS check (fixed); tools limited to `tools.core`; the untrusted folder
+   runs headless with folder trust off (fixed); workspace settings ignored.
+4. Shell sandbox: no writes outside the Task folder (a relative write into a
+   read-only dir gets through: known gap), no reads of `~`, `~/.gemini`,
+   the CLI home or `agents_root/data`, no network; `bash` starts (fixed:
+   `/bin` links); read-only dirs readable with `read_file`, not writable
+   with `write_file`/`replace`; LinkedIn fetches and searches denied.
+5. Resume by id after SIGTERM/SIGKILL keeps the session; a resumed Attempt
+   reports only its own tokens; SIGTERM is ignored while a shell command
+   runs (SIGKILL after 15 s ends it).
+6. End to end through Nightshift (throwaway config dir and agents root):
+   `orch add ... --agent gemini --yes --simulate-rate-limit-after 2` made a
+   real planning call, the Task paused after its Steps, the next Attempt
+   resumed the same session with `--resume`, the Task finished `done` with
+   report.md, `usage_events` got one row per model per Attempt, a probe
+   recorded "available", and `orch usage` shows the Gemini `daily` Window
+   ("not reported +N w/o cost", no Baseline). `test_pause_and_resume_through_nightshift`
+   in `tests/test_gemini_cli.py` repeats it.
 
-1. `gemini --version` / `--help` from the installed CLI (0.65.0 read here).
-2. A recorded stream of a real Task (replace `gemini_stream.jsonl`).
-3. Settings and policy accepted (no warnings), tools limited to
-   `tools.core`, MCP/extensions/hooks off; that an untrusted folder still
-   runs tools headless.
-4. The shell sandbox: writes outside the Task folder, reads of `~`, of
-   `agents_root/data`, and network from the shell all refused; read-only
-   dirs readable.
-5. Resume by id after a SIGTERM; usage of a resumed Attempt.
-6. A real quota hit: save the stream and compare with the format above;
-   whether the model fallback happens headless.
-7. `orch add ... --agent gemini` to `done` on the real CLI.
-8. A real Claude -> Gemini failover (§2.8, issue #19): `test_claude_to_gemini_failover`
-   in `tests/test_gemini_real.py` (also needs the signed-in `claude` CLI).
-9. A real `posting-scan` on Gemini (issue #22): `test_posting_scan_on_gemini`
-   (also needs `NIGHTSHIFT_SCAN_REPO`, a public internship tracker repo for
-   the configured season) runs two scans in a row and checks that each
-   `output/proposed_rows.csv` merges cleanly, the Tracker has no duplicates
-   and the second report lists only its own rows. Also worth a look by hand:
-   whether `web_fetch` on a big README returns a sample, as WebFetch does on
-   Claude ("Web fetch on big pages" above).
+### Still to verify (needs model access)
+
+The account can't make model calls (`IneligibleTierError`, see the top of
+this section), so these remain. `tests/test_gemini_real.py`
+(`NIGHTSHIFT_REAL_AGENT=1`) runs them once it can; today every test there
+fails at sign-in.
+
+1. **Model access**: Google says this client is no longer supported for
+   "Gemini Code Assist for individuals" and points to Antigravity. Either
+   the AI Pro entitlement has to reach the CLI, or Gemini needs another way
+   in (a Google Cloud project with Code Assist, or the paid `gemini-api`
+   path). Not something Nightshift can fix.
+2. A real model's stream and usage counts (the recording's numbers are
+   scripted).
+3. A real quota hit: save the stream, compare with "Rate limits" above,
+   check that a Limit observation is recorded and whether the model
+   fallback rotates the session.
+4. The paid path (`gemini-api`): that the key signs in headless, that the
+   telemetry file gets one `api_response` record per call with the counts
+   above, and that recorded costs match AI Studio's billing.
+5. A real Claude -> Gemini failover (`test_claude_to_gemini_failover`) and
+   a real `posting-scan` on Gemini (`test_posting_scan_on_gemini`, needs
+   `NIGHTSHIFT_SCAN_REPO`).
+6. **The hang** (see "Known 0.65.0 bug"): until the CLI answers its own
+   sandbox-expansion request headless, an Attempt whose agent runs a failing
+   command against a denied path or the network stalls until its runtime
+   cap. Options: a stall guard in the runner (no output while no shell
+   process runs), or a newer CLI; `test_a_denied_command_that_fails_hangs_the_cli`
+   tells when it's fixed.

@@ -1,9 +1,10 @@
 """A stand-in for `gemini --output-format stream-json`: replays
 tests/fixtures/gemini_stream.jsonl and acts like an agent in the Task folder.
 
-The fixture is shaped from the gemini-cli 0.65.0 source (StreamJsonFormatter
-and nonInteractiveCli), not yet a recording: replace it with a real stream
-once the CLI is signed in on this Mac (docs/adapters.md).
+The fixture is a recording of the real gemini-cli 0.65.0 (headless,
+stream-json, Nightshift's per-Task settings) driven by scripted model
+responses (--fake-responses), since the signed-in account can't make model
+calls (docs/adapters.md); paths and the prompt are replaced.
 
 Behaviour is driven by env vars so tests can shape each Attempt:
 FAKE_GEMINI_LIMIT=1 (a quota hit at the start; once per Task folder with
@@ -25,9 +26,14 @@ from pathlib import Path
 
 prompt = sys.stdin.read()
 argv = sys.argv[1:]
+# An API error in a turn reaches the result line as type "unknown" with the
+# CLI's 429 note under Google sign-in (seen on 0.65.0); the quota text itself
+# is from the source (classifyGoogleError).
 LIMIT_TEXT = ("[API Error: You have exhausted your capacity on this model. "
-              "Your quota will reset after 2h0m0s.]")
-SID = "3f2b9c1e-7a4d-4e8b-9c2f-1d5e6a7b8c9d"
+              "Your quota will reset after 2h0m0s.]\nPossible quota limitations in place or "
+              "slow response times detected. Switching to the gemini-2.5-flash model for the "
+              "rest of this session.")
+SID = "5fffc92d-5b30-4090-b661-67f3032f772e"  # the recording's
 STATS = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cached": 0, "input": 0,
          "duration_ms": 0, "tool_calls": 0, "models": {}}
 
@@ -39,11 +45,11 @@ def emit(obj):
 def limit_hit():
     text = os.environ.get("FAKE_GEMINI_LIMIT_TEXT", LIMIT_TEXT)
     emit({"type": "result", "status": "error",
-          "error": {"type": "TerminalQuotaError", "message": text}, "stats": STATS})
+          "error": {"type": "unknown", "message": text}, "stats": STATS})
     sys.exit(173)  # process.exit(429) & 0xff
 
 
-settings = json.loads(Path(os.environ["GEMINI_CLI_SYSTEM_SETTINGS_PATH"]).read_text())
+settings = json.loads((Path(os.environ["GEMINI_CLI_HOME"]) / ".gemini" / "settings.json").read_text())
 if not settings["tools"]["core"]:
     # A planning call or a probe: no tools, no Task folder.
     if os.environ.get("FAKE_GEMINI_PROBE_LOG"):
@@ -69,12 +75,13 @@ if not settings["tools"]["core"]:
 Path("logs").mkdir(exist_ok=True)
 with open("logs/fake_gemini_invocations.jsonl", "a") as f:
     f.write(json.dumps({"argv": argv, "stdin": prompt, "env": {
-        k: v for k, v in os.environ.items() if k.startswith("GEMINI_") or k == "TMPDIR"}}) + "\n")
+        k: v for k, v in os.environ.items() if k.startswith("GEMINI_") or k in ("TMPDIR", "PATH")}})
+        + "\n")
 
 resume = argv[argv.index("--resume") + 1] if "--resume" in argv else None
 if resume and os.environ.get("FAKE_GEMINI_RESUME_FAIL"):
     print(f"Error resuming session: Invalid session identifier \"{resume}\".", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(42)  # the real CLI's exit code for a failed resume
 
 if os.environ.get("FAKE_GEMINI_LIMIT") and not (
         os.environ.get("FAKE_GEMINI_LIMIT_ONCE") and Path("logs/fake_gemini_limit_hit").exists()):

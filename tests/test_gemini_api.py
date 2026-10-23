@@ -200,7 +200,7 @@ def test_subscription_path_never_spends_or_sees_the_key(cfg, db, genv):
     [run] = _gemini_runs(new.folder)
     assert run["env"]["GEMINI_API_KEY"] == ""  # an empty key is no key to the CLI
     assert "GEMINI_TELEMETRY_OUTFILE" not in run["env"]
-    settings = json.loads(Path(run["env"]["GEMINI_CLI_SYSTEM_SETTINGS_PATH"]).read_text())
+    settings = json.loads((Path(run["env"]["GEMINI_CLI_HOME"]) / ".gemini" / "settings.json").read_text())
     assert settings["security"]["auth"]["selectedType"] == "oauth-personal"
 
 
@@ -215,7 +215,7 @@ def test_api_path_signs_in_with_the_key_and_never_logs_it(cfg, db, genv):
     [run] = _gemini_runs(new.folder)
     assert run["env"]["GEMINI_API_KEY"] == KEY
     assert run["env"]["GEMINI_TELEMETRY_LOG_PROMPTS"] == "false"
-    settings = json.loads(Path(run["env"]["GEMINI_CLI_SYSTEM_SETTINGS_PATH"]).read_text())
+    settings = json.loads((Path(run["env"]["GEMINI_CLI_HOME"]) / ".gemini" / "settings.json").read_text())
     assert settings["security"]["auth"]["selectedType"] == "gemini-api-key"
     [attempt] = db.attempts(new.spec.id)
     assert KEY not in attempt["command"]

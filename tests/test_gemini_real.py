@@ -7,6 +7,11 @@ unless ``NIGHTSHIFT_REAL_AGENT=1`` and ``gemini`` is installed and signed in
 
     NIGHTSHIFT_REAL_AGENT=1 .venv/bin/python -m pytest tests/test_gemini_real.py
 
+As of 2026-10-22 every test here fails at sign-in: Google answers this
+account with ``IneligibleTierError`` (docs/adapters.md). Until then
+tests/test_gemini_cli.py checks the same things on the real CLI with
+scripted model responses.
+
 ``NIGHTSHIFT_GEMINI_MODEL`` picks the model (default: the CLI's own).
 ``test_posting_scan_on_gemini`` also needs ``NIGHTSHIFT_SCAN_REPO``, a public
 internship tracker repo URL for the configured season.
