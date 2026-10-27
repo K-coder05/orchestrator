@@ -297,8 +297,14 @@ is ahead, else the trailing `length` (config `usage.windows.claude`:
 - Bash's `$TMPDIR` inside the sandbox is `/tmp/claude-<uid>` (writable);
   other `/tmp` paths are not.
 - The sandbox blocks writes to `.git/config` and `.git/hooks`, so `git init`
-  and `git add` fail in a Task, and `git commit` is auto-denied (needs a
-  prompt). A heredoc redirected to a file was also auto-denied.
+  fails in a Task. A heredoc redirected to a file was also auto-denied.
+  Re-checked on 2.1.311 (2026-10-27, #46): every git command first failed
+  with `fatal: unable to access '~/.gitconfig': Operation not permitted`
+  (home is unreadable). With `GIT_CONFIG_GLOBAL=/dev/null` in the agent's
+  environment and a repo Nightshift created (`git init --template=`),
+  `git add`, `git commit` and `git checkout -b` work without any allow
+  rule; `git config` (`could not lock config file`) and writing
+  `.git/hooks/pre-push` still fail.
 - Internet-on Tasks get explicit `WebFetch`/`WebSearch` allow rules so a
   fetch never hits a (auto-denied) per-domain prompt. Denied domains get both
   `WebFetch(domain:x)` and `WebFetch(domain:*.x)`; with both, `x` and `www.x`

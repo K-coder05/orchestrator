@@ -442,6 +442,34 @@ MIGRATIONS: list[str] = [
     -- What the next Attempt is told about the stuck one; cleared when it starts.
     ALTER TABLE tasks ADD COLUMN stuck_note TEXT;
     """,
+    # 19: GitHub pushes and repo creations (nightshift.github, §5 item 6).
+    """
+    -- One row per GitHub request an agent raised (needs_you.json kind
+    -- github_push or github_create_repo). Its fields are copied here when
+    -- it is decided, so what Nightshift does never depends on a file the
+    -- agent can edit later. status: refused (by Nightshift, before asking),
+    -- denied, approved (waiting for the Task's next Attempt), running,
+    -- done or failed. commits is a JSON list; commit_sha is the tip pushed.
+    -- detail is Nightshift's text (redacted), never the token.
+    CREATE TABLE github_actions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id     TEXT NOT NULL REFERENCES tasks(id),
+        approval_id INTEGER REFERENCES approvals(id),
+        run_id      INTEGER REFERENCES runs(id),
+        kind        TEXT NOT NULL,
+        repo        TEXT,
+        branch      TEXT,
+        commits     TEXT,
+        path        TEXT,
+        commit_sha  TEXT,
+        status      TEXT NOT NULL CHECK (status IN
+                    ('refused', 'denied', 'approved', 'running', 'done', 'failed')),
+        detail      TEXT,
+        created_at  TEXT NOT NULL,
+        done_at     TEXT
+    );
+    CREATE INDEX github_actions_task ON github_actions (task_id);
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -790,19 +818,24 @@ class Database:
         kind: str,
         request_sha256: str,
         request_file: str,
+        expect: TaskState = TaskState.NEEDS_YOU,
+        github: dict[str, Any] | None = None,
     ) -> int:
         """Record a decision on an agent's request and requeue the Task, all
-        in one transaction: the Task must still be in ``needs_you`` on that
+        in one transaction: the Task must still be in ``expect`` (``needs_you``;
+        ``running`` for a request Nightshift refuses before asking) on that
         request (its last Attempt is ``run_id``), else :class:`StateChanged`.
         The next Attempt continues the work (``resume_pending``) and is told
-        the decision (``request_decision_id``). Returns the approvals id."""
+        the decision (``request_decision_id``). ``github`` (columns of
+        ``github_actions``) records a GitHub request in the same transaction.
+        Returns the approvals id."""
         with self.tx() as c:
             row = c.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if row is None:
                 raise KeyError(task_id)
             current = TaskState(row["state"])
             last = c.execute("SELECT MAX(id) FROM runs WHERE task_id = ?", (task_id,)).fetchone()[0]
-            if current != TaskState.NEEDS_YOU or last != run_id:
+            if current != expect or last != run_id:
                 raise StateChanged(f"Task {task_id} is {current}; its request was already decided")
             check_transition(current, TaskState.QUEUED)
             at = self._now()
@@ -813,6 +846,9 @@ class Database:
                  request_file, run_id),
             )
             decision_id = int(cur.lastrowid)
+            if github is not None:
+                self._insert_github_action(c, task_id, at=at, approval_id=decision_id,
+                                           run_id=run_id, **github)
             c.execute(
                 "UPDATE tasks SET state = ?, state_changed_at = ?, resume_pending = 1, "
                 "request_decision_id = ? WHERE id = ?",
@@ -1190,6 +1226,57 @@ class Database:
                       (decision, task_id, draft_id))
 
     # -- Interventions (Gate 2) -----------------------------------------------------
+    # -- GitHub (nightshift.github) ----------------------------------------------
+    GITHUB_ACTION_FIELDS = ("kind", "repo", "branch", "commits", "path", "commit_sha",
+                            "status", "detail")
+
+    def _insert_github_action(self, c: sqlite3.Connection, task_id: str, *, at: str,
+                              approval_id: int | None, run_id: int | None,
+                              **fields: Any) -> int:
+        unknown = set(fields) - set(self.GITHUB_ACTION_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown github_actions fields {sorted(unknown)}")
+        cols = ["task_id", "approval_id", "run_id", "created_at", *fields]
+        cur = c.execute(
+            f"INSERT INTO github_actions ({', '.join(cols)}) "
+            f"VALUES ({', '.join('?' for _ in cols)})",
+            (task_id, approval_id, run_id, at, *fields.values()),
+        )
+        return int(cur.lastrowid)
+
+    def record_github_action(self, task_id: str, *, run_id: int | None,
+                             approval_id: int | None = None, **fields: Any) -> int:
+        """A GitHub request outside a decision (one refused for good)."""
+        with self.tx() as c:
+            return self._insert_github_action(c, task_id, at=self._now(), approval_id=approval_id,
+                                              run_id=run_id, **fields)
+
+    def github_actions(self, task_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM github_actions WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+
+    def github_action_for(self, approval_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM github_actions WHERE approval_id = ? ORDER BY id DESC LIMIT 1",
+            (approval_id,),
+        ).fetchone()
+
+    def claim_github_action(self, action_id: int) -> bool:
+        """Move an approved action to ``running``; False if it isn't approved
+        (done already, or claimed elsewhere): it is carried out at most once."""
+        with self.tx() as c:
+            cur = c.execute("UPDATE github_actions SET status = 'running' "
+                            "WHERE id = ? AND status = 'approved'", (action_id,))
+            return cur.rowcount == 1
+
+    def finish_github_action(self, action_id: int, *, status: str, detail: str,
+                             commit_sha: str | None = None) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE github_actions SET status = ?, detail = ?, done_at = ?, "
+                      "commit_sha = COALESCE(?, commit_sha) WHERE id = ?",
+                      (status, detail, self._now(), commit_sha, action_id))
+
     def record_intervention(self, *, at: str, command: str, detail: str,
                             task_id: str | None = None,
                             schedule_name: str | None = None) -> None:

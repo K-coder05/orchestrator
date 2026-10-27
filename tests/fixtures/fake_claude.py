@@ -168,6 +168,25 @@ if os.environ.get("FAKE_STUDY"):
     for f in sorted(Path(os.environ["FAKE_STUDY"]).iterdir()):
         Path("output", f.name).write_text(f.read_text())
 
+if os.environ.get("FAKE_ENV_DUMP"):
+    Path("logs/fake_env.json").write_text(json.dumps(dict(os.environ)))
+if os.environ.get("FAKE_GIT"):
+    # A coding agent: a commit in repo/ (which Nightshift set up), and with
+    # FAKE_GITHUB=push|create_repo a request to push it to FAKE_GITHUB_REPO.
+    import subprocess
+    n = len(list(Path("repo").glob("app*.py"))) + 1
+    Path(f"repo/app{n}.py").write_text(f"print({n})\n")
+    subprocess.run(["git", "-C", "repo", "add", "."], check=True)
+    subprocess.run(["git", "-C", "repo", "commit", "-qm", f"Add app{n}"], check=True)
+    sha = subprocess.run(["git", "-C", "repo", "rev-parse", "HEAD"], check=True,
+                         capture_output=True, text=True).stdout.strip()
+    if os.environ.get("FAKE_GITHUB"):
+        Path("needs_you.json").write_text(json.dumps({
+            "kind": "github_" + os.environ["FAKE_GITHUB"], "summary": "Push my work",
+            "details": "", "proposed_action": "push main",
+            "repo": os.environ.get("FAKE_GITHUB_REPO", "octo/app"), "branch": "main",
+            "commits": json.loads(os.environ.get("FAKE_GITHUB_COMMITS") or "null") or [sha]}))
+
 result = os.environ.get("FAKE_RESULT", "done")
 if result != "none":
     Path("output/haiku.txt").write_text("quiet night\n")

@@ -33,6 +33,7 @@ NIGHTSHIFT_OWNED = {8, 9}
 PLACEHOLDER = "_(not written yet)_"
 NIGHTSHIFT_PLACEHOLDER = "_(filled in by Nightshift when the Task finishes)_"
 APPENDIX_HEADING = "## Appendix (written by Nightshift)"
+GITHUB_HEADING = "### GitHub pushes and repo creations"
 
 
 def skeleton(title: str) -> str:
@@ -187,6 +188,11 @@ def request_text(path: Path) -> str | None:
     if not isinstance(d, dict):
         return "- The agent wrote `needs_you.json`; check the Task folder."
     out = f"- **{d.get('kind', 'request')}:** {d.get('summary', '')}".rstrip()
+    from . import github  # github imports the config and DB layers
+
+    if (does := github.describe_request(d)) is not None:
+        # What approving it makes Nightshift do, in Nightshift's words.
+        out = f"- **{d['kind']}:** {does}.\n  Agent's summary: {d.get('summary', '')}".rstrip()
     if d.get("proposed_action"):
         out += f"\n  Proposed action: {d['proposed_action']}"
     return out
@@ -252,13 +258,16 @@ def finalize(
     paid_credits: list[str] | None = None,
     resolved: list[str] | None = None,
     stuck: list[str] | None = None,
+    github: list[str] | None = None,
 ) -> str:
     """Rewrite ``report.md`` from the agent's draft plus Nightshift's data.
 
     ``needs_you`` are entries Nightshift itself adds to section 2 (e.g. a
     deadline-driven failover); they lead the section, and ``resolved``
     (decided "needs you" requests) close it. ``spent`` and
-    ``paid_credits`` and ``stuck`` go to section 8 (:func:`usage_section`)."""
+    ``paid_credits`` and ``stuck`` go to section 8 (:func:`usage_section`).
+    ``github`` (pushes and repo creations, ``nightshift.github``) is listed
+    in the appendix."""
     path = folder / "report.md"
     draft = path.read_text() if path.exists() else ""
     head, sections = parse_sections(draft)
@@ -290,6 +299,9 @@ def finalize(
     parts = [head, ""]
     for i, heading in enumerate(SECTIONS, start=1):
         parts += [f"## {heading}", "", body[i], ""]
+    if github:
+        block = GITHUB_HEADING + "\n\n" + "\n".join(github)
+        appendix = f"{appendix.strip()}\n\n{block}" if appendix else block
     # Unnumbered, so a later finalize reads it as part of section 9 (which
     # Nightshift rewrites) and it is never duplicated.
     if appendix:

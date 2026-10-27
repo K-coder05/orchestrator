@@ -2952,3 +2952,93 @@ shipped cap of 1.
   start (04:50:24, done 04:50:39). All three `done`, one Attempt each,
   37 s for the queue against about 50 s one at a time.
 - **Not done here:** GitHub (#46).
+
+## Phase 3, issue #46: GitHub (scoped token, pushes approved through the inbox)
+
+- **The token** is the secret `GITHUB_TOKEN` (`.env` or the Keychain
+  service `nightshift`), a fixed name like `TELEGRAM_BOT_TOKEN`. It is
+  registered for redaction when loaded. git gets it from a credential helper
+  that reads an inherited pipe (`echo`/`printf`/`cat <&fd`), so it is never
+  in argv, the environment, a URL or a file. API calls (create a repo) send
+  it in a header from Nightshift's process. `orch doctor` has a GitHub
+  section: `ok` or `NOT SET` plus the allowed repos. A missing token counts
+  as unset only when `github.repos` isn't empty.
+- **Config `github:`**: `repos` (the allowlist, `owner/name`, case-insensitive;
+  empty means GitHub is off), `git_task_types` (`[coding]`), `commit_name`/
+  `commit_email` (null: your `git config --global` identity, read when the
+  repo is set up), `timeout_seconds` (60). A `token` key is refused, with a
+  pointer to `.env`.
+- **Local commits (relaxing the `.git` block "only as far as needed").** The
+  real blocker turned out to be `~/.gitconfig`: the sandbox can't read home,
+  so every git command failed. Claude's protection of `.git/config` and
+  `.git/hooks` is kept, because it stops an agent from planting hooks or
+  config. Instead (1) Nightshift creates `repo/` in a coding Task's folder
+  before the agent starts (`git init -b main --template=`: no hooks; your
+  identity; `core.hooksPath`/`excludesFile`/`attributesFile` = `/dev/null`),
+  and (2) every agent gets `GIT_CONFIG_GLOBAL=/dev/null` and
+  `GIT_CONFIG_NOSYSTEM=1` (Codex through `shell_environment_policy.set`).
+  No allow rule, no unsandboxed command. Verified on real Claude Code
+  2.1.311 (haiku): add, commit and checkout -b work; `git config` and a
+  hook write fail. Codex was checked with `codex sandbox`: commits work,
+  but its profile doesn't protect `.git/config` (recorded as a gap).
+- **The request.** `needs_you.json` with `kind` `github_push` or
+  `github_create_repo` plus top-level `repo`, `branch`, `commits` (the
+  branch tip among them) and optional `path` (default `repo`). The
+  protocol's new rule 7 (git Tasks only) explains this and lists the
+  allowed repos. A creation may also name a branch to push to the new repo.
+- **Refused before asking** when the Attempt ends: malformed, not on
+  `github.repos`, token not set, branch missing, a named commit not on the
+  branch, or a tip that isn't named. That is recorded as an `approvals` row
+  denied `via: nightshift`, with the same requeue and "told once" path as
+  #35, so it never reaches the inbox or Telegram. The transition reason is
+  generic: repo and branch names are the agent's text and stay out of it,
+  as #35 kept `kind` out. That way the clean-week check doesn't count it as
+  a hand intervention. A **second** refusal in one Task fails the Task, so
+  an agent can't loop all night.
+- **Deciding** is the ordinary approve/deny. `needsyou.resolve` copies the
+  request's fields into the new `github_actions` table (migration 19) in
+  the decision's transaction. What gets pushed then comes from the DB, not
+  from a file the agent could edit later. The inbox (dashboard, report
+  section 2, the Telegram alert line) shows Nightshift's own description,
+  "Nightshift will push branch main of repo/ to github.com/o/r (tip abc…,
+  N commits named; never forced)", so a misleading agent summary can't hide
+  the target.
+- **When the push happens: when the Task's next Attempt starts, before the
+  agent does** (`github.carry_out` in `run_attempt`), not inside the approve
+  call. This choice avoids two races. A push done at approve time could
+  race the daemon picking up the requeued Task (the agent wouldn't hear the
+  outcome). It could also race a concurrent deny (pushed but recorded
+  denied). The runner owns the Task, and the `approved → running` claim
+  makes it at most once. The outcome (done, failed with a redacted error,
+  or not done because a re-check failed) is told to that Attempt. The cost
+  is that the push waits until the Task runs again, normally right away.
+  Approving says so.
+- **How it pushes.** The branch is fetched over `file://` into a bare
+  mirror at `data/github/<task>.git`, which agents can't reach, and checked
+  there. It is pushed from the mirror as `<tip>:refs/heads/<branch>`, never
+  forced. Nightshift never runs git inside the agent-writable repo: only
+  upload-pack reads it, and upload-pack ignores the repo's hooks and pack
+  hooks (a test plants them). Nightshift's git runs with no system or
+  global config, no prompts, `core.hooksPath=/dev/null` and a reset
+  `credential.helper`.
+- **New repos** are `POST /user/repos` (or `/orgs/<owner>/repos` when the
+  owner isn't the token's user) with `"private": true`. A reply that
+  doesn't say private is an error.
+- **Report**: an appendix block "GitHub pushes and repo creations" lists
+  every request with its outcome (done, failed, denied, refused, approved
+  but not yet done). Resolved requests also appear in Needs you, as before.
+- **Tests** (`tests/test_github.py`): a fake GitHub client that pushes to
+  local bare repos, with real git and the fake Claude committing in `repo/`.
+  Covered: approve then push end to end (token in no file under
+  `agents_root` or the DB, nor in the agent's environment, even with
+  `GH_TOKEN` and a variable holding the token in the daemon's environment);
+  deny via Telegram; refusal before asking, then failing; create private,
+  then push; a failed push with the token in the error (redacted); the
+  allowlist re-checked at push time; bad requests; commit and tip matching;
+  planted hooks don't run; the real client pushing to a local bare repo
+  with argv and env spied; the credential helper; create-repo requests
+  (private, org endpoint, a non-private reply); API errors redacted;
+  config; doctor; protocol; Codex env.
+- **Real push to a scratch repo: not done yet.** This agent's instructions
+  forbid any GitHub write. Run it yourself to tick the last acceptance
+  criterion, and record the result here.

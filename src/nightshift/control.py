@@ -54,7 +54,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import daemon, failures, ical, needsyou, pauses, planning, schedules, templates
+from . import daemon, failures, github, ical, needsyou, pauses, planning, schedules, templates
 from . import priority as prio
 from .adapters.base import Usage
 from .config import Config, ConfigError
@@ -304,6 +304,7 @@ def _decide(cfg: Config, db: Database, task_id: str, approve_it: bool, via: str,
 def _decide_request(cfg: Config, db: Database, row: Any, approve_it: bool, via: str) -> Result:
     """Resolve the agent's request; approved or denied, the Task is requeued."""
     task_id, state = row["id"], TaskState.NEEDS_YOU
+    asked = needsyou.read_request(Path(row["folder"])) or {}
     try:
         needsyou.resolve(cfg, db, task_id, approved=approve_it, via=via, at=now(cfg.timezone))
     except needsyou.NotARequest:
@@ -313,6 +314,10 @@ def _decide_request(cfg: Config, db: Database, row: Any, approve_it: bool, via: 
                        task_id, state)
     except StateChanged as exc:  # decided or moved meanwhile
         return refused(STATE_CHANGED, str(exc), task_id, state)
+    if approve_it and github.is_github(asked):
+        msg = (f"Task {task_id}: GitHub request approved; queued. Nightshift does it when "
+               "the Task's next Attempt starts, and tells the agent the outcome.")
+        return Result(APPROVED, msg, task_id, state, TaskState.QUEUED, note=daemon_note(cfg))
     if approve_it:
         msg = f"Task {task_id}: request approved; queued, its next Attempt goes ahead."
         return Result(APPROVED, msg, task_id, state, TaskState.QUEUED, note=daemon_note(cfg))

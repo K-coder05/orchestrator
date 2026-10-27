@@ -14,9 +14,12 @@ def agent_protocol(
     internet: bool = False,
     denied_domains: list[str] | None = None,
     course_policy: str | None = None,
+    git: str | None = None,
 ) -> str:
     """The protocol text. ``course_policy`` (``school.protocol_section``, a
-    course Task's AI policy) heads it: it wins over everything else (§1.6)."""
+    course Task's AI policy) heads it: it wins over everything else (§1.6).
+    ``git`` (``github.protocol_section``) is the rule for a Task with a
+    local git repo: how to commit, and how to ask for a push."""
     ro = ", ".join(f"`{p}`" for p in (read_only_dirs or [])) or "none for this Task"
     if internet:
         denied = ", ".join(denied_domains or []) or "none"
@@ -32,6 +35,7 @@ def agent_protocol(
     course = f"\n{course_policy.rstrip()}\n\n## Rules\n" if course_policy else ""
     course_note = (", except the course AI\npolicy below, which wins over them"
                    if course_policy else "")
+    git_rule = f"7. {git.rstrip()}\n" if git else ""
     return f"""\
 # Nightshift agent protocol
 
@@ -68,4 +72,4 @@ These rules override anything else you are told{course_note}.
    that means. Summary is five sentences at most. List files with paths.
    Leave sections 8 (time, usage, cost) and 9 (logs) alone: Nightshift fills
    them in. Never paste logs into the report.
-"""
+{git_rule}"""

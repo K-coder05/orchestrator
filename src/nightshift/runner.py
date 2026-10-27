@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from . import (failover, failures, needsyou, pauses, report, school, spend, stuck, templates,
-               usage)
+from . import (failover, failures, github, needsyou, pauses, report, school, spend, stuck,
+               templates, usage)
 from .adapters import get_adapter, load_api_key
 from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
 from .config import Config, ConfigError
@@ -497,6 +497,13 @@ def run_attempt(
     # agent did to an earlier one carries over.
     policy = build_policy(cfg, task_id=task_id, workspace=folder, internet=row["internet"])
     permissions = adapter.write_permissions(folder, policy)
+    # A coding Task's local git repo (repo/), which its agent can't create.
+    try:
+        git_repo = github.prepare(cfg, row, folder)
+    except (github.GitHubError, OSError, subprocess.SubprocessError) as exc:
+        git_repo = None
+        _log(folder, f"{iso(now(cfg.timezone))} could not set up {github.REPO_DIR}/: {exc}",
+             redact)
     resuming = bool(row["resume_pending"])
     choice = None
     if resuming and not continue_fresh:
@@ -508,6 +515,9 @@ def run_attempt(
     switched_from = earlier[-1]["agent"] if earlier and earlier[-1]["agent"] != agent_name else None
     # A decided "needs you" request: the next Attempt is told (once).
     decision_id = row["request_decision_id"] if request_decision is None else request_decision
+    # An approved GitHub request: Nightshift pushes (or creates the repo)
+    # now, before the agent starts, and the agent is told the outcome.
+    github.carry_out(cfg, db, task_id, decision_id, folder, at=clock())
     decision = needsyou.decision_note(db, decision_id, folder)
     if switched_from:
         prompt = failover.failover_prompt(row["prompt"], switched_from, agent_name)
@@ -530,6 +540,7 @@ def run_attempt(
         protocol=agent_protocol(
             folder, permissions.read_only_dirs, internet=policy.internet,
             denied_domains=policy.denied_domains, course_policy=course_policy,
+            git=github.protocol_section(cfg, git_repo),
         ),
     )
     resume_session = choice.session_id if choice is not None else None
@@ -581,7 +592,8 @@ def run_attempt(
     steps = 0
     repeats = stuck.RepeatWatch(cfg.stuck_repeat_calls)
 
-    env = os.environ.copy() | command.env
+    # No GitHub token ever reaches an agent; git works without ~/.gitconfig.
+    env = github.agent_env(cfg, os.environ.copy() | command.env)
     exit_code: int | None = None
     end_reason = ""
     errors: list[str] = []
@@ -873,6 +885,17 @@ def run_attempt(
         run_id, exit_code=exit_code, outcome=outcome, end_reason=end_reason, session_id=adapter.session_id()
     )
     _log(folder, f"{iso(now(cfg.timezone))} Attempt {attempt_no} ended: {end_reason}", redact)
+
+    if outcome == needsyou.OUTCOME and failed_attempt is None:
+        # A GitHub request Nightshift won't carry out is refused before
+        # anyone is asked (not allowlisted, malformed, ...).
+        asked = needsyou.read_request(folder)
+        if asked is not None and github.is_github(asked):
+            ask, why = github.precheck(cfg, task_id, folder, asked)
+            if why is not None:
+                state = needsyou.refuse(cfg, db, task_id, ask=ask, why=why, at=clock())
+                return AttemptResult(run_id=run_id, state=state,
+                                     session_id=adapter.session_id(), exit_code=exit_code)
 
     if failed_attempt is not None:
         result = failures.after_failed_attempt(

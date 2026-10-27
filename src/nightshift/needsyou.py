@@ -20,6 +20,13 @@ same control from Telegram (``nightshift.control``), resolve that request:
 
 A Task in ``needs_you`` for another reason (the per-Task spend cap) has no
 request to decide: approve and deny refuse it, and it keeps its own handling.
+
+A GitHub request (kind ``github_push`` / ``github_create_repo``,
+``nightshift.github``) is decided the same way; its fields go to
+``github_actions`` with the decision, and an approved one is carried out by
+Nightshift when the next Attempt starts. One Nightshift refuses before asking
+(:func:`refuse`: not on the allowlist, malformed, ...) is recorded as denied
+``via: nightshift`` and requeued the same way, without reaching the inbox.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import failures, report
+from . import failures, github, report
 from .config import Config
 from .db import Database
 from .states import TaskState
@@ -41,6 +48,8 @@ from .timeutil import iso
 OUTCOME = "needs_you"
 #: ``approvals.subject`` of a decision on a request.
 SUBJECT = "request"
+#: ``approvals.via`` of a request Nightshift refused before asking anyone.
+VIA_NIGHTSHIFT = "nightshift"
 
 
 class NotARequest(Exception):
@@ -82,6 +91,14 @@ def _field(d: dict[str, Any], key: str) -> str | None:
     if v is None or v == "":
         return None
     return " ".join((v if isinstance(v, str) else json.dumps(v)).split())
+
+
+def read_request(folder: Path) -> dict[str, Any] | None:
+    """The agent's ``needs_you.json`` as a dict ({} if it isn't one); None if none."""
+    try:
+        return _parse((folder / report.REQUEST_FILE).read_bytes())
+    except OSError:
+        return None
 
 
 def archive_path(folder: Path, attempt_no: int) -> Path:
@@ -127,7 +144,8 @@ def resolve(cfg: Config, db: Database, task_id: str, *, approved: bool, via: str
     reason = f"needs-you request {word} ({via}); queued, the next Attempt is told"
     db.decide_request(task_id, approved=approved, via=via, reason=reason, run_id=req.run_id,
                       kind=req.kind, request_sha256=req.sha256,
-                      request_file=str(kept.relative_to(folder)))
+                      request_file=str(kept.relative_to(folder)),
+                      github=_github_fields(req.data, approved))
     req.path.unlink(missing_ok=True)
     redact = cfg.secrets.redact
     failures.log_line(folder, f"{iso(at)} {reason}; request kept in {kept.relative_to(folder)}",
@@ -135,6 +153,64 @@ def resolve(cfg: Config, db: Database, task_id: str, *, approved: bool, via: str
     report.refresh_needs_you(folder, needs_you=failures.needs_you_extra(cfg, db, task_id),
                              resolved=report_lines(db, task_id, folder), redact=redact)
     return reason
+
+
+def _github_fields(data: dict[str, Any], approved: bool) -> dict[str, Any] | None:
+    """The ``github_actions`` row a decision on a GitHub request records."""
+    if not github.is_github(data):
+        return None
+    try:
+        fields = github.parse(data).fields()
+    except github.RequestError as exc:
+        return {"kind": data["kind"], "status": github.DENIED if not approved else github.FAILED,
+                "detail": f"not done: not a valid GitHub request: {exc}"}
+    return fields | {"status": github.APPROVED if approved else github.DENIED}
+
+
+def refuse(cfg: Config, db: Database, task_id: str, *, ask: github.Ask | None, why: str,
+           at: datetime) -> TaskState:
+    """Refuse, before asking anyone, the GitHub request the Task's running
+    Attempt just raised (it has finished with outcome ``needs_you``): record
+    it denied ``via: nightshift`` and requeue the Task, whose next Attempt is
+    told why. The :data:`github.REFUSAL_LIMIT`-th refusal fails the Task
+    instead. Returns the Task's new state."""
+    row = db.get_task(task_id)
+    folder = Path(row["folder"])
+    last = db.attempts(task_id)[-1]
+    path = folder / report.REQUEST_FILE
+    raw = path.read_bytes()
+    req = Request(run_id=last["id"], attempt_no=last["attempt_no"], path=path, raw=raw)
+    kept = archive_path(folder, req.attempt_no)
+    kept.parent.mkdir(parents=True, exist_ok=True)
+    kept.write_bytes(raw)
+    redact = cfg.secrets.redact
+    why = redact(why)
+    fields = (ask.fields() if ask is not None else {"kind": req.kind}) | {
+        "status": github.REFUSED, "detail": why}
+    refused = sum(1 for a in db.github_actions(task_id) if a["status"] == github.REFUSED)
+    if refused + 1 >= github.REFUSAL_LIMIT:
+        db.record_github_action(task_id, run_id=req.run_id, **fields)
+        path.unlink(missing_ok=True)
+        reason = (f"Attempt {req.attempt_no} raised a GitHub request Nightshift refuses, "
+                  f"{refused + 1} in this Task; failed (see the report)")
+        failures.finalize(cfg, db, row, TaskState.FAILED, reason, at=at)
+        failures.log_line(folder, f"{iso(at)} GitHub request refused: {why}", redact)
+        db.transition(task_id, TaskState.FAILED, reason, run_id=req.run_id)
+        return TaskState.FAILED
+    # The why holds names the agent chose (repo, branch): it goes to the
+    # log, the report and the next prompt, not the transition reason.
+    reason = ("GitHub request refused by Nightshift before asking; queued, "
+              "the next Attempt is told why")
+    db.decide_request(task_id, approved=False, via=VIA_NIGHTSHIFT, reason=reason,
+                      run_id=req.run_id, kind=req.kind, request_sha256=req.sha256,
+                      request_file=str(kept.relative_to(folder)), expect=TaskState.RUNNING,
+                      github=fields)
+    path.unlink(missing_ok=True)
+    failures.log_line(folder, f"{iso(at)} {reason}: {why}; request kept in "
+                              f"{kept.relative_to(folder)}", redact)
+    report.refresh_needs_you(folder, needs_you=failures.needs_you_extra(cfg, db, task_id),
+                             resolved=report_lines(db, task_id, folder), redact=redact)
+    return TaskState.QUEUED
 
 
 def _decisions(db: Database, task_id: str) -> list[Any]:
@@ -159,6 +235,10 @@ def report_lines(db: Database, task_id: str, folder: Path) -> list[str]:
             line += f": {summary}"
         if action := _field(d, "proposed_action"):
             line += f" (proposed: {action})"
+        if a["via"] == VIA_NIGHTSHIFT:
+            out.append(f"{line}. Refused by Nightshift before asking, at {a['at']}; "
+                       "the Task was requeued.")
+            continue
         out.append(f"{line}. {a['decision'].capitalize()} via {a['via']} at {a['at']}; "
                    "the Task was requeued.")
     return out
@@ -178,6 +258,11 @@ Nightshift: you stopped and raised a "needs you" request, and the user \
 DENIED it. Don't take that action. Carry on with the Task without it; if the \
 Task can't be done without it, write a different request to `needs_you.json` \
 and stop."""
+
+REFUSED_NOTE = """\
+Nightshift: you stopped and raised a "needs you" request, and Nightshift \
+REFUSED it without asking the user. Don't take that action. Carry on with the \
+Task without it; if the Task can't be done without it, say so in the report."""
 
 RESUME_TAIL = """\
 Continue where you left off: check `progress.md` first and don't redo \
@@ -200,12 +285,16 @@ def decision_note(db: Database, decision_id: int | None, folder: Path) -> str | 
     if a is None:
         return None
     d = _kept(folder, a)
-    lines = [APPROVED_NOTE if a["decision"] == "approved" else DENIED_NOTE, "",
+    head = (REFUSED_NOTE if a["via"] == VIA_NIGHTSHIFT
+            else APPROVED_NOTE if a["decision"] == "approved" else DENIED_NOTE)
+    lines = [head, "",
              "Your request was:", f"- kind: {a['request_kind'] or 'request'}"]
     for key, label in (("summary", "summary"), ("details", "details"),
                        ("proposed_action", "proposed action")):
         if value := _field(d, key):
             lines.append(f"- {label}: {value}")
+    if outcome := github.outcome_note(db, decision_id):
+        lines += ["", outcome]
     return "\n".join(lines)
 
 

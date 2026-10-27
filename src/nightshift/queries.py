@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import priority, schedules, spend, stuck, usage
+from . import github, priority, schedules, spend, stuck, usage
 from .adapters import is_paid
 from .config import Config
 from .db import Database
@@ -172,6 +172,10 @@ def _request(cfg: Config, db: Database, row: sqlite3.Row) -> NeedsYouRequest:
             summary = _text(asked.get("summary")) or reason
             details = _text(asked.get("details"))
             action = _text(asked.get("proposed_action"))
+            # A GitHub request: what approving makes Nightshift do, in its
+            # own words (the agent's summary could say anything).
+            if (does := github.describe_request(asked)) is not None:
+                action = does
     elif state == TaskState.AWAITING_APPROVAL:
         if from_state == TaskState.PAUSED_USAGE:
             kind = "re-approval"

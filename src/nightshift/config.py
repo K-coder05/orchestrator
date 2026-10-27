@@ -580,10 +580,11 @@ def _validate(data: dict[str, Any]) -> None:
         raise ConfigError("wake.days must be letters from MTWRFSU, e.g. MTWRF")
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d:[0-5]\d", str(wake.get("time", "01:55:00"))):
         raise ConfigError("wake.time must be HH:MM:SS (24-hour), e.g. 01:55:00")
-    from . import comedy, school  # late: they import this module
+    from . import comedy, github, school  # late: they import this module
 
     school.validate(data)
     comedy.validate(data)
+    github.validate(data)
 
 
 def load_config(

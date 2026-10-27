@@ -22,6 +22,7 @@ and a resume is the same with ``resume <thread id> -`` at the end.
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 from collections.abc import Callable
@@ -301,7 +302,10 @@ class CodexAdapter(AgentAdapter):
             "history.persistence": "none",
             "shell_environment_policy.inherit": "core",
             "shell_environment_policy.ignore_default_excludes": False,
-            "shell_environment_policy.set": {"TMPDIR": str(policy.workspace / ".tmp")},
+            # git works without your ~/.gitconfig (unreadable here).
+            "shell_environment_policy.set": {"TMPDIR": str(policy.workspace / ".tmp"),
+                                             "GIT_CONFIG_GLOBAL": os.devnull,
+                                             "GIT_CONFIG_NOSYSTEM": "1"},
         }
         (policy.workspace / ".tmp").mkdir(parents=True, exist_ok=True)
         policy.settings_dir.mkdir(parents=True, exist_ok=True)

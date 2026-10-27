@@ -276,7 +276,7 @@ Schedule controls (`POST /schedules/<name>/enable|disable|edit`), which call
 
 | Limit | Status | How |
 |---|---|---|
-| Push to GitHub, deploy, send messages, post, submit applications or coursework, log into accounts | **Technically enforced** for anything that needs network from the shell; **instruction-only** through the web tools | Shell commands have no network. WebFetch only reads pages (no forms, no POSTs). The protocol tells the agent to raise `needs_you.json`. `git push`, `gh` are also on the Bash deny-list. |
+| Push to GitHub, deploy, send messages, post, submit applications or coursework, log into accounts | **Technically enforced** for anything that needs network from the shell; **instruction-only** through the web tools | Shell commands have no network. WebFetch only reads pages (no forms, no POSTs). The protocol tells the agent to raise `needs_you.json`. `git push`, `gh` are also on the Bash deny-list. Pushes and new repos are done by Nightshift, only after you approve (see GitHub below). |
 | Submit a job application (`resume-tailor`) | **Technically enforced** that it can't (no tool can submit: WebFetch only reads, shell has no network, no MCP or browser tools); **instruction-only** beyond that | The template prompt says never to submit, fill in forms, log in or contact anyone, and to say in Needs you that the application is ready for you to submit. |
 | Spend money | **Technically enforced** that only `--agent gemini-api` Tasks spend, and that one stops at `spend.per_task_usd` ($2); **instruction-only** for anything else an agent might pay for | Subscription agents never get an API key: the Gemini plan path pins `security.auth.selectedType: oauth-personal` and blanks `GEMINI_API_KEY`/`GOOGLE_API_KEY`. On the API path every model call is read from the CLI's telemetry file, priced and recorded in `spend_events`; the Task is stopped (SIGTERM) and moved to `needs_you` once it reaches the cap. Gap: the CLI writes calls in batches every ~5 s, so a call or two may land after the cap before the stop, and prices are config placeholders (`spend.gemini_api_prices`). Daily and monthly caps are issue #25. |
 | The AI Studio API key | **Technically enforced** | A secret (`.env` or Keychain, `agents.gemini-api.api_key_secret`), passed only in the CLI's environment, never in argv or settings files; registered for redaction, so it never reaches logs, stored commands or reports. Shell commands get it redacted from their environment (`security.environmentVariableRedaction`). The telemetry file sits in the agent-inaccessible settings folder and logs no prompts. |
@@ -304,6 +304,35 @@ Schedule controls (`POST /schedules/<name>/enable|disable|edit`), which call
 | Bot token and user ID never logged or written into reports | **Technically enforced** | The token comes from `.env` or the Keychain (`TELEGRAM_BOT_TOKEN`); the user ID is registered with the same redaction as secrets, applied to the daemon log, reports and alert texts. Bot API errors are built from the method and status, never the request URL (which holds the token). |
 | A Telegram outage never fails or blocks a Task | **Technically enforced** | Alerts go to the `alerts` outbox first and are sent from their own daemon thread; a failed send is retried (backing off) until `telegram.alert_max_age_hours`, then dropped and logged. |
 
+### GitHub (§5 item 6)
+
+Agents commit locally; only Nightshift talks to GitHub, and only for a
+request you approved (`nightshift.github`).
+
+**Technically enforced:**
+
+| Limit | Status | How |
+|---|---|---|
+| No agent can push or reach GitHub | **Technically enforced** (verified for Claude) | Shell commands have no network on any agent; `git push` and `gh` are also on the Bash deny-list. The agent has no token (below). |
+| The token never reaches an agent, a file, the DB, a log or a report | **Technically enforced** (tested) | A secret (`GITHUB_TOKEN` in `.env` or the Keychain), registered for redaction when loaded. Every agent's environment drops `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GITHUB_PAT`, `GH_PAT` and any variable holding the token's value. git gets it from a credential helper that reads an inherited pipe (shell builtins only), so it is never in any process's argv or environment, a URL or a file; API calls send it in a header from Nightshift's own process. A test runs push, approve and push end to end and finds the token in no file under `agents_root` (the DB included) and not in the agent's environment; another spies on the real client's git call. |
+| Every push or new repo goes through the inbox | **Enforced by Nightshift** | Only an approval of a `github_push` / `github_create_repo` request (CLI, Telegram or dashboard, `nightshift.control`) leads to one. A denial requeues the Task and nothing is pushed. |
+| Repos not on `github.repos` are refused before asking | **Enforced by Nightshift** (tested) | Checked when the Attempt ends (with a malformed request, a missing token, or commits that don't match the local repo); the Task is requeued and told why, `via: nightshift`, and never reaches the inbox. A second refusal fails the Task. Checked again just before the push. |
+| What is pushed is what you saw | **Enforced by Nightshift** | The inbox shows Nightshift's own description (repo, branch, tip commit), not just the agent's summary. The request's fields are copied into the DB when you decide; the branch is fetched into Nightshift's mirror and its tip must be one of the named commits. Never forced (`sha:refs/heads/branch`, no `+`, no `--force`): a push that isn't a fast-forward fails and the agent is told. |
+| Nothing in the agent's repo runs with the token | **Technically enforced** (tested) | Nightshift never runs git inside the Task's repo. It fetches the branch over `file://` (upload-pack ignores the repo's hooks and `uploadpack.packObjectsHook`) into a bare mirror in the data dir, and pushes from the mirror with no system or global config and `core.hooksPath=/dev/null`. A test plants hooks, `core.fsmonitor` and a pack hook in the Task repo; none runs. |
+| New repos are private | **Enforced by Nightshift** (tested with a fake API) | Created with `"private": true`; a reply that doesn't say private is reported as an error ("check its visibility now"). Nightshift never makes a repo public. |
+
+**Local commits (§1.6 allows them):**
+
+| Limit | Status | How |
+|---|---|---|
+| Agents can commit, branch and log | **Allowed** (verified on real Claude Code 2.1.311, haiku, 2026-10-27) | Task types in `github.git_task_types` (coding) get `repo/`, set up by Nightshift with no hooks (`--template=`), your git identity and `core.hooksPath=/dev/null`. Every agent gets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` (its sandbox can't read `~/.gitconfig`, which made every git command fail before). The sandbox itself is unchanged: no new allow rule and no unsandboxed command. |
+| The agent can't change `.git/config` or add hooks | **Technically enforced for Claude** (verified); **gap for Codex** | Claude Code's sandbox protects `.git/config` and `.git/hooks` (`git config` and writing `hooks/pre-push` both failed), which is also why it can't `git init`. Codex's profile doesn't protect them (verified with `codex sandbox`). Nightshift's push never runs anything from that repo, but **don't run git commands in a Codex Task's `repo/` yourself without checking its `.git/config` and hooks first.** |
+| Codex Tasks can commit | **Allowed** (verified with `codex sandbox`, 0.163.0) | `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_NOSYSTEM` set through `shell_environment_policy.set`. |
+| Gemini Tasks | **No git** | Unchanged: the CLI denies git in an untrusted folder. |
+| Pushing to an existing repo's history | **Gap** | `repo/` starts empty and Tasks have no network, so an agent can't fetch an existing repo's history. A push to a new branch works; one onto an existing branch fails as not a fast-forward. |
+| The push or repo creation happens when the next Attempt starts | **By design** | Approving requeues the Task. Nightshift does the push before that Attempt's agent starts, exactly once (the DB claim), and tells the agent the outcome. An Attempt that dies mid-push leaves it `running`, and the report says to check GitHub. |
+| The token's own scope | **Your setup** | Nightshift's allowlist is a second limit; the fine-grained token's repository selection is the first. |
+
 ## Known gaps and side effects
 
 - **Settings that fail validation are silently ignored** by `claude -p`
@@ -311,12 +340,10 @@ Schedule controls (`POST /schedules/<name>/enable|disable|edit`), which call
   sandbox without any error. Mitigations: the generated shape is pinned by
   tests, and the real-agent tests prove the limits hold; re-run them after
   upgrading Claude Code.
-- **Local git commits don't work inside a Task.** Claude Code's sandbox
-  blocks writes to `.git/config` and `.git/hooks`, so `git init` and `git add`
-  fail, and `git commit` needs a permission prompt that is auto-denied.
-  §1.6 allows local commits, so this is stricter than the spec. Revisit when
-  coding Tasks need commits (for example by running git outside the sandbox
-  with tight allow rules).
+- **Local git commits work only in the repo Nightshift sets up** (`repo/`
+  of a coding Task; see GitHub above). Claude Code's sandbox still blocks
+  writes to `.git/config` and `.git/hooks`, so an agent can't `git init` a
+  repo of its own.
 - **Some shell constructs need approval and are auto-denied**, for example a
   heredoc written to a file. The agent protocol tells agents to write
   files with their file-writing tool instead.

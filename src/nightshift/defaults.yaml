@@ -471,5 +471,24 @@ telegram:
   # (`timezone`). Asleep then: sent once on wake, never twice.
   digest_time: "08:00"
 
+github:
+  # GitHub (§5 item 6). Agents commit locally; they can't push or reach
+  # GitHub. To push, or to create a repo, an agent raises a "needs you"
+  # request (kind github_push / github_create_repo); once you approve it,
+  # Nightshift does it itself with a fine-grained token stored as the secret
+  # GITHUB_TOKEN (.env or the Keychain), which no agent ever gets.
+  # The repos (owner/name) Nightshift may push to or create. A request for
+  # any other repo is refused without asking you. Empty: GitHub is off.
+  repos: []
+  # Task types whose Task folder gets a local git repo (repo/), set up by
+  # Nightshift, that the agent commits to.
+  git_task_types: [coding]
+  # The author of the agent's commits. null: your own `git config --global`
+  # user.name / user.email, read when the repo is set up.
+  commit_name: null
+  commit_email: null
+  # Each GitHub API call or git push gives up after this long.
+  timeout_seconds: 60
+
 secrets:
   keychain_service: nightshift
