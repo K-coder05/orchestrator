@@ -1,5 +1,5 @@
 """Task control (§2.4, §2.6, §2.7, §5 items 1-2): the one layer behind every
-surface that changes a Task by hand.
+surface that changes a Task (or a Schedule) by hand.
 
 ``orch approve|deny|cancel|pause|resume|retry|priority|add``, Telegram and
 the dashboard all call these functions. Each looks the Task up, checks its
@@ -33,6 +33,13 @@ Intake is split so a caller without a terminal can drive it step by step:
 Task), then :func:`create` or :func:`decline`, then for a Task over the plan
 threshold :func:`plan` (``plan.md``) and :func:`approve` or :func:`deny`.
 
+Schedule controls (§2.5): :func:`edit_schedule` (`orch schedule edit`,
+the dashboard's edit form) changes a Schedule's timing, Catch-up and
+Overlap rules; :func:`set_schedule_enabled` (`orch schedule
+enable|disable`, the dashboard's toggles) turns it on or off. Each records
+an intervention whose command is :func:`schedule_command`, e.g. ``orch
+schedule edit`` or ``dashboard schedule disable``.
+
 Every function that needs the time takes it from the caller (approve and
 deny date only their log line, like a plan decision).
 """
@@ -47,7 +54,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import daemon, failures, needsyou, pauses, planning, templates
+from . import daemon, failures, needsyou, pauses, planning, schedules, templates
 from . import priority as prio
 from .adapters.base import Usage
 from .config import Config, ConfigError
@@ -81,9 +88,14 @@ DECLINED = "declined"
 CREATED = "created"
 PLANNED = "planned"
 REFUSED = "refused"
+SCHEDULE_EDITED = "schedule_edited"
+SCHEDULE_ENABLED = "schedule_enabled"
+SCHEDULE_DISABLED = "schedule_disabled"
+UNCHANGED = "unchanged"  # a Schedule control that found nothing to change
 
 # Why a control was refused (``Result.refusal``).
 UNKNOWN_TASK = "unknown_task"
+UNKNOWN_SCHEDULE = "unknown_schedule"
 WRONG_STATE = "wrong_state"
 STATE_CHANGED = "state_changed"  # the daemon moved the Task meanwhile
 INVALID = "invalid"  # bad input or config: nothing was changed
@@ -147,7 +159,8 @@ class Result:
     refusal: str | None = None
     #: The daemon isn't running, so nothing will act on this yet.
     note: str | None = None
-    #: Lines to show before ``message`` (a new Task's timing, fault injection).
+    #: Lines to show with ``message``: before it, a new Task's timing and
+    #: fault injection; after it, a Schedule's next fire.
     details: tuple[str, ...] = ()
     draft: Draft | None = None
     plan: str | None = None
@@ -489,6 +502,85 @@ def set_priority(cfg: Config, db: Database, task_id: str, level: str, *, via: st
     note = "" if eff == level else f" (effective {eff}: deadline {row['deadline']})"
     return Result(PRIORITY_SET, f"Task {task_id} priority {old} -> {level}{note}", task_id,
                   state, state)
+
+
+# --------------------------------------------------------------------------
+# Schedules (§2.5, §5 item 2): edit, enable, disable
+# --------------------------------------------------------------------------
+
+EDIT, ENABLE, DISABLE = "edit", "enable", "disable"
+
+
+def schedule_command(via: str, action: str) -> str:
+    """The intervention record's command for a Schedule control: ``orch
+    schedule <action>`` from the command line, else ``<via> schedule
+    <action>`` (``dashboard schedule disable``). The clean-week check reads
+    the action from it (a disabled Schedule's fires don't count; fires
+    before an edit were judged by rules it no longer has)."""
+    surface = "orch" if via.startswith("orch") else via
+    return f"{surface} schedule {action}"
+
+
+def _schedule_lookup(db: Database, name: str) -> Result | None:
+    if db.get_schedule(name) is None:
+        return refused(UNKNOWN_SCHEDULE, f"no Schedule {name!r}")
+    return None
+
+
+def edit_schedule(cfg: Config, db: Database, name: str, *, cron_rule: str | None = None,
+                  catch_up: str | None = None, overlap: str | None = None, via: str,
+                  at: datetime) -> Result:
+    """Change a Schedule's timing, Catch-up or Overlap rule (None keeps it),
+    validated as `orch schedule add` validates them; any bad value refuses
+    the whole edit (``INVALID``). It takes effect at the daemon's next
+    evaluation (``schedules.edit`` says how fires are counted)."""
+    bad = _schedule_lookup(db, name)
+    if bad:
+        return bad
+    try:
+        e = schedules.edit(cfg, db, name, cron_rule=cron_rule, catch_up=catch_up,
+                           overlap=overlap, at=at)
+    except schedules.ScheduleError as exc:
+        return refused(INVALID, str(exc))
+    if not e.changes:
+        return Result(UNCHANGED, f"Schedule {name}: nothing changed (the rules are already "
+                                 "as given).")
+    what = "; ".join(e.changes)
+    db.record_intervention(at=iso(at), command=schedule_command(via, EDIT), schedule_name=name,
+                           detail=f"Schedule {name} edited: {what}")
+    details = []
+    if e.dropped:
+        details.append(f"{e.dropped} fire{'s' if e.dropped > 1 else ''} of the old timing rule "
+                       "not decided yet won't catch up.")
+    nxt = schedules.next_fire(cfg, e.new, at) if e.new.enabled else None
+    if nxt is not None:
+        details.append(f"Next fire: {iso(nxt)}")
+    return Result(SCHEDULE_EDITED, f"Schedule {name} edited: {what}.", details=tuple(details),
+                  note=daemon_note(cfg, "the new rules apply once it starts"))
+
+
+def set_schedule_enabled(cfg: Config, db: Database, name: str, enabled: bool, *, via: str,
+                         at: datetime) -> Result:
+    """Enable (counting fires from ``at``) or disable a Schedule."""
+    bad = _schedule_lookup(db, name)
+    if bad:
+        return bad
+    word = "enabled" if enabled else "disabled"
+    try:
+        changed = schedules.set_enabled(db, name, enabled, at=at)
+    except (schedules.ScheduleError, KeyError):
+        return refused(UNKNOWN_SCHEDULE, f"no Schedule {name!r}")
+    if not changed:
+        return Result(UNCHANGED, f"Schedule {name} is already {word}.")
+    db.record_intervention(at=iso(at), schedule_name=name,
+                           command=schedule_command(via, ENABLE if enabled else DISABLE),
+                           detail=f"Schedule {name} {word}")
+    if not enabled:
+        return Result(SCHEDULE_DISABLED, f"Schedule {name} disabled.")
+    nxt = schedules.next_fire(cfg, schedules.get(db, name), at)
+    return Result(SCHEDULE_ENABLED, f"Schedule {name} enabled. Fires from now on count; fires "
+                                    "while it was disabled don't catch up.",
+                  details=(f"Next fire: {iso(nxt)}",) if nxt is not None else ())
 
 
 # --------------------------------------------------------------------------

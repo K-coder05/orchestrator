@@ -535,27 +535,44 @@ def schedule_list(ctx):
         db.close()
 
 
+def _schedule_done(cfg, res: control.Result) -> None:
+    """A Schedule control's result: a refusal ends the command (exit 1)."""
+    _done(res)
+    click.echo(res.message)
+    for line in res.details:
+        click.echo(line)
+    _note(res.note)
+
+
 def _set_enabled(ctx, name: str, enabled: bool) -> None:
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        try:
-            changed = schedules.set_enabled(db, name, enabled, at=_clock(cfg))
-        except schedules.ScheduleError as exc:
-            raise _schedule_error(exc) from None
-        word = "enabled" if enabled else "disabled"
-        if not changed:
-            click.echo(f"Schedule {name} is already {word}.")
-            return
-        db.record_intervention(at=iso(_clock(cfg)), schedule_name=name,
-                               command=f"orch schedule {'enable' if enabled else 'disable'}",
-                               detail=f"Schedule {name} {word}")
-        click.echo(f"Schedule {name} {word}." + (
-            " Fires from now on count; fires while it was disabled don't catch up."
-            if enabled else ""))
-        if enabled:
-            nxt = schedules.next_fire(cfg, schedules.get(db, name), _clock(cfg))
-            if nxt is not None:
-                click.echo(f"Next fire: {iso(nxt)}")
+        _schedule_done(cfg, control.set_schedule_enabled(
+            cfg, db, name, enabled, at=_clock(cfg),
+            via=f"orch schedule {'enable' if enabled else 'disable'}"))
+    finally:
+        db.close()
+
+
+@schedule_group.command("edit")
+@click.argument("name")
+@click.option("--cron", "cron_rule", default=None, metavar="RULE",
+              help="New timing rule, as for `orch schedule add` (e.g. '0 8 * * *'). Fires "
+              "count from now: a fire of the new rule before the edit never catches up.")
+@click.option("--catch-up", "catch_up", default=None, metavar="RULE",
+              help="New Catch-up rule: 'within <N>h' or 'next-wake'. It also decides fires "
+              "already missed.")
+@click.option("--overlap", type=click.Choice(list(schedules.OVERLAPS)), default=None,
+              help="New Overlap rule.")
+@click.pass_context
+def schedule_edit(ctx, name, cron_rule, catch_up, overlap):
+    """Change Schedule NAME's timing, Catch-up or Overlap rule (the ones
+    given; the others stay). The daemon uses them from its next look."""
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        _schedule_done(cfg, control.edit_schedule(
+            cfg, db, name, cron_rule=cron_rule, catch_up=catch_up, overlap=overlap,
+            via="orch schedule edit", at=_clock(cfg)))
     finally:
         db.close()
 

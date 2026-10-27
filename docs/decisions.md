@@ -2165,3 +2165,85 @@ lasting consequences go in `docs/adr/` instead.
   (missing and foreign Origin, missing and wrong token, fragment and plain)
   and GETs on both routes. `tests/test_control.py`: `decidable`, and a
   stale `seen`. The old `test_inbox_has_no_action_buttons` is gone.
+
+## Phase 3, issue #38: schedule editing (`orch schedule edit`, dashboard toggles)
+
+- **What can be edited: the three rules.** `orch schedule edit <name>
+  [--cron RULE] [--catch-up RULE] [--overlap skip|replace]` changes the
+  timing, Catch-up and Overlap rules, the ones given; the others stay.
+  Template, request, agent and priority aren't editable (the issue names
+  the three rules); remove and add again for those. Each value is checked
+  by the same helpers `orch schedule add` uses (`schedules.parse_cron`,
+  `parse_catch_up`, `check_overlap`, factored out of `add`), so the
+  messages match ("bad cron rule: ...", "bad Catch-up rule ...", "Overlap
+  rule must be one of skip, replace"). One bad value refuses the whole edit
+  and nothing changes. No rule given is refused ("nothing to change");
+  rules equal to the current ones are a no-op, reported and not recorded.
+- **Shared code.** `schedules.edit` does the change; the control layer
+  gets `control.edit_schedule` and `control.set_schedule_enabled`, which
+  return a `Result` (refusals `INVALID` and the new `UNKNOWN_SCHEDULE`; new
+  actions `SCHEDULE_EDITED`, `SCHEDULE_ENABLED`, `SCHEDULE_DISABLED`,
+  `UNCHANGED`) and record the intervention. `orch schedule edit|enable|
+  disable` and the dashboard both call them. `orch schedule add`, `remove`
+  and `run-now` stay CLI-only, unchanged.
+- **When an edit takes effect, and never twice.** It is written to SQLite
+  at once and the daemon reads it at its next evaluation (start, wake or
+  poll). A new Catch-up or Overlap rule leaves `last_fire_at` alone, so it
+  also decides a fire that is already due and not yet decided (asleep
+  through 6:30 on "within 1h", edited to next-wake: it runs at wake). A new
+  timing rule counts fires from the edit, as enabling does
+  (`last_fire_at` moves to the edit time, never backwards): a fire of the
+  new rule before the edit was never a missed fire, so moving a daily
+  6:30 run (already done today) to 8:00 at 9am doesn't run it again at
+  9am; the next run is tomorrow at 8. The cost: a fire of the *old* rule
+  that was due but not decided yet (only possible while the daemon is down;
+  it decides within seconds while it runs) is dropped. The result says so
+  ("1 fire of the old timing rule not decided yet won't catch up").
+  The write is a compare-and-set on `last_fire_at`
+  (`Database.update_schedule_rules`), retried on a miss, so an edit racing
+  the daemon's claim of a fire never undoes the claim and the fire is
+  never handled twice.
+- **Interventions, with the surface.** Every edit and toggle that changes
+  something is an `interventions` row whose command is
+  `control.schedule_command(via, action)`: `orch schedule edit|enable|
+  disable` from the CLI, `dashboard schedule edit|enable|disable` from the
+  dashboard. The Task controls record just `dashboard`, but here the
+  clean-week check needs the action too: it treats toggles from any
+  surface as enable/disable (fires while disabled don't count), and checks
+  a Schedule's fires only from its last edit (earlier fires were judged by
+  rules it no longer has, maybe a different timing rule; the edit itself
+  is listed, so that week isn't clean anyway). Issue #38 says edits and
+  toggles count as interventions, so they do.
+- **Dashboard.** Each Schedule on `/schedules` (its item moved to
+  `_schedule.html`) gets an Enable or Disable button and an "Edit rules"
+  `<details>` with the timing rule, the Catch-up rule (as `--catch-up`
+  takes it: `within 12h` or `next-wake`) and an Overlap select, prefilled.
+  `POST /schedules/<name>/enable|disable|edit`, behind the same
+  `refuse_cross_site` guard (exact Origin, Sec-Fetch-Site, the per-process
+  CSRF token, POST only, 4 KB form) as the Task controls. HTMX swaps the
+  whole item (`closest li.schedule`, outerHTML) for the answer: the
+  outcome, then the Schedule as it is now (so the toggle flips, and a
+  refused edit leaves the form there to fix); a plain post gets the page
+  with the outcome on that item. A guard refusal is a 403 with no controls
+  and no token. Disable doesn't ask to confirm (it is undone by Enable).
+- **The page's refresh.** The 60 s `<meta refresh>` would wipe a
+  half-typed edit and, after a plain post, reload the POST URL. It is now a
+  small script that reloads `/schedules` every minute unless an edit form
+  is open, with the meta refresh (to `/schedules`) kept in `<noscript>`.
+- **Not done here:** Telegram schedule commands (not in §5 item 1), and the
+  school roundup Schedule (#41).
+- **Tests.** `tests/test_schedules.py`: each rule edited, refusals for bad
+  and missing values with nothing changed, unknown Schedule, unchanged
+  rules not recorded; with a fake clock, the next fire and the daemon's
+  catch-up under an edited timing rule (no second run today, a run moved
+  later today fires once), an edited Catch-up rule deciding an already
+  missed fire both ways, an edited Overlap rule, dropped old-rule fires,
+  the race with the daemon's claim; interventions with their surface and
+  the clean-week list; `orch schedule edit` end to end.
+  `tests/test_cleanweek.py`: dashboard toggles count as disabled periods;
+  fires before an edit aren't judged by the new rules.
+  `tests/test_dashboard.py`: the toggle and prefilled form, disable/enable
+  and edit end to end (DB, interventions, the swapped item, then the
+  daemon's next fire), bad values refused in place, plain posts, the guard
+  on all three routes (missing, foreign and other-port Origin, missing and
+  wrong token, fragment and plain, cross-site fetch), GETs are 405.

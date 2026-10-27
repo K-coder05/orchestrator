@@ -13,7 +13,8 @@ against the three conditions of a clean week:
    error, a catch-up outside the rule, an Occurrence cancelled (other than
    by the Overlap rule ``replace``) or one still unfinished a day after it
    was created fails the check. Fires while a Schedule was disabled don't
-   count (disabling it is listed as an intervention).
+   count (disabling it is listed as an intervention), nor do fires before
+   its last edit (judged by rules it no longer has; the edit is listed).
 2. **Failures.** Every Failed Attempt that ended in the period, and every
    Task that failed in it without a Failed Attempt (the agent's report said
    failed, or Nightshift could not start it), with its explanation. A crash
@@ -23,8 +24,9 @@ against the three conditions of a clean week:
    ``retry``, ``pause``, ``resume``, ``priority``, or the same control from
    Telegram or the dashboard), every approval or denial
    (except the plan decision of ``orch add`` or Telegram's ``add`` itself,
-   part of asking for the work), every ``orch schedule run-now``, ``enable``, ``disable`` or
-   ``remove`` and every ``orch raise-cap``.
+   part of asking for the work), every ``orch schedule run-now``, ``edit``, ``enable``,
+   ``disable`` or ``remove`` (or the dashboard's edit form and toggles) and every
+   ``orch raise-cap``.
 
 The week is clean only if all three hold; ``orch clean-week`` exits 1
 otherwise. Times come from the caller, so it is tested on fixture data.
@@ -144,10 +146,15 @@ def _within(at: str | None, start: datetime, end: datetime) -> bool:
 # --------------------------------------------------------------------------
 
 
+#: A Schedule control's intervention command (``control.schedule_command``).
+_SCHEDULE_TOGGLE = re.compile(r"(orch|telegram|dashboard) schedule (enable|disable)")
+_SCHEDULE_EDIT = re.compile(r"(orch|telegram|dashboard) schedule edit")
+
+
 def _disabled_at(row: Any, events: list[Any], t: datetime) -> bool:
     """Whether the Schedule ``row`` was disabled at ``t``, from the recorded
-    `orch schedule enable|disable` (else its current state since its last
-    change)."""
+    `orch schedule enable|disable` or dashboard toggles (else its current
+    state since its last change)."""
     before = [e for e in events if parse_iso(e["at"]) <= t]
     if before:
         return before[-1]["command"].endswith("disable")
@@ -158,13 +165,17 @@ def _disabled_at(row: Any, events: list[Any], t: datetime) -> bool:
 
 def _fires(cfg: Config, db: Database, start: datetime, end: datetime) -> list[FireCheck]:
     tz = ZoneInfo(cfg.timezone)
-    toggles = [i for i in db.interventions()
-               if i["command"] in ("orch schedule enable", "orch schedule disable")]
+    toggles = [i for i in db.interventions() if _SCHEDULE_TOGGLE.fullmatch(i["command"])]
+    edits = [i for i in db.interventions() if _SCHEDULE_EDIT.fullmatch(i["command"])]
     out: list[FireCheck] = []
     for row in db.schedules():
         s = schedules.Schedule.from_row(row)
         created = parse_iso(s.created_at)
-        lo = max(start, created)
+        # The rules now are the ones since the last edit: earlier fires (of
+        # an older timing rule, perhaps) aren't checked against them.
+        edited = [parse_iso(e["at"]) for e in edits
+                  if e["schedule_name"] == s.name and parse_iso(e["at"]) >= created]
+        lo = max([start, created, *edited])
         if lo >= end:
             continue
         events = [e for e in toggles if e["schedule_name"] == s.name

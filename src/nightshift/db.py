@@ -932,6 +932,18 @@ class Database:
             if cur.rowcount != 1:
                 raise KeyError(name)
 
+    def update_schedule_rules(self, name: str, *, cron: str, catch_up: str,
+                              catch_up_hours: float | None, overlap: str, at: str,
+                              last_fire_at: str, expect_last: str) -> bool:
+        """Set a Schedule's rules (an edit), if its ``last_fire_at`` is still
+        ``expect_last`` (the daemon hasn't claimed fires meanwhile)."""
+        with self.tx() as c:
+            return c.execute(
+                "UPDATE schedules SET cron = ?, catch_up = ?, catch_up_hours = ?, overlap = ?, "
+                "updated_at = ?, last_fire_at = ? WHERE name = ? AND last_fire_at = ?",
+                (cron, catch_up, catch_up_hours, overlap, at, last_fire_at, name,
+                 expect_last)).rowcount == 1
+
     def claim_schedule_fires(self, name: str, *, expect_last: str, through: str,
                              checked_at: str) -> bool:
         """Mark every fire up to ``through`` handled, if no one else did

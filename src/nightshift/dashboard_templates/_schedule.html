@@ -1,0 +1,60 @@
+{# One Schedule in the list, its toggle and edit form, and the outcome of
+   the last one pressed. An HTMX swap replaces the whole item with this
+   template's answer. Without ``csrf`` (a refusal) no controls are shown;
+   without ``v`` (the Schedule is gone) only the outcome is. #}
+{% if v %}{% set s = v.schedule %}{% endif %}
+<li class="schedule {{ 'on' if v and s.enabled else 'off' }}"{% if v %} id="schedule-{{ s.name }}"{% endif %}>
+  {% if v %}
+  <div class="title">
+    <span>{{ s.name }}</span>
+    <span class="{{ 'state-on' if s.enabled else 'state-off' }}">{{ "enabled" if s.enabled else "disabled" }}</span>
+  </div>
+  {% endif %}
+  {% if refused or result %}
+  <div class="controls">
+    {% if refused %}<p class="outcome refused" role="status">{{ refused }}</p>{% endif %}
+    {% if result %}
+    <p class="outcome{% if not result.ok %} refused{% endif %}" role="status">{% if not result.ok %}Not done: {% endif %}{{ result.message }}</p>
+    {% for line in result.details %}<p class="outcome note">{{ line }}</p>{% endfor %}
+    {% if result.note %}<p class="outcome note">{{ result.note }}</p>{% endif %}
+    {% endif %}
+  </div>
+  {% endif %}
+  {% if v %}
+  <dl>
+    <dt>timing</dt><dd><code>{{ s.cron.expr }}</code> ({{ tz }})</dd>
+    <dt>catch-up</dt><dd>{{ s.catch_up }}</dd>
+    <dt>overlap</dt><dd>{{ s.overlap }}</dd>
+    <dt>template</dt><dd>{{ s.template }}{% if s.priority %} · {{ s.priority }}{% endif %}{% if s.agent %} · {{ s.agent }}{% endif %}</dd>
+    <dt>next fire</dt><dd>{% if v.next_fire %}{{ v.next_fire.strftime("%a %b %-d, %H:%M") }}{% else %}&ndash;{% endif %}</dd>
+    <dt>last run</dt><dd>{% if v.last %}{{ v.last.decided_at|short_time }}: {{ v.last.decision.describe().split(": ", 1)[1] }}{% if v.last.task_state %} ({{ v.last.task_state|replace('_', ' ') }}){% endif %}{% else %}never fired{% endif %}</dd>
+    {% if v.open_occurrences %}<dt>open</dt><dd>{% for o in v.open_occurrences %}<a href="/tasks/{{ o.task_id }}/report">{{ o.task_id }}</a> ({{ o.state|replace('_', ' ') }}){% if not loop.last %}, {% endif %}{% endfor %}</dd>{% endif %}
+  </dl>
+  {% if csrf %}
+  {% set toggle = "disable" if s.enabled else "enable" %}
+  <div class="controls"><div class="buttons">
+    <form method="post" action="/schedules/{{ s.name }}/{{ toggle }}" hx-post="/schedules/{{ s.name }}/{{ toggle }}"
+          hx-target="closest li.schedule" hx-swap="outerHTML">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="b-{{ toggle }}">{{ toggle|capitalize }}</button>
+    </form>
+  </div>
+  <details class="edit"><summary>Edit rules</summary>
+    <form class="edit-form" method="post" action="/schedules/{{ s.name }}/edit" hx-post="/schedules/{{ s.name }}/edit"
+          hx-target="closest li.schedule" hx-swap="outerHTML">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label>timing <input name="cron" value="{{ s.cron.expr }}" autocomplete="off" spellcheck="false"
+             aria-label="Timing rule of {{ s.name }}"></label>
+      <span class="hint">cron, local time: minute hour day-of-month month day-of-week, e.g. <code>30 6 * * *</code>; fires count from the edit</span>
+      <label>catch-up <input name="catch_up" value="{{ catch_up_arg(s.catch_up) }}" autocomplete="off" spellcheck="false"
+             aria-label="Catch-up rule of {{ s.name }}"></label>
+      <span class="hint"><code>within &lt;N&gt;h</code> (else skip) or <code>next-wake</code></span>
+      <label>overlap <select name="overlap" aria-label="Overlap rule of {{ s.name }}">
+        {% for o in overlaps %}<option value="{{ o }}"{% if o == s.overlap %} selected{% endif %}>{{ o }}</option>{% endfor %}
+      </select></label>
+      <button type="submit" class="b-edit">Save</button>
+    </form>
+  </details></div>
+  {% endif %}
+  {% endif %}
+</li>

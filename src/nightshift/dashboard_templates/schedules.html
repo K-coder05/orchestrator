@@ -1,5 +1,6 @@
 {% extends "base.html" %}
-{% block head %}<meta http-equiv="refresh" content="60">{% endblock %}
+{% block head %}<noscript><meta http-equiv="refresh" content="60; url=/schedules"></noscript>
+{% include "_htmx.html" %}{% endblock %}
 {% block title %}Schedules · Nightshift{% endblock %}
 {% block style %}
   nav { font-size: 14px; margin-bottom: 10px; }
@@ -25,6 +26,16 @@
   dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 6px 0 0;
        font-size: 13px; }
   dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
+  .edit { margin-top: 6px; font-size: 13px; }
+  .edit summary { color: var(--muted); cursor: pointer; }
+  .controls .edit-form { display: grid; grid-template-columns: 1fr; gap: 4px; margin-top: 6px; }
+  .edit-form label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+  .edit-form input { flex: 1; min-width: 0; font: 13px ui-monospace, Menlo, monospace; color: var(--text);
+                     background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+                     padding: 6px 8px; min-height: 34px; }
+  .edit-form .hint { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .edit-form button { justify-self: start; }
+  .controls .b-enable { color: var(--done); } .controls .b-disable { color: var(--paused); }
 {% endblock %}
 {% block body %}
   <nav><a href="/">&larr; Nightshift</a></nav>
@@ -85,26 +96,23 @@
     {% if schedules %}
     <ul>
       {% for v in schedules %}
-      {% set s = v.schedule %}
-      <li class="{{ 'on' if s.enabled else 'off' }}">
-        <div class="title">
-          <span>{{ s.name }}</span>
-          <span class="{{ 'state-on' if s.enabled else 'state-off' }}">{{ "enabled" if s.enabled else "disabled" }}</span>
-        </div>
-        <dl>
-          <dt>timing</dt><dd><code>{{ s.cron.expr }}</code> ({{ tz }})</dd>
-          <dt>catch-up</dt><dd>{{ s.catch_up }}</dd>
-          <dt>overlap</dt><dd>{{ s.overlap }}</dd>
-          <dt>template</dt><dd>{{ s.template }}{% if s.priority %} · {{ s.priority }}{% endif %}{% if s.agent %} · {{ s.agent }}{% endif %}</dd>
-          <dt>next fire</dt><dd>{% if v.next_fire %}{{ v.next_fire.strftime("%a %b %-d, %H:%M") }}{% else %}&ndash;{% endif %}</dd>
-          <dt>last run</dt><dd>{% if v.last %}{{ v.last.decided_at|short_time }}: {{ v.last.decision.describe().split(": ", 1)[1] }}{% if v.last.task_state %} ({{ v.last.task_state|replace('_', ' ') }}){% endif %}{% else %}never fired{% endif %}</dd>
-          {% if v.open_occurrences %}<dt>open</dt><dd>{% for o in v.open_occurrences %}<a href="/tasks/{{ o.task_id }}/report">{{ o.task_id }}</a> ({{ o.state|replace('_', ' ') }}){% if not loop.last %}, {% endif %}{% endfor %}</dd>{% endif %}
-        </dl>
-      </li>
+      {% with result=(result if result_for == v.schedule.name else none), refused=none %}{% include "_schedule.html" %}{% endwith %}
       {% endfor %}
     </ul>
     {% else %}
     <p class="empty">No Schedules. Add one with <code>orch schedule add</code>.</p>
     {% endif %}
   </section>
+<script>
+(() => {
+  // Fresh numbers every minute, but never while an edit form is open (it
+  // would lose what is being typed). Always a GET of /schedules, even
+  // after a form post.
+  const reload = () => {
+    if (document.querySelector("details.edit[open]")) setTimeout(reload, 15000);
+    else location.href = "/schedules";
+  };
+  setTimeout(reload, 60000);
+})();
+</script>
 {% endblock %}

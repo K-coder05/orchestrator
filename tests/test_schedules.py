@@ -546,3 +546,193 @@ def test_cli_schedule_commands(run_cli, cfg):
     assert "No Schedules." in run_cli("schedule", "list").output
     res = run_cli("schedule", "enable", "posting-scan", ok=False)
     assert "no Schedule 'posting-scan'" in res.output
+
+
+# --------------------------------------------------------------------------
+# Editing (§5 item 2): `orch schedule edit`, through the control layer
+# --------------------------------------------------------------------------
+
+from nightshift import cleanweek, control  # noqa: E402
+
+
+def edit(cfg, db, at, name="scan", via="orch schedule edit", **kw):
+    return control.edit_schedule(cfg, db, name, via=via, at=at, **kw)
+
+
+def test_edit_changes_each_rule(cfg, db):
+    add(cfg, db, la(2026, 10, 21, 7, 0))
+    at = la(2026, 10, 21, 9, 0)
+    res = edit(cfg, db, at, cron_rule="0 8 * * 1-5")
+    assert res.ok and res.action == control.SCHEDULE_EDITED
+    assert res.message == "Schedule scan edited: timing 30 6 * * * -> 0 8 * * 1-5."
+    assert res.details == ("Next fire: 2026-10-22T08:00:00-07:00",)
+    res = edit(cfg, db, at, catch_up="next-wake")
+    assert "catch-up within 12h, else skip -> run on next wake" in res.message
+    res = edit(cfg, db, at, overlap="replace")
+    assert "overlap skip -> replace" in res.message
+    s = schedules.get(db, "scan")
+    assert (s.cron.expr, s.catch_up, s.overlap) == (
+        "0 8 * * 1-5", schedules.CatchUp("next_wake"), "replace")
+    res = edit(cfg, db, at, cron_rule="30 6 * * *", catch_up="within 2h", overlap="skip")
+    assert res.message == ("Schedule scan edited: timing 0 8 * * 1-5 -> 30 6 * * *; catch-up run "
+                           "on next wake -> within 2h, else skip; overlap replace -> skip.")
+    # Unchanged values are no edit, and no intervention.
+    before = len(db.interventions())
+    res = edit(cfg, db, at, cron_rule="30  6 * * *", catch_up="within 2 hours")
+    assert res.ok and res.action == control.UNCHANGED
+    assert len(db.interventions()) == before
+
+
+def test_edit_refuses_invalid_values_and_changes_nothing(cfg, db):
+    add(cfg, db, la(2026, 10, 21, 7, 0))
+    row = dict(db.get_schedule("scan"))
+    at = la(2026, 10, 21, 9, 0)
+    for kw, msg in [
+        ({"cron_rule": "30 6 * *"}, "bad cron rule: '30 6 * *' has 4 fields"),
+        ({"cron_rule": "61 6 * * *"}, "bad cron rule: minute: 61 is outside 0-59"),
+        ({"cron_rule": ""}, "bad cron rule: a cron rule is five fields"),
+        ({"catch_up": "sometime"}, "bad Catch-up rule 'sometime'"),
+        ({"catch_up": "within 0h"}, "bad Catch-up rule"),
+        ({"overlap": "stack"}, "Overlap rule must be one of skip, replace, not 'stack'"),
+        # One bad value refuses the whole edit.
+        ({"cron_rule": "0 8 * * *", "overlap": "stack"}, "Overlap rule"),
+        ({}, "nothing to change"),
+    ]:
+        res = edit(cfg, db, at, **kw)
+        assert not res.ok and res.refusal == control.INVALID, kw
+        assert msg in res.message, (kw, res.message)
+    res = edit(cfg, db, at, name="nope", overlap="skip")
+    assert res.refusal == control.UNKNOWN_SCHEDULE and res.message == "no Schedule 'nope'"
+    assert dict(db.get_schedule("scan")) == row
+    assert db.interventions() == []
+
+
+def test_edited_timing_sets_the_next_fire_and_never_refires_a_handled_run(cfg, db):
+    add(cfg, db, la(2026, 10, 21, 5, 0))
+    [d] = schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 6, 30, 5))
+    assert d.outcome == "created"
+    db.transition(d.task_id, TaskState.RUNNING, "picked")
+    db.transition(d.task_id, TaskState.DONE, "finished")
+    # 9am: move it to 8am. Today's 8am under the new rule is before the edit,
+    # so it never counts as missed: no second run today.
+    edit(cfg, db, la(2026, 10, 21, 9, 0), cron_rule="0 8 * * *")
+    s = schedules.get(db, "scan")
+    assert schedules.next_fire(cfg, s, la(2026, 10, 21, 9, 0)) == la(2026, 10, 22, 8, 0)
+    assert schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 9, 0, 5)) == []
+    assert schedules.apply_catch_up(cfg, db, la(2026, 10, 22, 6, 30, 5)) == []  # old rule gone
+    [d] = schedules.apply_catch_up(cfg, db, la(2026, 10, 22, 8, 0, 5))
+    assert d.outcome == "created"
+    assert d.fire_at == "2026-10-22T08:00:00-07:00" and d.fires == 1
+    assert len(db.list_tasks()) == 2
+
+
+def test_edited_timing_moved_later_today_fires_once_at_the_new_time(cfg, db):
+    add(cfg, db, la(2026, 10, 21, 5, 0))
+    schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 6, 30, 5))  # today's run
+    edit(cfg, db, la(2026, 10, 21, 9, 0), cron_rule="0 20 * * *")
+    [d] = schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 20, 0, 5))
+    assert d.fire_at == "2026-10-21T20:00:00-07:00"
+    assert schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 20, 1)) == []
+
+
+def test_edited_timing_drops_undecided_fires_of_the_old_rule_and_says_so(cfg, db):
+    add(cfg, db, la(2026, 10, 20, 7, 0))
+    # The daemon was down: the 6:30 fire is due but not decided.
+    res = edit(cfg, db, la(2026, 10, 21, 7, 0), cron_rule="0 8 * * *")
+    assert "1 fire of the old timing rule not decided yet won't catch up." in res.details
+    assert schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 7, 1)) == []
+    [d] = schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 8, 0, 5))
+    assert d.outcome == "created"
+
+
+def test_edited_catch_up_rule_decides_a_fire_already_missed(cfg, db):
+    add(cfg, db, la(2026, 10, 20, 7, 0), catch_up="within 1h")
+    # Asleep through the 6:30 fire; at 9am, before the daemon's next look,
+    # the rule becomes next-wake: the missed fire runs.
+    edit(cfg, db, la(2026, 10, 21, 9, 0), catch_up="next-wake")
+    [d] = schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 9, 0, 5), trigger="wake")
+    assert d.outcome == "created" and d.fire_at == "2026-10-21T06:30:00-07:00"
+    # And the other way: next-wake -> within 1h skips a missed fire.
+    edit(cfg, db, la(2026, 10, 21, 9, 1), catch_up="within 1h")
+    [d] = schedules.apply_catch_up(cfg, db, la(2026, 10, 22, 9, 0), trigger="wake")
+    assert d.outcome == "skipped_catch_up" and "within 1h, else skip" in d.detail
+    # Each missed fire is decided once, whatever the edits.
+    assert schedules.apply_catch_up(cfg, db, la(2026, 10, 22, 9, 1)) == []
+    assert len(db.list_tasks()) == 1
+
+
+def test_edited_overlap_rule_applies_at_the_next_fire(cfg, db):
+    add(cfg, db, la(2026, 10, 21, 5, 0))
+    [first] = schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 6, 30, 5))
+    edit(cfg, db, la(2026, 10, 21, 9, 0), overlap="replace")
+    [d] = schedules.apply_catch_up(cfg, db, la(2026, 10, 22, 6, 30, 5))
+    assert d.outcome == "replaced" and d.replaced == [first.task_id]
+
+
+def test_an_edit_never_undoes_fires_the_daemon_claimed_meanwhile(cfg, db, monkeypatch):
+    add(cfg, db, la(2026, 10, 20, 7, 0))
+    real = db.update_schedule_rules
+    calls = []
+
+    def racing(name, **kw):
+        if not calls:  # the daemon decides the due fire between the read and the write
+            schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 6, 30, 5))
+        calls.append(kw)
+        return real(name, **kw)
+
+    monkeypatch.setattr(db, "update_schedule_rules", racing)
+    res = edit(cfg, db, la(2026, 10, 21, 6, 30, 6), overlap="replace")
+    assert res.ok and len(calls) == 2
+    assert schedules.get(db, "scan").last_fire_at == "2026-10-21T06:30:00-07:00"
+    assert schedules.apply_catch_up(cfg, db, la(2026, 10, 21, 6, 31)) == []
+    assert len(db.list_tasks()) == 1
+
+
+def test_schedule_controls_record_interventions_with_their_surface(cfg, db):
+    add(cfg, db, la(2026, 10, 21, 7, 0))
+    at = la(2026, 10, 21, 9, 0)
+    edit(cfg, db, at, cron_rule="0 8 * * *")
+    edit(cfg, db, at, via=control.VIA_DASHBOARD, overlap="replace")
+    control.set_schedule_enabled(cfg, db, "scan", False, via=control.VIA_DASHBOARD, at=at)
+    assert control.set_schedule_enabled(
+        cfg, db, "scan", False, via=control.VIA_DASHBOARD, at=at).action == control.UNCHANGED
+    control.set_schedule_enabled(cfg, db, "scan", True, via="orch schedule enable", at=at)
+    assert [(i["command"], i["schedule_name"], i["detail"]) for i in db.interventions()] == [
+        ("orch schedule edit", "scan", "Schedule scan edited: timing 30 6 * * * -> 0 8 * * *"),
+        ("dashboard schedule edit", "scan", "Schedule scan edited: overlap skip -> replace"),
+        ("dashboard schedule disable", "scan", "Schedule scan disabled"),
+        ("orch schedule enable", "scan", "Schedule scan enabled"),
+    ]
+    week = cleanweek.check(cfg, db, la(2026, 10, 21, 10, 0))
+    assert [i.command for i in week.interventions] == [
+        "orch schedule edit", "dashboard schedule edit", "dashboard schedule disable",
+        "orch schedule enable"]
+    assert not week.clean
+
+
+def test_cli_schedule_edit(run_cli, cfg):
+    run_cli("schedule", "add", "scan", "--template", "scan", "--cron", "30 6 * * *",
+            "--catch-up", "within 12h")
+    run_cli.clock.advance(hours=2)
+    out = run_cli("schedule", "edit", "scan", "--cron", "0 8 * * *", "--catch-up", "next-wake",
+                  "--overlap", "replace").output
+    assert ("Schedule scan edited: timing 30 6 * * * -> 0 8 * * *; catch-up within 12h, else "
+            "skip -> run on next wake; overlap skip -> replace.") in out
+    assert "Next fire: 2026-10-22T08:00:00-07:00" in out
+    listing = run_cli("schedule", "list").output
+    for line in ("rule       0 8 * * *", "catch-up   run on next wake", "overlap    replace",
+                 "next fire  2026-10-22 08:00"):
+        assert line in listing
+    assert "nothing changed" in run_cli("schedule", "edit", "scan", "--overlap", "replace").output
+
+    for args, msg in [
+        (["--cron", "8am"], "bad cron rule"),
+        (["--catch-up", "soon"], "bad Catch-up rule 'soon'"),
+        (["--overlap", "stack"], "'stack' is not one of 'skip', 'replace'"),
+        ([], "nothing to change"),
+    ]:
+        res = run_cli("schedule", "edit", "scan", *args, ok=False)
+        assert res.exit_code != 0 and msg in res.output, (args, res.output)
+    res = run_cli("schedule", "edit", "nope", "--overlap", "skip", ok=False)
+    assert res.exit_code == 1 and "no Schedule 'nope'" in res.output
+    assert "rule       0 8 * * *" in run_cli("schedule", "list").output

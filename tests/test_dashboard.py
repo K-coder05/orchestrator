@@ -1224,3 +1224,173 @@ def test_dashboard_run_refuses_when_tailscale_is_down(config_dir, fake_host):
     fake_host.tailscale_ip = None
     r = _orch(config_dir, "dashboard", "run")
     assert r.exit_code != 0 and "Tailscale is not connected" in r.output
+
+
+# --------------------------------------------------------------------------
+# Schedule controls (§5 item 2): toggles and the edit form
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sched_cfg(config_dir):
+    from nightshift import schedules
+    from nightshift.db import Database
+
+    cfg = _with_template(config_dir)
+    db = Database(cfg.db_path, tz=cfg.timezone)
+    try:
+        schedules.add(cfg, db, "rescrape", template="rescrape", cron_rule="0 2 * * *",
+                      catch_up="within 12h", at=NOW - timedelta(hours=1))
+    finally:
+        db.close()
+    return cfg
+
+
+def _sched(client, name, action, *, htmx=True, origin=ORIGIN, token=None, **form):
+    headers = {"HX-Request": "true"} if htmx else {}
+    if origin is not None:
+        headers["Origin"] = origin
+    data = {"csrf": client.app.state.csrf_token if token is None else token, **form}
+    if token == "":
+        del data["csrf"]
+    return client.post(f"/schedules/{name}/{action}", data=data, headers=headers)
+
+
+def _schedule_row(cfg, name="rescrape"):
+    from nightshift.db import Database
+
+    db = Database(cfg.db_path, tz=cfg.timezone)
+    try:
+        return dict(db.get_schedule(name)), [dict(i) for i in db.interventions()]
+    finally:
+        db.close()
+
+
+def test_schedule_list_has_a_toggle_and_an_edit_form(sched_cfg):
+    html = _client(sched_cfg).get("/schedules").text
+    item = html[html.index('id="schedule-rescrape"'):]
+    assert 'action="/schedules/rescrape/disable"' in item
+    assert 'action="/schedules/rescrape/enable"' not in item
+    assert 'action="/schedules/rescrape/edit"' in item
+    assert 'name="cron" value="0 2 * * *"' in item
+    assert 'name="catch_up" value="within 12h"' in item
+    assert '<option value="skip" selected>skip</option>' in item
+    assert 'name="csrf"' in item and 'hx-target="closest li.schedule"' in item
+    assert 'src="/static/htmx.min.js"' in html
+    assert 'url=/schedules' in html  # a refresh never re-posts
+
+
+def test_dashboard_disables_and_enables_a_schedule_end_to_end(sched_cfg):
+    client = TestClient(_app(sched_cfg), base_url="http://127.0.0.1:8765")
+    r = _sched(client, "rescrape", "disable")
+    assert r.status_code == 200 and r.text.lstrip().startswith('<li class="schedule off"')
+    assert "Schedule rescrape disabled." in r.text
+    assert 'action="/schedules/rescrape/enable"' in r.text  # the toggle flips
+    row, interventions = _schedule_row(sched_cfg)
+    assert row["enabled"] == 0
+    assert [(i["command"], i["detail"]) for i in interventions] == [
+        ("dashboard schedule disable", "Schedule rescrape disabled")]
+
+    assert "already disabled" in _sched(client, "rescrape", "disable").text
+    r = _sched(client, "rescrape", "enable")
+    assert "Schedule rescrape enabled." in r.text
+    assert "Next fire: 2026-10-22T02:00:00-07:00" in r.text
+    assert 'action="/schedules/rescrape/disable"' in r.text
+    row, interventions = _schedule_row(sched_cfg)
+    assert row["enabled"] == 1 and row["last_fire_at"] == "2026-10-21T22:00:00-07:00"
+    assert [i["command"] for i in interventions] == [
+        "dashboard schedule disable", "dashboard schedule enable"]
+
+
+def test_dashboard_edits_a_schedule_end_to_end(sched_cfg):
+    from nightshift import cleanweek, schedules
+    from nightshift.db import Database
+
+    client = TestClient(_app(sched_cfg), base_url="http://127.0.0.1:8765")
+    r = _sched(client, "rescrape", "edit", cron="30 3 * * 1-5", catch_up="next-wake",
+               overlap="replace")
+    assert r.status_code == 200
+    assert ("Schedule rescrape edited: timing 0 2 * * * -&gt; 30 3 * * 1-5; catch-up within "
+            "12h, else skip -&gt; run on next wake; overlap skip -&gt; replace.") in r.text
+    assert "Next fire: 2026-10-22T03:30:00-07:00" in r.text
+    assert "<code>30 3 * * 1-5</code>" in r.text and "Thu Oct 22, 03:30" in r.text
+    assert 'name="catch_up" value="next-wake"' in r.text
+    row, interventions = _schedule_row(sched_cfg)
+    assert (row["cron"], row["catch_up"], row["overlap"]) == ("30 3 * * 1-5", "next_wake",
+                                                             "replace")
+    assert interventions[-1]["command"] == "dashboard schedule edit"
+
+    # The daemon uses the edited rule at its next look (a fake clock).
+    db = Database(sched_cfg.db_path, tz=sched_cfg.timezone)
+    try:
+        la = ZoneInfo("America/Los_Angeles")
+        assert schedules.apply_catch_up(sched_cfg, db, datetime(2026, 10, 22, 2, 0, 5,
+                                                                tzinfo=la)) == []
+        [d] = schedules.apply_catch_up(sched_cfg, db, datetime(2026, 10, 22, 3, 30, 5, tzinfo=la))
+        assert d.outcome == "created" and d.fire_at == "2026-10-22T03:30:00-07:00"
+        week = cleanweek.check(sched_cfg, db, datetime(2026, 10, 22, 4, 0, tzinfo=la))
+        assert [i.command for i in week.interventions] == ["dashboard schedule edit"]
+    finally:
+        db.close()
+
+
+def test_dashboard_edit_refuses_bad_values_in_place(sched_cfg):
+    client = TestClient(_app(sched_cfg), base_url="http://127.0.0.1:8765")
+    before, _ = _schedule_row(sched_cfg)
+    for form, msg in [
+        ({"cron": "every day", "catch_up": "within 12h", "overlap": "skip"}, "bad cron rule"),
+        ({"cron": "", "catch_up": "within 12h", "overlap": "skip"}, "bad cron rule"),
+        ({"cron": "0 2 * * *", "catch_up": "later", "overlap": "skip"}, "bad Catch-up rule"),
+        ({"cron": "0 9 * * *", "catch_up": "within 12h", "overlap": "stack"}, "Overlap rule"),
+        ({}, "nothing to change"),
+    ]:
+        r = _sched(client, "rescrape", "edit", **form)
+        assert r.status_code == 200 and "Not done: " in r.text and msg in r.text, form
+        assert 'action="/schedules/rescrape/edit"' in r.text  # still there to fix and resend
+    assert _schedule_row(sched_cfg) == (before, [])
+    r = _sched(client, "nope", "disable")
+    assert "Not done: no Schedule &#39;nope&#39;" in r.text and "<form" not in r.text
+    # Unchanged rules are not an edit.
+    r = _sched(client, "rescrape", "edit", cron="0 2 * * *", catch_up="within 12h", overlap="skip")
+    assert "nothing changed" in r.text and _schedule_row(sched_cfg)[1] == []
+
+
+def test_schedule_controls_without_javascript_get_the_schedule_page(sched_cfg):
+    client = TestClient(_app(sched_cfg), base_url="http://127.0.0.1:8765")
+    r = _sched(client, "rescrape", "edit", htmx=False, cron="0 4 * * *", catch_up="within 12h",
+               overlap="skip")
+    assert r.status_code == 200 and "<h1>Schedules</h1>" in r.text
+    item = r.text[r.text.index('id="schedule-rescrape"'):]
+    assert "Schedule rescrape edited: timing 0 2 * * * -&gt; 0 4 * * *." in item
+    r = _sched(client, "rescrape", "disable", htmx=False)
+    assert "Schedule rescrape disabled." in r.text and "<h1>Schedules</h1>" in r.text
+
+
+@pytest.mark.parametrize("origin,token", [(None, None), ("http://evil.example", None),
+                                          ("http://127.0.0.1:9999", None), (ORIGIN, ""),
+                                          (ORIGIN, "wrong")])
+@pytest.mark.parametrize("action", ["enable", "disable", "edit"])
+def test_schedule_controls_are_behind_the_write_guard(sched_cfg, origin, token, action):
+    client = TestClient(_app(sched_cfg), base_url="http://127.0.0.1:8765")
+    before = _schedule_row(sched_cfg)
+    for htmx in (True, False):
+        r = _sched(client, "rescrape", action, htmx=htmx, origin=origin, token=token,
+                   cron="0 9 * * *", catch_up="next-wake", overlap="replace")
+        assert r.status_code == 403 and "Refused: " in r.text and "Nothing was changed" in r.text
+        assert 'name="csrf"' not in r.text and "<form" not in r.text
+    assert _schedule_row(sched_cfg) == before
+
+
+@pytest.mark.parametrize("action", ["enable", "disable", "edit"])
+def test_schedule_controls_are_post_only(sched_cfg, action):
+    client = TestClient(_app(sched_cfg), base_url="http://127.0.0.1:8765")
+    r = client.get(f"/schedules/rescrape/{action}?csrf={client.app.state.csrf_token}"
+                   "&cron=0+9+*+*+*", headers={"Origin": ORIGIN})
+    assert r.status_code == 405
+
+
+def test_schedule_controls_refuse_cross_site_fetches(sched_cfg):
+    client = TestClient(_app(sched_cfg), base_url="http://127.0.0.1:8765")
+    r = client.post("/schedules/rescrape/disable", data={"csrf": client.app.state.csrf_token},
+                    headers={"Origin": ORIGIN, "Sec-Fetch-Site": "cross-site"})
+    assert r.status_code == 403 and _schedule_row(sched_cfg)[0]["enabled"] == 1

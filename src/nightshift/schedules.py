@@ -19,6 +19,10 @@ into **one** decision about the latest of them:
   fire and creates nothing; ``replace`` cancels the unfinished Occurrence
   and creates a fresh one.
 
+`orch schedule edit` and the dashboard change the rules through
+:func:`edit` (via ``nightshift.control``); the daemon uses them from its
+next evaluation.
+
 Every time comes from the caller, so all of it is unit tested with a fake
 clock.
 """
@@ -92,6 +96,24 @@ def parse_catch_up(text: str) -> CatchUp:
             f"bad Catch-up rule {text!r}: use 'within <N>h' (run within N hours, else skip) "
             "or 'next-wake'")
     return CatchUp(CATCH_UP_WITHIN, float(m.group(1)))
+
+
+def parse_cron(text: str) -> cron.Cron:
+    try:
+        return cron.parse(text)
+    except cron.CronError as exc:
+        raise ScheduleError(f"bad cron rule: {exc}") from None
+
+
+def check_overlap(text: str) -> str:
+    if text not in OVERLAPS:
+        raise ScheduleError(f"Overlap rule must be one of {', '.join(OVERLAPS)}, not {text!r}")
+    return text
+
+
+def catch_up_arg(cu: CatchUp) -> str:
+    """``cu`` as ``--catch-up`` takes it (what an edit form starts from)."""
+    return "next-wake" if cu.kind == CATCH_UP_NEXT_WAKE else f"within {cu.hours:g}h"
 
 
 @dataclass(frozen=True)
@@ -187,13 +209,9 @@ def add(cfg: Config, db: Database, name: str, *, template: str | None = None,
         cron_rule = std["cron"] if cron_rule is None else cron_rule
         catch_up = std["catch_up"] if catch_up is None else catch_up
         overlap = std.get("overlap", OVERLAP_SKIP) if overlap is None else overlap
-    try:
-        rule = cron.parse(cron_rule)
-    except cron.CronError as exc:
-        raise ScheduleError(f"bad cron rule: {exc}") from None
+    rule = parse_cron(cron_rule)
     cu = catch_up if isinstance(catch_up, CatchUp) else parse_catch_up(catch_up)
-    if overlap not in OVERLAPS:
-        raise ScheduleError(f"Overlap rule must be one of {', '.join(OVERLAPS)}")
+    check_overlap(overlap)
     if priority is not None and priority not in ("urgent", "normal", "background"):
         raise ScheduleError("priority must be urgent, normal or background")
     _check_template(cfg, template, request, agent)
@@ -225,6 +243,65 @@ def set_enabled(db: Database, name: str, enabled: bool, *, at: datetime) -> bool
         return False
     db.set_schedule_enabled(name, enabled, at=iso(at), last_fire_at=iso(at) if enabled else None)
     return True
+
+
+@dataclass(frozen=True)
+class Edit:
+    """What :func:`edit` did: the Schedule before and after, one line per
+    rule changed (none: nothing to change) and how many fires of the old
+    timing rule were still undecided and won't catch up."""
+
+    old: Schedule
+    new: Schedule
+    changes: tuple[str, ...]
+    dropped: int = 0
+
+
+def edit(cfg: Config, db: Database, name: str, *, cron_rule: str | None = None,
+         catch_up: str | None = None, overlap: str | None = None, at: datetime) -> Edit:
+    """Change a Schedule's timing, Catch-up or Overlap rule (None: keep it),
+    each checked as `orch schedule add` checks it. Nothing is changed unless
+    every value given is valid.
+
+    The daemon's next evaluation uses the new rules. A new Catch-up or
+    Overlap rule also decides fires already due. A new timing rule counts
+    fires from ``at``, as enabling does: its fires before the edit were
+    never missed, so the edit never makes a fire that was handled run
+    again. Fires of the old timing rule the daemon hadn't decided yet (it
+    decides within seconds while it runs) are dropped and counted.
+    """
+    if cron_rule is None and catch_up is None and overlap is None:
+        raise ScheduleError("nothing to change: give a timing (cron), Catch-up or Overlap rule")
+    rule = parse_cron(cron_rule) if cron_rule is not None else None
+    cu = parse_catch_up(catch_up) if catch_up is not None else None
+    if overlap is not None:
+        check_overlap(overlap)
+    for _ in range(5):
+        s = get(db, name)
+        changes = []
+        if rule is not None and rule.expr != s.cron.expr:
+            changes.append(f"timing {s.cron.expr} -> {rule.expr}")
+        if cu is not None and cu != s.catch_up:
+            changes.append(f"catch-up {s.catch_up} -> {cu}")
+        if overlap is not None and overlap != s.overlap:
+            changes.append(f"overlap {s.overlap} -> {overlap}")
+        if not changes:
+            return Edit(s, s, ())
+        retimed = rule is not None and rule.expr != s.cron.expr
+        dropped, last = 0, s.last_fire_at
+        if retimed:
+            if s.enabled:
+                dropped = due(cfg, s, at)[0]
+            last = iso(max(parse_iso(s.last_fire_at), at))
+        new_cu = cu or s.catch_up
+        # Compare-and-set on last_fire_at: if the daemon claimed fires
+        # meanwhile, look again rather than undo its claim.
+        if db.update_schedule_rules(
+                name, cron=(rule or s.cron).expr, catch_up=new_cu.kind,
+                catch_up_hours=new_cu.hours, overlap=overlap or s.overlap, at=iso(at),
+                last_fire_at=last, expect_last=s.last_fire_at):
+            return Edit(s, get(db, name), tuple(changes), dropped)
+    raise ScheduleError(f"Schedule {name!r} kept changing; try again")
 
 
 def next_fire(cfg: Config, s: Schedule, now: datetime) -> datetime | None:

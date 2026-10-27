@@ -5,7 +5,7 @@ interface, the LAN or a public address, and refuses to start otherwise. It
 runs as its own launchd agent (`orch dashboard install`), apart from the
 daemon. Opening the database (as every `orch` command does) may migrate it.
 
-Its one write surface is the Task controls: ``POST /tasks/<id>/<action>``
+Its write surface is the Task controls: ``POST /tasks/<id>/<action>``
 for ``cancel``, ``pause``, ``resume``, ``retry`` and ``priority`` (form field
 ``level``), and the inbox's ``approve`` and ``deny`` (form field ``request``,
 the ``control.request_key`` the button was shown with), each a call into
@@ -15,8 +15,12 @@ counts it), never logic of its own. The buttons are shown only where
 Task's state allows them, and the result replaces them in place (an HTMX
 swap of the controls row, or of the whole inbox; a plain form post gets a
 result page, or the home page). A decision on a request that was decided
-elsewhere meanwhile only reports the Task's state now. Every action is POST
-only and must pass
+elsewhere meanwhile only reports the Task's state now. And the Schedule
+controls on ``/schedules``: ``POST /schedules/<name>/enable|disable`` (the
+toggle) and ``/edit`` (form fields ``cron``, ``catch_up``, ``overlap``),
+calls to ``control.set_schedule_enabled``/``control.edit_schedule`` with
+``via: dashboard``, the result swapped in for the Schedule's item. Every
+action is POST only and must pass
 :func:`refuse_cross_site`: an ``Origin`` that is this very ``Host`` (itself
 one of :func:`allowed_hosts`), and the CSRF token the pages carry, random
 per dashboard process. Anything else changes nothing.
@@ -54,7 +58,7 @@ from markupsafe import Markup
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import control, daemon, queries, tonight, views
+from . import control, daemon, queries, schedules, tonight, views
 from . import priority as prio
 from .config import Config
 from .db import Database
@@ -193,6 +197,8 @@ def _environment() -> Environment:
     env.filters["minutes"] = _minutes
     env.filters["countdown"] = views.countdown
     env.filters["epoch_ms"] = _epoch_ms
+    env.globals["catch_up_arg"] = schedules.catch_up_arg
+    env.globals["overlaps"] = schedules.OVERLAPS
     return env
 
 
@@ -428,6 +434,35 @@ def run_control(cfg: Config, db: Database, task_id: str, action: str, form: dict
     return control.set_priority(cfg, db, task_id, form.get("level", ""), via=via, at=at)
 
 
+# --------------------------------------------------------------------------
+# Schedule controls: toggles and the edit form
+# --------------------------------------------------------------------------
+
+#: ``POST /schedules/<name>/<action>``.
+SCHEDULE_ACTIONS = (control.ENABLE, control.DISABLE, control.EDIT)
+
+#: The edit form's fields: the rules `orch schedule edit` changes.
+EDIT_FIELDS = {"cron": "cron_rule", "catch_up": "catch_up", "overlap": "overlap"}
+
+
+def run_schedule_control(cfg: Config, db: Database, name: str, action: str,
+                         form: dict[str, str], *, at: datetime) -> control.Result:
+    """One Schedule control, through the shared control layer, as `orch
+    schedule enable|disable|edit` with ``via: dashboard``. The edit form
+    sends every rule; only the ones that differ change. A rule left out of
+    the form is kept; one sent blank is refused like any bad value."""
+    via = control.VIA_DASHBOARD
+    if action == control.EDIT:
+        rules = {arg: form[f].strip() for f, arg in EDIT_FIELDS.items() if f in form}
+        return control.edit_schedule(cfg, db, name, via=via, at=at, **rules)
+    return control.set_schedule_enabled(cfg, db, name, action == control.ENABLE, via=via, at=at)
+
+
+def schedule_view(cfg: Config, db: Database, name: str, at: datetime) -> Any | None:
+    """``queries.schedule_list``'s entry for ``name`` (None: no such Schedule)."""
+    return next((v for v in queries.schedule_list(cfg, db, at) if v.schedule.name == name), None)
+
+
 def create_app(
     cfg: Config, *, tailscale_ip: str | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -476,17 +511,51 @@ def create_app(
     def home() -> str:
         return with_db(home_page)
 
+    def schedules_page(db: Database, *, result: control.Result | None = None,
+                       result_for: str | None = None) -> str:
+        at = now()
+        return env.get_template("schedules.html").render(
+            preview=tonight.preview(cfg, db, at), schedules=queries.schedule_list(cfg, db, at),
+            now=at, tz=cfg.timezone, csrf=token, result=result, result_for=result_for)
+
     @app.get("/schedules", response_class=HTMLResponse)
     def schedule_page() -> str:
-        at = now()
-        db = Database(cfg.db_path, tz=cfg.timezone)
-        try:
-            preview = tonight.preview(cfg, db, at)
-            items = queries.schedule_list(cfg, db, at)
-        finally:
-            db.close()
-        return env.get_template("schedules.html").render(
-            preview=preview, schedules=items, now=at, tz=cfg.timezone)
+        return with_db(schedules_page)
+
+    async def schedule_act(name: str, action: str, request: Request) -> HTMLResponse:
+        fragment = request.headers.get("hx-request") == "true"
+        body = await request.body()
+        form = parse_form(body) if len(body) <= MAX_FORM_BYTES else {}
+        why = refuse_cross_site(request.headers, form, token=token, allowed=hosts)
+        if why is not None:
+            refusal = f"Refused: {why}. Nothing was changed."
+            if not fragment:
+                return HTMLResponse(env.get_template("action.html").render(
+                    c=None, result=None, refused=refusal), status_code=403)
+            # The item as it is, with the refusal and no controls or token.
+            html = await run_in_threadpool(with_db, lambda db: env.get_template(
+                "_schedule.html").render(v=schedule_view(cfg, db, name, now()), tz=cfg.timezone,
+                                         csrf=None, result=None, refused=refusal))
+            return HTMLResponse(html, status_code=403)
+
+        def work(db: Database) -> str:
+            res = run_schedule_control(cfg, db, name, action, form, at=now())
+            if not fragment:
+                return schedules_page(db, result=res, result_for=name)
+            return env.get_template("_schedule.html").render(
+                v=schedule_view(cfg, db, name, now()), tz=cfg.timezone, csrf=token,
+                result=res, refused=None)
+
+        return HTMLResponse(await run_in_threadpool(with_db, work))
+
+    def schedule_route(action: str) -> Callable[..., Any]:
+        async def route(name: str, request: Request) -> HTMLResponse:
+            return await schedule_act(name, action, request)
+        return route
+
+    for name in SCHEDULE_ACTIONS:  # POST only, like the Task controls
+        app.post(f"/schedules/{{name}}/{name}", response_class=HTMLResponse)(
+            schedule_route(name))
 
     @app.get("/usage", response_class=HTMLResponse)
     def usage_page() -> str:

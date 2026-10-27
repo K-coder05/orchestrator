@@ -253,6 +253,36 @@ def test_fires_while_disabled_do_not_count_but_disabling_is_an_intervention(cfg,
     assert "1. Scheduled runs: PASS (5 fires" in cleanweek.format_check(week, cfg.timezone)
 
 
+def test_dashboard_toggles_count_like_orch_schedule_enable_and_disable(cfg, db):
+    on_time_week(cfg, db, days=[16, 17, 18, 21, 22])
+    db.record_intervention(at=iso(la(2026, 10, 18, 12)), command="dashboard schedule disable",
+                           schedule_name="scan", detail="Schedule scan disabled")
+    db.record_intervention(at=iso(la(2026, 10, 20, 12)), command="dashboard schedule enable",
+                           schedule_name="scan", detail="Schedule scan enabled")
+    week = cleanweek.check(cfg, db, END)
+    f = by_day(week)
+    assert f[19].status == f[20].status == "disabled" and week.schedules_ok
+    assert [i.command for i in week.interventions] == [
+        "dashboard schedule disable", "dashboard schedule enable"]
+
+
+def test_fires_before_an_edit_are_judged_by_the_rules_since_it(cfg, db):
+    # 6:30 daily until an edit on the 19th moved it to 8pm.
+    on_time_week(cfg, db, days=[16, 17, 18])
+    db.conn.execute("UPDATE schedules SET cron = '0 20 * * *', last_fire_at = ?",
+                    (iso(la(2026, 10, 19, 9)),))
+    db.conn.commit()
+    db.record_intervention(at=iso(la(2026, 10, 19, 9)), command="dashboard schedule edit",
+                           schedule_name="scan",
+                           detail="Schedule scan edited: timing 30 6 * * * -> 0 20 * * *")
+    for d in (19, 20, 21, 22):
+        occurrence(cfg, db, "scan", la(2026, 10, d, 20), la(2026, 10, d, 20, 0, 5))
+    week = cleanweek.check(cfg, db, END)
+    assert sorted(by_day(week)) == [19, 20, 21, 22] and week.schedules_ok
+    assert [i.command for i in week.interventions] == ["dashboard schedule edit"]
+    assert not week.clean
+
+
 def test_a_schedule_still_disabled_counts_nothing_since(cfg, db):
     add_schedule(db, enabled=False, created=la(2026, 10, 1))
     db.conn.execute("UPDATE schedules SET updated_at = ?", (iso(la(2026, 10, 2)),))

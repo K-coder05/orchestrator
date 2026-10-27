@@ -161,7 +161,12 @@ as one Occurrence however many were missed: `--catch-up "within <N>h"` runs it
 only if the latest missed fire is at most N hours old, `--catch-up next-wake`
 always runs it. `--overlap skip` (default) skips a fire while the previous
 Occurrence is unfinished; `--overlap replace` cancels that one and starts
-fresh. `orch schedule run-now <name>` fires once by hand.
+fresh. `orch schedule run-now <name>` fires once by hand. `orch schedule edit
+<name> --cron RULE --catch-up RULE --overlap skip|replace` changes any of the
+three rules (checked as `add` checks them), as does the dashboard's edit form
+on `/schedules`, beside its enable/disable toggle. The daemon uses the new
+rules from its next look; a new timing rule counts fires from the edit, so no
+run that already happened is repeated.
 
 `orch clean-week` checks the last 7 days (`--days N`, `--until WHEN`) against
 Gate 2: every Schedule fire either ran, caught up within its Catch-up rule, or
@@ -170,5 +175,5 @@ Failed Attempt and failed Task has an explanation (a crash with no error
 message, a daemon that died mid-Attempt, or an agent that reported failed
 without saying why is listed as unexplained); and nothing was done by hand
 (`orch cancel|retry|pause|resume|approve|deny|priority|raise-cap`, `orch
-schedule run-now|enable|disable|remove`; approving a plan while `orch add`
-asks doesn't count). It exits 1 if any of the three fails.
+schedule run-now|edit|enable|disable|remove`, or the same from Telegram or the
+dashboard; approving a plan while `orch add` asks doesn't count). It exits 1 if any of the three fails.
