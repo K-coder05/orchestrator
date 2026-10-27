@@ -216,8 +216,9 @@ def _msg(update_id, from_id, text):
 def test_incoming_messages_from_other_users_are_ignored_and_logged(tg_cfg, tg_db, api, notifier):
     api.updates = [_msg(7, 999001, "/approve all"), _msg(8, USER_ID, "status?")]
     assert notifier.poll_updates() is True
-    # Nothing is answered or acted on; only the configured user is ever written to.
-    assert api.sent == []
+    # The stranger gets nothing; only the configured user is ever written to
+    # (commands: tests/test_remote.py).
+    assert [chat for chat, _ in api.sent] == [USER_ID]
     assert any("ignored" in m and "999001" in m for m in notifier.logs)
     assert not any("/approve all" in m for m in notifier.logs)
     assert not any(str(USER_ID) in m for m in notifier.logs)

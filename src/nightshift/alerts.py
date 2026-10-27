@@ -19,7 +19,8 @@ afterwards: a Telegram outage only leaves alerts pending (retried until
 Comedy Tasks get status lines only: never the title, the Result, the
 reason or the request, which may carry script or idea content (§1.6).
 
-The same loop makes and sends the 8am digest (``nightshift.digest``).
+The same loop makes and sends the 8am digest (``nightshift.digest``); the
+long poll answers your commands (``nightshift.remote``).
 """
 
 from __future__ import annotations
@@ -217,9 +218,11 @@ class Notifier:
         return True
 
     def poll_updates(self) -> bool:
-        """One long poll for incoming updates. Phase 2 is outbound only, so
-        every update is ignored: one from another user is logged with its
-        sender ID (never its content). False if Telegram failed."""
+        """One long poll for incoming updates. A text message from
+        ``telegram.user_id`` is a command (``nightshift.remote``), answered
+        to that user; any other update from them is ignored. One from another
+        user is logged with its sender ID (never its content) and never
+        answered. False if Telegram failed."""
         offset = self.db.get_meta(OFFSET_KEY)
         timeout = self.cfg.telegram_setting("poll_timeout_seconds")
         try:
@@ -228,16 +231,45 @@ class Notifier:
             self.log(f"Telegram getUpdates failed: {exc}")
             return False
         for u in updates:
+            # Confirmed before it is acted on: a crash or restart mid-command
+            # never runs it twice.
+            self.db.set_meta(OFFSET_KEY, str(int(u["update_id"]) + 1))
             body: dict[str, Any] = next(
                 (u[k] for k in u if k != "update_id" and isinstance(u[k], dict)), {})
             sender = (body.get("from") or {}).get("id")
             if sender != self.user_id:
                 self.log(f"Telegram: ignored an update from user {sender}, who is not "
                          "telegram.user_id")
+            elif not isinstance(u.get("message"), dict):
+                self.log("Telegram: ignored an update from you that is not a new message")
             else:
-                self.log("Telegram: ignored a message from you (commands come in Phase 3)")
-            self.db.set_meta(OFFSET_KEY, str(int(u["update_id"]) + 1))
+                self.command(u["message"].get("text") or "")
         return True
+
+    #: Bounds of the wait for the daemon after a cancel or pause (None:
+    #: ``control``'s own); tests shorten them.
+    cancel_wait: float | None = None
+    pause_wait: float | None = None
+
+    def command(self, text: str) -> None:
+        """Run one command from you and answer it. Its text is never logged."""
+        from . import remote  # control -> daemon -> alerts: imported on use
+
+        def reply(msg: str) -> None:
+            try:
+                self.api.send_message(self.user_id, self.cfg.secrets.redact(msg))
+            except TelegramError as exc:
+                self.log(f"Telegram reply not sent: {exc}")
+
+        try:
+            verb = remote.run(self.cfg, self.db, text, at=self.clock(), reply=reply,
+                              cancel_wait=self.cancel_wait, pause_wait=self.pause_wait)
+        except Exception as exc:  # a bug in one command must not end the poll
+            self.log(f"Telegram command error: {type(exc).__name__}: {exc}")
+            reply(f"Nightshift hit an error running that command ({type(exc).__name__}); "
+                  "see the daemon log.")
+            return
+        self.log(f"Telegram: {verb} command from you")
 
     def tick(self) -> bool:
         """Collect alerts and a due digest, then deliver; False if Telegram failed."""
@@ -253,8 +285,9 @@ MAX_BACKOFF_SECONDS = 300.0
 class AlertService:
     """Runs a Notifier in the daemon on two background threads: one sends
     alerts (every ``interval`` seconds, or at once after :meth:`kick`), one
-    long-polls for incoming updates. Each has its own DB connection. A
-    Telegram outage or hang only stalls these threads, never the queue.
+    long-polls for incoming updates and answers commands. Each has its own
+    DB connection. A Telegram outage or hang only stalls these threads,
+    never the queue.
     """
 
     def __init__(self, cfg: Config, api: BotAPI, *, log: Callable[[str], None] | None = None,
@@ -342,5 +375,5 @@ def service_from_config(cfg: Config, *, log: Callable[[str], None],
         log(f"Telegram alerts off: secret {Config.TELEGRAM_TOKEN_SECRET} not found in .env "
             "or the Keychain")
         return None
-    log("Telegram alerts on (long polling; no port opened)")
+    log("Telegram alerts and commands on (long polling; no port opened)")
     return AlertService(cfg, HttpBotAPI(token), log=log, interval=interval)

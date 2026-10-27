@@ -1904,3 +1904,46 @@ lasting consequences go in `docs/adr/` instead.
   which kept writing to the Task folder after the Attempt ended (seen).
   Stops now signal the group and the group is SIGKILLed when the Attempt
   ends, for every agent.
+
+## Phase 3, issue #33: Telegram commands
+
+- **Command syntax.** One message is one command: a word, then its
+  arguments separated by spaces. A leading `/` and a `@botname` suffix are
+  optional (`/status`, `status` and `/status@mybot` are the same), and the
+  word's case doesn't matter.
+
+  | Command | Does |
+  |---|---|
+  | `status` | daemon up or down, the running Task, queue depth (queued, waiting to retry, scheduled), paused count, open "needs you" count |
+  | `list [state ...]` | Tasks in the dashboard's status groups (running, queued, paused, needs you, done, failed), newest first; the finished groups show their newest 10. States (as `orch list --status`, e.g. `list queued failed`) show only those |
+  | `approve <id>`, `deny <id>` | a Task awaiting approval |
+  | `cancel <id>`, `pause <id>`, `resume <id>`, `retry <id>` | as the `orch` commands |
+  | `priority <id> <urgent\|normal\|background>` | set the assigned Priority |
+  | `help` (also `start`) | the command list |
+
+  Anything else gets "Unknown command. Send help for the list."; a known
+  command with the wrong arguments gets its usage line. Inline buttons and
+  adding Tasks are #34; approving "needs you" requests is #35.
+- **Everything goes through `nightshift.control` with `via: telegram`**, so
+  checks, refusals, records and the clean-week interventions are exactly
+  those of the `orch` command. A refusal is replied as `Not done: <reason>`.
+  The control layer's wording is kept, except that a backticked
+  `` `orch resume <id>` `` (or another control command) becomes
+  `/resume <id>`.
+- **Cancel and pause of a running Task reply twice:** the request at once,
+  then the outcome after the control layer's bounded wait (30 s, or the
+  Step grace). The wait runs on the long-poll thread, so later commands
+  wait for it; the queue never does.
+- **Commands are answered in `nightshift.remote`, called from the
+  existing long poll** (`Notifier.poll_updates`). Only new text messages
+  from `telegram.user_id` are commands; edits and other update kinds are
+  ignored, and anything from another user is logged by sender ID and never
+  answered. A command's text is never logged, only its word (or
+  `unknown`). Replies go to `telegram.user_id`, redacted like alerts.
+- **The update offset is stored before the command runs**, so a crash or
+  restart mid-command never runs it again (at most once, never twice).
+  Replies aren't queued in the alerts outbox: a reply Telegram refuses is
+  logged and lost, the change itself already done; `status` shows it.
+- **Comedy Tasks are id and state only** in `status` and `list`. Control
+  replies are built from ids, states and fixed reasons, never the title,
+  request or Result, so they need no special case.

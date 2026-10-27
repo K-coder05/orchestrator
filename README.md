@@ -105,6 +105,9 @@ Keychain) as `TELEGRAM_BOT_TOKEN`, the daemon sends you a Telegram message when
 a Task finishes (its one-line Result), fails, or needs you; usage pauses stay
 silent, and comedy Tasks get status lines only. It only long-polls the Bot
 API, so no port is opened, and it ignores (and logs) messages from anyone else.
+It also takes commands from you: `status`, `list [state ...]`, `approve`,
+`deny`, `cancel`, `pause`, `resume` and `retry <id>`, and
+`priority <id> <urgent|normal|background>`; send `help` for the list.
 At 8am Los Angeles time (`telegram.digest_time`) one digest sums up everything
 since the previous one, usage pauses included, and what is still waiting; if
 the laptop was asleep at 8am it is sent once on wake.

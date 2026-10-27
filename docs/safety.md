@@ -243,15 +243,16 @@ dedupes and appends them (`nightshift.tracker`).
 | Delete files outside the Task folder | **Technically enforced** | Same as the write limit above. |
 | Turn off permission checks | **Technically enforced** | `--restricted` refuses `bypassPermissions`, the settings set `disableBypassPermissionsMode: disable`, and the adapter refuses flags that would do it. |
 | Coursework: never complete graded assignments | **Instruction-only** | |
-| Unreleased comedy material is never posted or shared | **Instruction-only** for the agent (it has no way to post: no shell network, read-only web); **technically enforced** for Telegram | A comedy Task's Telegram alert is built from its id and state only (`nightshift.alerts`): never its title, Result, failure reason or Needs you request. |
+| Unreleased comedy material is never posted or shared | **Instruction-only** for the agent (it has no way to post: no shell network, read-only web); **technically enforced** for Telegram | A comedy Task's Telegram alert, and its line in a `status` or `list` reply, is built from its id and state only (`nightshift.alerts`, `nightshift.remote`): never its title, Result, failure reason or Needs you request. |
 
 ### Telegram (§2.12)
 
 | Limit | Status | How |
 |---|---|---|
 | No port opened to the internet | **Technically enforced** | Nightshift only calls the Bot API (`sendMessage`, long-polling `getUpdates`); it never sets a webhook or listens on a socket. |
-| Nightshift writes only to you | **Technically enforced** | Every alert goes to `telegram.user_id`. |
-| Messages from anyone else are ignored and logged | **Technically enforced** | Phase 2 acts on no incoming message at all; one from another user is logged with its sender ID, never its content. |
+| Nightshift writes only to you | **Technically enforced** | Every alert and command reply goes to `telegram.user_id`, with secrets redacted. |
+| Messages from anyone else are ignored and logged | **Technically enforced** | Only a text message whose sender is `telegram.user_id` is a command (`nightshift.remote`); one from another user is never answered or acted on and is logged with its sender ID, never its content. Your own commands are logged by their command word only. |
+| Telegram commands change Tasks only as the CLI would | **Technically enforced** | Every command goes through `nightshift.control` with `via: telegram`: the same state checks and refusals, recorded as an intervention for the clean-week check. The update offset is stored before a command runs, so none is ever run twice. |
 | Bot token and user ID never logged or written into reports | **Technically enforced** | The token comes from `.env` or the Keychain (`TELEGRAM_BOT_TOKEN`); the user ID is registered with the same redaction as secrets, applied to the daemon log, reports and alert texts. Bot API errors are built from the method and status, never the request URL (which holds the token). |
 | A Telegram outage never fails or blocks a Task | **Technically enforced** | Alerts go to the `alerts` outbox first and are sent from their own daemon thread; a failed send is retried (backing off) until `telegram.alert_max_age_hours`, then dropped and logged. |
 

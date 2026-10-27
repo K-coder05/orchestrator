@@ -384,7 +384,8 @@ telegram:
   # TELEGRAM_BOT_TOKEN (create the bot with @BotFather, then send it a
   # message once so it may write to you).
   # Your numeric Telegram user ID (ask @userinfobot). Nightshift writes to
-  # this user only and ignores, and logs, messages from anyone else.
+  # this user only, takes commands (send the bot `help`) from this user
+  # only, and ignores, and logs, messages from anyone else.
   user_id: null
   # Long-polling timeout of each getUpdates call.
   poll_timeout_seconds: 30
