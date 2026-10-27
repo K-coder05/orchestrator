@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from . import cron, failures, planning, templates
+from . import cron, failures, ical, planning, templates
 from .config import Config, ConfigError
 from .db import Database
 from .runner import create_task
@@ -372,8 +372,14 @@ def _occurrence(cfg: Config, db: Database, s: Schedule, fire_at: datetime, *,
     why = ("run now by hand (orch schedule run-now)" if trigger == TRIGGER_RUN_NOW
            else f"fire at {iso(fire_at)}" + (f", {fires} missed fires collapsed" if fires > 1
                                               else ""))
+    deadline = None
+    if instance.course:
+        # A course Occurrence's deadline: the course's next due date (§2.3).
+        due = ical.course_deadline(cfg, instance.course, now)
+        deadline = due.at if due is not None else None
     new = create_task(
         cfg, db, instance.prompt, title=f"{s.name} {day:%Y-%m-%d}", task_type=tpl.task_type,
+        deadline=deadline,
         agent=s.agent or tpl.agent, agent_override=s.agent is not None, priority=s.priority,
         long=tpl.long, internet=tpl.internet, estimated_minutes=proposal.estimated_minutes,
         template=tpl.name, max_runtime_minutes=tpl.max_runtime_minutes,

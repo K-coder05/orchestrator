@@ -54,7 +54,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import daemon, failures, needsyou, pauses, planning, schedules, templates
+from . import daemon, failures, ical, needsyou, pauses, planning, schedules, templates
 from . import priority as prio
 from .adapters.base import Usage
 from .config import Config, ConfigError
@@ -125,6 +125,9 @@ class Draft:
     needs_plan: bool  # over the plan threshold: plan.md and approval
     template: templates.Template | None = None
     instance: templates.Instance | None = None
+    #: Where ``deadline`` came from when no --deadline was given (a course
+    #: due date from the calendar feeds, §2.3).
+    deadline_source: str | None = None
 
     @property
     def estimated_minutes(self) -> int:
@@ -621,13 +624,19 @@ def propose(cfg: Config, request: str, *, at: datetime, template: str | None = N
                                          adapter_provider=adapter_provider or planning.get_adapter)
     except (ConfigError, planning.PlanningError, templates.TemplateError) as exc:
         return refused(INVALID, f"{exc}. Nothing was queued.")
+    source = None
+    if deadline_at is None and instance is not None and instance.course:
+        # --deadline always wins; else the course's next due date (§2.3).
+        due = ical.course_deadline(cfg, instance.course, at)
+        if due is not None:
+            deadline_at, source = due.at, due.describe(cfg)
     draft = Draft(
         request=request, prompt=instance.prompt if instance else request, proposal=proposal,
         task_type=task_type or (tpl.task_type if tpl else proposal.task_type),
         type_given=task_type is not None, agent=agent, priority=priority, deadline=deadline_at,
         run_at=start_at, internet=internet, simulate_after=simulate_after,
         needs_plan=planning.needs_plan(cfg, proposal.estimated_minutes), template=tpl,
-        instance=instance,
+        instance=instance, deadline_source=source,
     )
     return Result(PROPOSED, "\n".join(describe(cfg, draft)), draft=draft)
 
@@ -653,6 +662,8 @@ def describe(cfg: Config, draft: Draft) -> list[str]:
              f"Task type: {draft.task_type}" + (" (from --type)" if draft.type_given else "")]
     lines += [f"Input:     {var} = {inst.values[var]}" for var in tpl.inputs]
     lines += [f"Input:     {f.source} -> {f.to}" for f in inst.files]
+    if draft.deadline_source:
+        lines.append(f"Due date:  {draft.deadline_source}: the Task's deadline")
     if tpl.deadline and not draft.deadline:
         lines.append(f"Deadline:  from the agent's {tpl.deadline['from_output']} "
                      f"({tpl.deadline['field']}), if the posting states one")

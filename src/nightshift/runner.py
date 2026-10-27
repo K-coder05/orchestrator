@@ -462,6 +462,9 @@ def run_attempt(
             course_policy = school.protocol_section(school.course(cfg, row["course"]))
         except school.CourseError as exc:
             raise ConfigError(f"{exc}. The Task did not start") from None
+    elif row["template"]:
+        # A Task about all my courses (the weekly roundup): every policy.
+        course_policy = templates.all_courses_policy(cfg, row)
 
     # A fresh policy every Attempt, so config changes apply and nothing the
     # agent did to an earlier one carries over.
@@ -551,8 +554,13 @@ def run_attempt(
     # one while the daily or monthly cap holds.
     at_cap = paid and spend.cap_reached(cfg, db, task_id)
     spend_held = paid and not at_cap and spend.spend_pause(cfg, db, clock()) is not None
+    # A template's pre-hooks (the school calendar fetch): Nightshift's own
+    # steps before the agent starts; one that fails is a Failed Attempt.
+    pre_error = None
+    if row["template"] and not at_cap and not spend_held:
+        pre_error = templates.run_pre_hooks(cfg, row, folder, clock())
     proc: subprocess.Popen | None = None
-    if not at_cap and not spend_held:
+    if not at_cap and not spend_held and pre_error is None:
         try:
             proc = subprocess.Popen(
                 command.argv,
@@ -765,6 +773,8 @@ def run_attempt(
     elif interrupted:
         state, outcome = TaskState.CANCELLED, "cancelled"
         end_reason = "interrupted from the terminal (Ctrl-C)"
+    elif pre_error is not None:
+        failed_attempt = f"Attempt {attempt_no}: the agent did not start: {pre_error}"
     elif exit_code != 0 or ok is False or proc is None:
         err = adapter.result_error() or (errors[-1] if errors else None)
         if resume_session and steps == 0 and proc is not None:

@@ -315,7 +315,25 @@ school:
   #       it to write or debug code for graded assignments.
   #     limits:
   #       - No solutions to homework, lab or project problems
+  # A course's calendar events are matched by title the same way, so add
+  # the name your calendars use as an alias (bCourses titles look like
+  # "HW 05 [COMPSCI 61A]": add "COMPSCI 61A").
   courses: {}
+  # The weekly school-roundup Schedule (Sunday 8pm) and course due-date
+  # deadlines read your bCourses calendar feed and your Google Calendar
+  # private iCal link. Both URLs are secrets: put them in .env or the
+  # Keychain as BCOURSES_ICAL_URL and GOOGLE_CALENDAR_ICAL_URL, never here
+  # (`orch doctor` says whether they are set). Nightshift fetches them
+  # itself; agents never see the URLs.
+  calendar:
+    # How far ahead the roundup looks, and how far ahead a course due date
+    # may be to become a course Task's deadline.
+    lookahead_days: 14
+    # A course Task's deadline comes from the latest fetch; one older than
+    # this is fetched again first.
+    refresh_hours: 12
+    # Each feed's fetch gives up after this long.
+    timeout_seconds: 20
 
 permissions:
   # Per-Task agent access (§1.4). The Task folder is the only writable place.

@@ -33,6 +33,7 @@ orch logs <id> -f
 orch report <id>
 orch schedule add posting-scan   # daily 6:30am, catch-up within 12h else skip, overlap skip
 orch schedule add company-rescrape  # 2am every 2 days, catch-up on next wake, overlap skip
+orch schedule add school-roundup    # Sunday 8pm, catch-up on next wake, overlap skip
 orch schedule list           # also enable | disable | run-now | remove <name>
 orch clean-week              # Gate 2: were the last 7 days clean? exits 1 if not
 orch dashboard install       # read-only web dashboard: its own launchd agent on
@@ -97,7 +98,16 @@ and writes `output/study_guide.md` and `output/practice_problems.md`. The
 request names the course, which needs an AI policy in config
 (`school.courses`): that policy heads the agent protocol and wins over
 everything else. A course with no policy, or a folder outside `~/school/`,
-is refused. It never does or submits graded work.
+is refused. It never does or submits graded work. It gets the course's next
+due date from your calendars as its deadline, unless `--deadline` is given.
+`school-roundup` (the weekly Schedule) writes `output/roundup.md`, every due
+date of the coming two weeks, and `output/study_plan.md`, a 7-day plan. Before
+it starts, Nightshift itself fetches your bCourses calendar feed and Google
+Calendar private iCal link and writes the events into the Task folder; the
+agent never sees the URLs. Put them in `~/.config/nightshift/.env` (or the
+Keychain) as `BCOURSES_ICAL_URL` and `GOOGLE_CALENDAR_ICAL_URL`; `orch doctor`
+says whether they are set. Each course's AI policy heads its protocol; a
+course without one gets its due dates listed and no study plan.
 
 The queue runs by Effective priority: urgent first (nearest deadline first),
 then normal in order, then background only when nothing else can start. A

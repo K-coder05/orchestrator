@@ -87,7 +87,8 @@ def scfg(scfg_dir):
 
 def test_defaults_have_the_school_section():
     school_cfg = load_defaults()["school"]
-    assert school_cfg == {"dir": "~/school", "courses": {}}
+    assert school_cfg == {"dir": "~/school", "courses": {}, "calendar": {
+        "lookahead_days": 14, "refresh_hours": 12, "timeout_seconds": 20}}
     assert "~/school" in load_defaults()["permissions"]["read_only_dirs"]
     # config.example.yaml is a byte-identical copy of the packaged defaults.
     assert (REPO / "config.example.yaml").read_text() == (

@@ -3,7 +3,8 @@
 Reads machine facts and installed tool versions from the machine through the
 host seam (ADR 0001), compares the facts with ``machine`` in config, reports
 ``launchd`` status and prints the optional ``pmset`` wake command. Every
-probe is read-only; the ``pmset`` command is printed, never run.
+probe is read-only; the ``pmset`` command is printed, never run. It also
+says whether the school calendar feeds' secrets are set (never their values).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import ical
 from .config import Config
 from .host import HardwareInfo, Host, LaunchdStatus
 
@@ -70,6 +72,13 @@ class DoctorReport:
     #: the launchd daemon can't run at all.
     access: list[str] = field(default_factory=list)
     access_blocking: bool = False
+    #: The school calendar feeds' secrets (§5 item 3): (label, secret name,
+    #: set?). Never their values.
+    calendar_secrets: list[tuple[str, str, bool]] = field(default_factory=list)
+
+    @property
+    def unset_secrets(self) -> list[str]:
+        return [name for _label, name, ok in self.calendar_secrets if not ok]
 
     @property
     def missing(self) -> list[ToolResult]:
@@ -213,6 +222,8 @@ def run_doctor(cfg: Config, host: Host) -> DoctorReport:
         config_path=cfg.source or cfg.config_dir / "config.yaml",
         access=daemon.format_access_problems(problems),
         access_blocking=any(p.blocking for p in problems),
+        calendar_secrets=[(f.label, f.secret, ok) for f, ok in zip(
+            ical.FEEDS, ical.configured(cfg).values())],
     )
 
 
@@ -271,8 +282,18 @@ def format_report(r: DoctorReport) -> str:
         f"  {r.wake_command}",
         "",
     ]
+    if r.calendar_secrets:
+        lines.append("Secrets (school calendar iCal URLs, in .env or the Keychain)")
+        width = max(len(label) for label, _, _ in r.calendar_secrets)
+        for label, name, ok in r.calendar_secrets:
+            lines.append(f"  {'ok' if ok else 'NOT SET':<7}  {label:<{width}}  {name}"
+                         + ("" if ok else ": the school-roundup Schedule can't read it"))
+        lines.append("")
     if r.ok:
         lines.append("Ready: no missing tools, no mismatches.")
+        if r.unset_secrets:
+            lines.append(f"Not set: {', '.join(r.unset_secrets)} (only the school-roundup "
+                         "Schedule needs them).")
     else:
         parts = []
         if r.missing:

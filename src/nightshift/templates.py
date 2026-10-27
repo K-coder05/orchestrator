@@ -43,6 +43,12 @@ snapshot section: the diff against the previous Task's snapshot as counts
 company-brief) gets a Sources section: the distinct sources its result cites,
 read by Nightshift from the result file (``research``). A course Task
 (study-guide) gets a Course AI policy section naming the policy it ran under.
+
+``pre_hooks``: Nightshift's own steps before each Attempt (``PRE_HOOKS``).
+``school_calendar`` (school-roundup) fetches the calendar feeds (``ical``) and
+writes the coming events to ``to``; one that fails is a Failed Attempt and the
+agent doesn't start. ``courses: all``: the Task is about every course, so every
+course's AI policy heads its protocol (and its report says which).
 """
 
 from __future__ import annotations
@@ -60,7 +66,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from . import latex, research, school, snapshots, trace, tracker
+from . import ical, latex, research, school, snapshots, trace, tracker
 from .config import Config
 from .db import Database
 from .failures import PostHook, PostHookFailed
@@ -85,7 +91,7 @@ BUILTIN_DIR = Path(__file__).resolve().parents[2] / "templates"
 REQUIRED = ("task_type", "agent", "estimated_minutes", "max_runtime_minutes", "long",
             "internet", "prompt")
 OPTIONAL = ("name", "description", "inputs", "files", "values", "deadline", "post_hooks",
-            "report_diffs", "schedule")
+            "report_diffs", "schedule", "pre_hooks", "courses")
 #: Keys of a template's ``schedule:`` block (its standard Schedule's rules).
 SCHEDULE_KEYS = ("cron", "catch_up", "overlap", "request")
 #: What an ``inputs`` entry takes from the request (``from:``).
@@ -125,6 +131,11 @@ class Template:
     #: The template's standard Schedule rules (``orch schedule add NAME``
     #: uses them when no flag is given): {cron, catch_up, overlap}.
     schedule: dict | None = None
+    #: Steps Nightshift runs before each Attempt (``PRE_HOOKS``).
+    pre_hooks: list[dict] = field(default_factory=list)
+    #: ``all``: the Task is about all my courses; every course's AI policy
+    #: heads its agent protocol (``school.all_courses_section``).
+    courses: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """What ``planning.from_template`` reads."""
@@ -244,6 +255,21 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
         _input_file(name, files, "report_diffs against", d.get("against"))
 
     schedule = _validate_schedule(name, data.get("schedule"))
+    pre = data.get("pre_hooks") or []
+    if not isinstance(pre, list):
+        raise TemplateError(f"template {name!r}: pre_hooks must be a list")
+    for h in pre:
+        if not isinstance(h, dict) or h.get("hook") not in PRE_HOOKS:
+            raise TemplateError(f"template {name!r}: pre-hook {h!r} must name one of "
+                                f"{', '.join(sorted(PRE_HOOKS))}")
+        PRE_HOOKS[h["hook"]].validate(name, h)
+    courses = data.get("courses")
+    if courses is not None and courses != "all":
+        raise TemplateError(f"template {name!r}: courses must be all (the Task is about every "
+                            "configured course) or left out")
+    if courses and "course" in [spec["from"] for spec in inputs.values()]:
+        raise TemplateError(f"template {name!r}: courses: all and an input from: course "
+                            "exclude each other")
 
     known = {"request", *inputs, *files, *values}
     used = set(_VAR.findall(data["prompt"]))
@@ -257,7 +283,7 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
         internet=data["internet"], prompt=data["prompt"],
         description=str(data.get("description") or ""), inputs=dict(inputs), files=dict(files),
         values=dict(values), deadline=deadline, post_hooks=list(hooks), report_diffs=list(diffs),
-        schedule=schedule,
+        schedule=schedule, pre_hooks=list(pre), courses=courses,
     )
 
 
@@ -791,6 +817,107 @@ def post_hooks(cfg: Config, row: Mapping[str, Any], host: Host | None = None) ->
 
 
 # --------------------------------------------------------------------------
+# Pre-hooks: Nightshift's steps before each Attempt
+# --------------------------------------------------------------------------
+
+
+class PreHookFailed(Exception):
+    """A pre-hook could not prepare the Attempt; it is a Failed Attempt."""
+
+
+@dataclass
+class PreHookKind:
+    validate: Callable[[str, dict], None]
+    #: run(cfg, tpl, hook, row, folder, at); raises PreHookFailed.
+    run: Callable[[Config, Template, dict, Mapping[str, Any], Path, datetime], None]
+
+
+def _validate_calendar(name: str, h: dict) -> None:
+    unknown = sorted(set(h) - {"hook", "to"})
+    if unknown:
+        raise TemplateError(f"template {name!r}: school_calendar has unknown keys "
+                            f"{', '.join(unknown)}")
+    _rel_path(name, "school_calendar to", h.get("to"))
+
+
+def calendar_record(cfg: Config, task_id: str) -> Path:
+    """The calendar a Task's Attempts work from, as fetched (no URLs), in
+    the data dir where the agent can't reach it."""
+    return pristine_dir(cfg, task_id) / "calendar.json"
+
+
+def _run_calendar(cfg: Config, tpl: Template, h: dict, row: Mapping[str, Any], folder: Path,
+                  at: datetime) -> None:
+    """Fetch the school calendar feeds (``ical``) and write the coming
+    events into the Task folder (``to``). Once per Task: later Attempts
+    (retries, resumes) work from the same events. A feed that fails, or no
+    feed set up at all, fails the Attempt; nothing is written."""
+    dest = folder / h["to"]
+    record = calendar_record(cfg, row["id"])
+    if record.is_file() and dest.is_file() and not dest.is_symlink():
+        return
+    if not any(ical.configured(cfg).values()):
+        raise PreHookFailed(
+            "no calendar feed is set up: put your bCourses and Google Calendar iCal URLs in "
+            "~/.config/nightshift/.env or the Keychain as "
+            + " and ".join(f.secret for f in ical.FEEDS) + " (`orch doctor` checks them)")
+    snap = ical.fetch(cfg, at)
+    ical.store(cfg, snap)
+    if snap.errors:
+        raise PreHookFailed("could not fetch the calendar: " + "; ".join(snap.errors))
+    ical.save(record, snap)
+    try:
+        latex.inside(folder, dest)
+    except latex.LatexError as exc:
+        raise PreHookFailed(str(exc)) from None
+    if dest.is_symlink():
+        dest.unlink()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(ical.calendar_markdown(cfg, snap))
+    due = sum(1 for e in snap.events if e.due)
+    log_line(folder, "calendar fetched: " + ", ".join(
+        f"{f.label} {f.events} event(s)" if f.configured else f"{f.label} not configured"
+        for f in snap.feeds) + f"; {due} due date(s); written to {h['to']}",
+        cfg.secrets.redact, cfg.timezone)
+
+
+PRE_HOOKS: dict[str, PreHookKind] = {
+    "school_calendar": PreHookKind(_validate_calendar, _run_calendar),
+}
+
+
+def run_pre_hooks(cfg: Config, row: Mapping[str, Any], folder: Path, at: datetime) -> str | None:
+    """Run a template Task's pre-hooks before an Attempt. Returns why one
+    failed (the Attempt is then a Failed Attempt, §2.7), or None."""
+    if not row["template"]:
+        return None
+    try:
+        tpl = load(cfg, row["template"])
+    except TemplateError:
+        return None  # the post-hooks report it
+    for h in tpl.pre_hooks:
+        try:
+            PRE_HOOKS[h["hook"]].run(cfg, tpl, h, row, folder, at)
+        except (PreHookFailed, OSError) as exc:
+            why = cfg.secrets.redact(f"pre-hook {h['hook']} failed: {exc}")
+            log_line(folder, why, cfg.secrets.redact, cfg.timezone)
+            return why
+    return None
+
+
+def all_courses_policy(cfg: Config, row: Mapping[str, Any]) -> str | None:
+    """The protocol section of a ``courses: all`` template Task: every
+    course's AI policy (``school.all_courses_section``); else None."""
+    if not row["template"]:
+        return None
+    try:
+        tpl = load(cfg, row["template"])
+    except TemplateError:
+        return None
+    return school.all_courses_section(cfg) if tpl.courses == "all" else None
+
+
+# --------------------------------------------------------------------------
 # Report diffs
 # --------------------------------------------------------------------------
 
@@ -866,6 +993,54 @@ def course_section(cfg: Config, course_id: str) -> str:
             f"{limits}) headed the agent protocol of every Attempt, ahead of everything else.")
 
 
+def courses_section(cfg: Config) -> str:
+    """The report's Course AI policies section of a ``courses: all`` Task."""
+    found = school.courses(cfg).values()
+    ok = [c for c in found if c.policy is not None and c.ai_allowed]
+    none = [c.label + (" (no policy)" if c.policy is None else " (no AI use)")
+            for c in found if c not in ok]
+    lines = ["### Course AI policies", ""]
+    if not ok:
+        lines.append("No course has a usable AI policy in config (`school.courses`), so the "
+                     "agent was told to list due dates only.")
+    else:
+        lines.append("Each course's AI policy (`school.courses` in config) headed the agent "
+                     "protocol of every Attempt: " + ", ".join(
+                         c.label + (f" ({len(c.limits)} hard limit"
+                                    f"{'s' if len(c.limits) != 1 else ''})" if c.limits else "")
+                         for c in ok) + ".")
+    if none:
+        lines.append("Due dates only, no study work: " + ", ".join(none) + ".")
+    return "\n".join(lines)
+
+
+def calendar_section(cfg: Config, row: Mapping[str, Any]) -> str:
+    """The report's School calendar section: what Nightshift fetched (feeds
+    by name, never their URLs) and the due dates per course, as counts."""
+    title = "### School calendar"
+    snap = ical.load(calendar_record(cfg, row["id"]))
+    if snap is None:
+        return f"{title}\n\nThe calendar was not fetched (see `logs/nightshift.log`)."
+    tz = ZoneInfo(cfg.timezone)
+    feeds = ", ".join(f"{f.label}: {f.events} event{'s' if f.events != 1 else ''}"
+                      if f.configured else f"{f.label}: not configured" for f in snap.feeds)
+    names = {c.id: c.label for c in school.courses(cfg).values()}
+    per: dict[str, int] = {}
+    for e in snap.events:
+        if e.due and e.course:
+            per[names.get(e.course, e.course)] = per.get(names.get(e.course, e.course), 0) + 1
+    loose = sum(1 for e in snap.events if e.course is None)
+    lines = [title, "",
+             f"Fetched by Nightshift at {snap.fetched_at.astimezone(tz):%Y-%m-%d %H:%M}, covering "
+             f"{snap.start.astimezone(tz):%b %d} to {snap.end.astimezone(tz):%b %d} ({feeds}).",
+             "Due dates per course: " + (", ".join(f"{k} {v}" for k, v in per.items())
+                                         or "none") + ".",
+             f"{loose} event{'s' if loose != 1 else ''} named no configured course."]
+    if snap.notes:
+        lines.append("Not fully read: " + "; ".join(snap.notes) + ".")
+    return "\n".join(lines)
+
+
 def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
     """The Nightshift-written part of a template Task's ``report.md``: each
     ``report_diffs`` item as a unified diff of an output against the pristine
@@ -880,6 +1055,10 @@ def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
     parts = []
     if "course" in row.keys() and row["course"]:
         parts.append(course_section(cfg, row["course"]))
+    if tpl.courses == "all":
+        parts.append(courses_section(cfg))
+    if any(h["hook"] == "school_calendar" for h in tpl.pre_hooks):
+        parts.append(calendar_section(cfg, row))
     if any(h["hook"] == "merge_tracker" for h in tpl.post_hooks):
         parts.append(new_postings(cfg, row))
     if any(h["hook"] == "snapshot_pages" for h in tpl.post_hooks):

@@ -2454,3 +2454,129 @@ lasting consequences go in `docs/adr/` instead.
   the slides*, and new practice problems with an `## Answers` section;
   the slides folder untouched. A second run straight after hit Claude's
   five-hour limit and paused (expected handling, not a defect).
+
+## Phase 3, issue #41: the weekly school deadline roundup (iCal feeds)
+
+- **No new dependency: our own iCal reader** (`nightshift.ical`, standard
+  library only, like the cron parser and the Telegram client). `icalendar`
+  plus `recurring-ical-events` (and their `python-dateutil`, `x-wr-timezone`
+  dependencies) would cover more of RFC 5545, but the two feeds need a known
+  subset: line unfolding and text escapes; `DTSTART`/`DTEND`/`DURATION`;
+  all-day (`VALUE=DATE`) events; UTC, `TZID` (IANA names, Outlook/Windows
+  names, `/mozilla.org/.../America/X` prefixes; anything else is the
+  configured zone) and floating times (`X-WR-TIMEZONE`, else the configured
+  zone); `STATUS:CANCELLED`; recurring events with `RRULE` (`FREQ` daily,
+  weekly, monthly, yearly with `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY` with
+  ordinals, `BYMONTHDAY`, `BYMONTH`, `BYSETPOS`, `WKST`), `RDATE`, `EXDATE`
+  and `RECURRENCE-ID` overrides. Instances are made in the event's own wall
+  clock, so a 10am lecture stays 10am across the DST change. A rule with any
+  other part (`HOURLY`, `BYWEEKNO`, ...) lists only its first instance and
+  says so in the input file and the report ("Not fully read"), never
+  silently. Fetching is stdlib `urllib` with a timeout
+  (`school.calendar.timeout_seconds`, 20 s) and a 10 MB cap; `webcal://` is
+  read as `https://`.
+- **The URLs are secrets**, `BCOURSES_ICAL_URL` and
+  `GOOGLE_CALENDAR_ICAL_URL`, in `.env` or the Keychain (fixed names, like
+  `TELEGRAM_BOT_TOKEN`). Loading one registers it for redaction. Only
+  Nightshift code reads them: the agent gets parsed events, never a URL; no
+  URL goes into `task.yaml`, a prompt, the DB, a log or a report. Fetch
+  errors are built from the feed's name and the HTTP status or the
+  connection error's reason, then redacted again (a test feeds an error
+  whose text holds the URL). The test suite runs the roundup end to end and
+  searches every file under `agents_root`, the DB included, for both URLs
+  and their tokens.
+- **When the feeds are fetched: before the first Attempt, by Nightshift**,
+  as a template **pre-hook** (`pre_hooks: [{hook: school_calendar, to:
+  input/calendar.md}]`, a new template key, run in `run_attempt` before the
+  agent starts), not when the Occurrence is created. The Sunday fire is
+  often caught up on wake, when the network may not be up yet: a fetch that
+  fails then is a **Failed Attempt** (the agent doesn't start; retried at 10
+  and 30 minutes, §2.7) instead of a lost week. Any configured feed failing
+  fails the Attempt: a roundup that silently lacks the bCourses due dates is
+  worse than one that comes 10 minutes late. A feed whose secret is unset is
+  skipped and marked "not configured" in the input file; none set at all
+  fails the Attempt with what to do. Fetched **once per Task**: retries and
+  resumes work from the same events (the agent may already have used them).
+- **The input file** `input/calendar.md` (Markdown, for the agent): the
+  coming `school.calendar.lookahead_days` (14) of events, one section per
+  configured course with its rule ("AI policy in the protocol above", or
+  "due dates only, no study work"), due dates first with a 300-character
+  plain-text description, then the course's other events; then everything
+  naming no configured course as **titles and times only** (no
+  descriptions, locations: my personal calendar stays as private as it can
+  while still letting the plan fit around it). Nightshift keeps the full
+  fetch (no URLs) in `data/inputs/<task-id>/calendar.json` for the report
+  and the latest successful fetch in `data/school/calendar.json`; agents
+  can't reach either.
+- **Each course's AI policy**: a new template key `courses: all` puts every
+  configured course's policy and hard limits at the head of the agent
+  protocol (`school.all_courses_section`), course by course, with the same
+  coursework rule. A course with no policy or `ai_allowed: false` is listed
+  there as "no study work: list its due dates only", and so is anything
+  naming no configured course (§1.6: a course with no AI policy gets no
+  Tasks, so it gets no AI-made plan either; its dates are calendar facts
+  Nightshift fetched). The report gets `### Course AI policies` (which
+  courses' policies applied, which got due dates only) and `### School
+  calendar` (fetch time, events per feed, due dates per course, events
+  naming no course), both written by Nightshift.
+- **Template `school-roundup`**: Task type `study` on Claude (failover to
+  Gemini, §2.8), **internet off** (the events are local; the agent needs no
+  web, and an internet-off Task can't leak them), 20 minutes estimated (no
+  plan approval), 60-minute cap, not long. Standard Schedule `0 20 * * 0`
+  (Sunday 8pm), catch-up "run on next wake", overlap skip; pre-approved like
+  every Occurrence. Outputs `output/roundup.md` (everything due, soonest
+  first, a Due soon section for the next 48 hours, a Later list) and
+  `output/study_plan.md` (7 days, sessions fitted around fixed events,
+  working back from due dates), both checked by `require_outputs`.
+- **The matching rule for course deadlines** (§2.3 "a course due date from
+  a calendar feed"):
+  - An event belongs to a course when its **title** names exactly one
+    configured course, by id, name or alias, with #40's rule (whole names,
+    ignoring case, spaces, `-`, `_`). bCourses titles look like `HW 05
+    [COMPSCI 61A]`, so add the bCourses course code as an alias. An event
+    naming two courses belongs to neither.
+  - It is a **due date** when it is a bCourses assignment (its UID contains
+    `assignment`, Canvas's `event-assignment-<id>`), or its title has one of
+    the words due, deadline, homework, hw, assignment, pset, problem set,
+    quiz, exam, midterm, final, essay (whole words, any case, a plural or a
+    number may follow: `hw5`, `Exams`). Lectures, sections, office hours and
+    study groups are not.
+  - When it is due: a timed event's start (bCourses puts the due time
+    there); an all-day event at 23:59:59 local of its first day, like a
+    posting's close date.
+  - A Task tied to a course (an input `from: course`: study-guide, from
+    `orch add`, Telegram or a Schedule) gets the **earliest** due date of
+    its course that is after now and within `lookahead_days`, unless
+    `--deadline` was given (which always wins; the feeds aren't even read
+    then). `orch add` shows `Due date: <when> (<title>, from your <feed>):
+    the Task's deadline`. Nothing matching: no deadline, normal priority.
+  - It reads the latest fetch (`data/school/calendar.json`); one older than
+    `school.calendar.refresh_hours` (12) is fetched again first. A failed
+    fetch falls back to the older one, and the feeds being down never stops
+    a Task from being added (it just gets no deadline). A fetch in which a
+    feed failed is never cached.
+  - Not done: matching the request's words to a specific event ("study
+    guide for the midterm" still gets the next due date, whatever it is).
+- **`orch doctor`** has a Secrets section: each feed's secret name and `ok`
+  or `NOT SET` (never the value). Unset secrets don't make it "Not ready"
+  (only the roundup needs them); a Ready report adds a "Not set: ..." line.
+- **Config**: `school.calendar` (`lookahead_days` 14, `refresh_hours` 12,
+  `timeout_seconds` 20), validated; the URLs never go in config.
+- **Tests.** `tests/test_roundup.py`, with local sample feeds in
+  `tests/fixtures/ical/` (a bCourses-style feed and a Google-style one) and
+  a fake fetcher (`ical.fetch_url` replaced; no network): all-day events,
+  UTC/TZID/Windows/mozilla/New York/floating times, a weekly MO/WE/FR rule
+  with `UNTIL`, an `EXDATE`, a moved instance and the DST change, daily
+  `COUNT`, monthly last Friday, more rule shapes, a cancelled event, an
+  unsupported rule, a non-feed; course and due-date classification;
+  deadlines (next due date, all-day end of day, lookahead, cache and
+  refresh, fallback, no feeds); `orch add --template study-guide` getting
+  the deadline, `--deadline` winning, the feeds down; a course Occurrence;
+  the template and bad keys; the protocol; the standard Schedule (Sunday
+  8pm, next wake, skip), a missed Sunday caught up once on wake and run end
+  to end with the fake Claude (`FAKE_STUDY`) to `done`; a failed feed as a
+  Failed Attempt that never starts the agent and a retry that works; one
+  fetch per Task across a retry; no feed set up; Keychain URLs redacted;
+  `orch doctor`. No URL in any written file is checked twice. There is no
+  real-agent run for this issue: the agent's part is the same Claude path
+  as study-guide (#40), and the fetch is Nightshift code tested here.

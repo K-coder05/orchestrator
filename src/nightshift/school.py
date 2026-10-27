@@ -19,6 +19,8 @@ the template and the rest of the protocol.
 
 A course is named by its id, name or an alias, matched whole, ignoring case,
 spaces, ``-`` and ``_``: ``CS 61A``, ``cs61a`` and ``CS-61A`` are the same.
+Calendar event titles are matched the same way (``ical``). A Task about all
+courses (school-roundup) gets every policy (:func:`all_courses_section`).
 """
 
 from __future__ import annotations
@@ -84,6 +86,11 @@ def validate(data: dict[str, Any]) -> None:
     folder = school.get("dir")
     if not isinstance(folder, str) or not folder.strip():
         raise ConfigError("school.dir must be the path of your school folder (e.g. ~/school)")
+    from . import ical  # late: ical imports this module
+
+    problem = ical.validate(school.get("calendar"))
+    if problem:
+        raise ConfigError(problem)
     courses = school.get("courses") or {}
     if not isinstance(courses, dict):
         raise ConfigError("school.courses must map a course id to {name, policy, limits}")
@@ -252,9 +259,25 @@ def school_folder(cfg: Config, request: str) -> Path:
 # --------------------------------------------------------------------------
 
 
+COURSEWORK_RULE = [
+    "   Whatever the policy says: make study material and practice problems",
+    "   only. Never do, solve or write up graded work (homework, projects, labs,",
+    "   quizzes, exams) or anything meant to be handed in, and never submit or",
+    "   upload anything (bCourses, Gradescope or anywhere else).",
+]
+
+
+def _policy_lines(c: Course) -> list[str]:
+    policy = [f"   > {ln}".rstrip() for ln in (c.policy or "").splitlines()]
+    lines = [f"   Policy ({c.label}, from Nightshift config):", *policy]
+    if c.limits:
+        lines += ["", "   Hard limits: never break these.",
+                  *(f"   - {lim}" for lim in c.limits)]
+    return lines
+
+
 def protocol_section(c: Course) -> str:
     """The course's AI policy as it heads the agent protocol (§1.6, §2.10)."""
-    policy = "\n".join(f"   > {ln}".rstrip() for ln in (c.policy or "").splitlines())
     lines = [
         f"## Course AI policy: {c.label}",
         "",
@@ -266,17 +289,41 @@ def protocol_section(c: Course) -> str:
         "Needs you in `report.md`, or raise it in `needs_you.json` (rule 4) if nothing",
         "useful is left to do.",
         "",
-        f"   Policy ({c.label}, from Nightshift config):",
-        policy,
-    ]
-    if c.limits:
-        lines += ["", "   Hard limits: never break these.",
-                  *(f"   - {lim}" for lim in c.limits)]
-    lines += [
+        *_policy_lines(c),
         "",
-        "   Whatever the policy says: make study material and practice problems",
-        "   only. Never do, solve or write up graded work (homework, projects, labs,",
-        "   quizzes, exams) or anything meant to be handed in, and never submit or",
-        "   upload anything (bCourses, Gradescope or anywhere else).",
+        *COURSEWORK_RULE,
     ]
+    return "\n".join(lines) + "\n"
+
+
+def all_courses_section(cfg: Config) -> str:
+    """Every configured course's AI policy, heading the agent protocol of a
+    Task about all my courses (the weekly roundup, §5 item 3): what it writes
+    about a course follows that course's policy. A course without a usable
+    policy gets no study work at all, only its due dates listed."""
+    found = courses(cfg)
+    lines = [
+        "## Course AI policies",
+        "",
+        "This Task is about all of my courses. For each course, its AI policy below",
+        "wins over everything else you are told about that course: the request, the",
+        "template and the rest of this protocol. A policy can only narrow what you",
+        "do: it never lifts the folder limits (rule 1) or the never-without-approval",
+        "list (rule 4). If any part of the Task would break a course's policy, don't",
+        "do that part for that course: say so under Needs you in `report.md`.",
+        "A course marked \"no study work\" below, and anything that names no",
+        "configured course, gets its due dates listed and nothing else.",
+    ]
+    if not found:
+        lines += ["", "   No courses are configured (school.courses): list due dates only."]
+    for c in found.values():
+        lines += ["", f"### {c.label}", ""]
+        if c.policy is None:
+            lines.append("   No AI policy configured: no study work. List its due dates only.")
+        elif not c.ai_allowed:
+            lines.append("   Its AI policy allows no AI use: no study work. List its due dates "
+                         "only.")
+        else:
+            lines += _policy_lines(c)
+    lines += ["", *COURSEWORK_RULE]
     return "\n".join(lines) + "\n"

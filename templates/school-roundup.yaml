@@ -1,0 +1,89 @@
+# school-roundup (§5 item 3): the weekly school deadline roundup and study
+# plan. Usage:
+#   orch schedule add school-roundup  (the standard Schedule below: Sunday
+#                                      8pm, catch-up run on next wake,
+#                                      overlap skip; pre-approved)
+#   orch add "Deadline roundup and study plan" --template school-roundup
+#
+# Before each Attempt Nightshift (never the agent) fetches the bCourses
+# calendar feed and the Google Calendar private iCal link, whose URLs are
+# secrets (BCOURSES_ICAL_URL, GOOGLE_CALENDAR_ICAL_URL in .env or the
+# Keychain), and writes the coming school.calendar.lookahead_days of events
+# into input/calendar.md, grouped by course (school.courses, matched by event
+# title). Once per Task: a retry or resume works from the same events. A
+# feed that fails is a Failed Attempt (retried at 10 and 30 minutes); no
+# feed set up at all fails it too. The URLs are never in task.yaml, the
+# prompt, the logs or the report.
+#
+# Every configured course's AI policy heads the agent protocol (courses:
+# all). A course with no policy, or one allowing no AI use, gets its due
+# dates listed and no study work.
+#
+# A `study` Task on Claude, failing over to Gemini (§2.8). Internet off: the
+# events are local and the agent needs no web. 20 minutes, no plan approval.
+name: school-roundup
+description: Weekly school deadline roundup and study plan from the bCourses and Google calendars
+task_type: study
+agent: claude
+estimated_minutes: 20
+max_runtime_minutes: 60
+long: false
+internet: "off"
+courses: all
+
+schedule:
+  cron: "0 20 * * 0"
+  catch_up: next-wake
+  overlap: skip
+  request: Weekly school deadline roundup and study plan
+
+pre_hooks:
+  - hook: school_calendar
+    to: input/calendar.md
+
+post_hooks:
+  - hook: require_outputs
+    files: [output/roundup.md, output/study_plan.md]
+
+prompt: |
+  Write my weekly school deadline roundup and a study plan for the coming
+  week. My request:
+  "{{request}}"
+
+  Nightshift has fetched my bCourses calendar and my Google Calendar and
+  written the coming events to `input/calendar.md`, grouped by course, with
+  each course's rule. Read it first; it is the only source of dates. Never
+  guess or add a due date that isn't in it, and never try to fetch the
+  calendars yourself. If it lists no events at all, say so in the roundup
+  and the report and stop after writing both output files.
+
+  Each course's AI policy heads the Nightshift protocol and wins over
+  everything here, course by course. A course marked "no study work" (no
+  policy, or no AI use allowed), and any due date that names no configured
+  course, get listed with their dates and nothing else. Never do, solve or
+  write up graded work, and never submit or upload anything.
+
+  Do this in order, keeping `progress.md` current after each step:
+
+  1. Write `output/roundup.md`: a `# School roundup: <first day> to <last
+     day>` line, then everything due in that window, soonest first, as
+     one line each: day and time, course, what is due, and how many days
+     away it is. Put anything due in the next 48 hours under a `## Due
+     soon` heading at the top. Then a `## Later` list of what is due after
+     the coming week. Note any feed that failed or wasn't configured, as
+     `input/calendar.md` says.
+  2. Write `output/study_plan.md`: a plan for the next 7 days, one `##`
+     section per day. Fit study sessions around my other calendar events
+     (lectures, sections, anything else at a set time), working back from
+     each due date and exam, with the soonest and biggest first. Each
+     session names the course, what to study or review, and a rough length.
+     Plan only for courses whose policy allows it, and keep each session
+     within its policy. A session may be time for me to work on an
+     assignment myself; never write any of its answers, solutions or hints.
+  3. Write `report.md`. Under Summary say how many due dates the coming
+     week has and which course needs the most time; list anything due in
+     the next 48 hours under Needs you.
+
+  Nightshift fails this Attempt if either output file is missing or empty.
+  If `logs/nightshift.log` shows a failed post-hook from an earlier
+  Attempt, fix what it names first.
