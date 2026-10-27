@@ -2108,3 +2108,60 @@ lasting consequences go in `docs/adr/` instead.
   Origins, missing, wrong and old-process tokens on every action,
   cross-site fetch metadata, a foreign Host, GETs to every action, an
   oversized form, and HTMX served locally (`tests/test_dashboard.py`).
+
+## Phase 3, issue #37: dashboard approve/deny inbox buttons
+
+- **Which items get buttons: `control.decidable(db, row)`**, new in the
+  control layer next to `available`: a Task in `awaiting_approval` (a plan,
+  or a re-approval after a long usage pause) or one in `needs_you` with an
+  open agent request (`needsyou.open_request`). Anything else in the inbox
+  has none: the monthly spend cap (`paused_spend`) and the per-Task cap
+  (`needs_you` without a request) keep pointing at `orch raise-cap`, as
+  `control.approve` would refuse them anyway.
+- **The plan is shown.** For a Task awaiting approval, its `plan.md` is
+  rendered in the inbox item (same Markdown renderer as the report viewer,
+  raw HTML off, secrets masked) in an open `<details>`, so it can be folded
+  away on a phone. A re-approval shows its plan too when it has one.
+- **Routes.** `POST /tasks/<id>/approve` and `/deny`, registered beside the
+  Task controls and behind the same `refuse_cross_site` guard (exact
+  Origin, Sec-Fetch-Site, the per-process CSRF token, POST only), each a
+  call to `control.approve`/`control.deny` with `via: dashboard`. Denying
+  a plan asks to confirm (`hx-confirm`, it cancels the Task); approving, or
+  denying an agent request (it requeues), doesn't.
+- **The item leaves the inbox.** The HTMX swap target is the whole inbox
+  (`#inbox`, outerHTML), not the item: the answer is the outcome line, then
+  the inbox as it is now, so the decided item is gone, the count is right
+  and the remaining items keep working buttons. The inbox moved to its own
+  template (`_inbox.html`) so the home page and the swap render it the same
+  way. A plain form post (no JavaScript) gets the home page with the
+  outcome in the inbox; the home page's 30 s refresh now goes to `/`
+  (`content="30; url=/"`) so it never re-requests the POST URL. A guard
+  refusal swaps in the inbox with the refusal and no buttons or token; a
+  plain refused post gets the existing refusal page.
+- **Stale buttons: `request_key` and `seen`.** Each button carries
+  `control.request_key` (the id of the Task's last transition, the one
+  into `awaiting_approval` or `needs_you`). `control.approve`/`deny` take an
+  optional `seen`; when it no longer matches, they refuse with
+  `STATE_CHANGED` and the Task's state now plus its last decision (the
+  `decision_state` text Telegram's buttons already used, moved from
+  `remote` into `control` so both share it). This covers a request decided
+  elsewhere, and also a Task that was decided and then raised a *new*
+  request: a plain state check would let the old button decide the new
+  request. A button post with no `request` field is never current. The
+  database's own guards (`decide_approval`, `decide_request`) still catch a
+  decision racing in between the check and the change. Telegram and `orch`
+  don't pass `seen` and behave as before.
+- **Approvals and clean week.** Nothing new: the control layer records
+  `via: dashboard` in `approvals` and in the transition reason, and
+  `cleanweek` already counts them; a test checks both.
+- **Tests.** `tests/test_dashboard.py`: buttons for an agent request, a
+  plan (with its plan shown, raw HTML escaped) and a re-approval, none for
+  the monthly cap; approve and deny of each kind end to end (state,
+  `approvals` row with `via: dashboard`, the item gone from the swapped
+  inbox, other items keep their buttons); the plain-form page; a stale
+  button after a decision from Telegram, after a decided request was
+  followed by a new one, and with no request named; approve on a spend-cap
+  Task and an unknown Task refused; clean-week interventions; the guard
+  (missing and foreign Origin, missing and wrong token, fragment and plain)
+  and GETs on both routes. `tests/test_control.py`: `decidable`, and a
+  stale `seen`. The old `test_inbox_has_no_action_buttons` is gone.

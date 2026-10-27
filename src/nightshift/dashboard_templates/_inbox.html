@@ -1,0 +1,46 @@
+{# The "needs you" inbox. Approve / Deny swap the whole inbox for this
+   template's answer: the outcome, then what still needs you. Without
+   ``csrf`` (a refusal) no buttons are shown. #}
+<section class="inbox" id="inbox">
+  <div class="group"><h2>Inbox</h2><span class="count">{{ inbox|length }}</span></div>
+  {% if refused %}<p class="outcome refused" role="status">{{ refused }}</p>{% endif %}
+  {% if result %}
+  <p class="outcome{% if not result.ok %} refused{% endif %}" role="status">{% if not result.ok %}Not done: {% endif %}{{ result.message }}</p>
+  {% if result.note %}<p class="outcome note">{{ result.note }}</p>{% endif %}
+  {% endif %}
+  {% if inbox %}
+  <ul>
+    {% for e in inbox %}{% set r = e.request %}
+    <li>
+      <div class="title"><a href="/tasks/{{ r.task_id }}/report">{{ r.title }}</a></div>
+      <div class="meta">
+        <span class="kind">{{ r.kind }}</span>
+        <code>{{ r.task_id }}</code>
+        <span>{{ r.task_type }}</span>
+        <span>since {{ r.since|short_time }}</span>
+      </div>
+      <div class="summary">{{ r.summary }}</div>
+      {% if r.details %}<div class="details">{{ r.details }}</div>{% endif %}
+      {% if r.proposed_action %}<div class="action">Proposed: {{ r.proposed_action }}</div>{% endif %}
+      {% if e.plan is not none %}
+      <details class="plan" open><summary>plan.md</summary><article>{{ e.plan }}</article></details>
+      {% endif %}
+      {% if csrf and e.key is not none %}
+      <div class="controls"><div class="buttons">
+        {% for a in ["approve", "deny"] %}
+        <form method="post" action="/tasks/{{ r.task_id }}/{{ a }}" hx-post="/tasks/{{ r.task_id }}/{{ a }}"
+              hx-target="#inbox" hx-swap="outerHTML"{% if a == "deny" and e.cancels %} hx-confirm="Deny the plan of Task {{ r.task_id }}? It will be cancelled."{% endif %}>
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="request" value="{{ e.key }}">
+          <button type="submit" class="b-{{ a }}">{{ a|capitalize }}</button>
+        </form>
+        {% endfor %}
+      </div></div>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">Nothing needs you</p>
+  {% endif %}
+</section>

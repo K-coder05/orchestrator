@@ -494,14 +494,6 @@ def _decision_press(cfg: Config, db: Database, task_id: str, approve_it: bool, *
     elif res.refusal == control.UNKNOWN_TASK:
         decided("No such Task.", result_text(res))
     else:  # decided already (another tap, message or surface), or moved on
-        state = decision_state(db, task_id)
+        state = control.decision_state(db, task_id)
         decided(f"Already decided: {state}", f"Already decided: {state}")
 
-
-def decision_state(db: Database, task_id: str) -> str:
-    """A Task's state now and its last plan or request decision."""
-    text = f"Task {task_id} is {db.task_state(task_id)}"
-    last = db.approvals(task_id)
-    if last:
-        text += f" ({last[-1]['subject']} {last[-1]['decision']} via {last[-1]['via']})"
-    return text + "."

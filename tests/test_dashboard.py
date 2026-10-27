@@ -209,15 +209,6 @@ def test_inbox_lists_each_request_with_its_task_kind_and_summary(cfg, db):
     assert html.index(">Inbox<") < html.index(">Running<")  # it leads the page
 
 
-def test_inbox_has_no_action_buttons(cfg, db):
-    # Approve / deny in the inbox are #37; the Task controls are in the groups.
-    _needs_you(cfg, db, "Asks", {"kind": "approval", "summary": "OK to push?"})
-    create_task(cfg, db, "Wants a plan approved", needs_approval=True)
-    html = _client(cfg).get("/").text.lower()
-    inbox = html[html.index(">inbox<"):html.index(">running<")]
-    assert "<button" not in inbox and "<form" not in inbox and 'method="post"' not in inbox
-
-
 def test_inbox_says_when_nothing_needs_you(cfg):
     assert "Nothing needs you" in _client(cfg).get("/").text
 
@@ -971,6 +962,213 @@ def test_the_guard_on_its_own():
     assert dashboard.parse_form(b"csrf=a%2Fb&level=urgent&level=normal") == {
         "csrf": "a/b", "level": "urgent"}
     assert dashboard.parse_form(b"\xff\xfe") == {}
+
+
+# --------------------------------------------------------------------------
+# Inbox Approve / Deny (§5 item 2)
+# --------------------------------------------------------------------------
+
+def _asking(cfg, db, env, title="Push the fix"):  # noqa: F811
+    """A Task whose agent (the fake claude) wrote needs_you.json and stopped:
+    kind approval, "May I push?", proposed action git push."""
+    env.setenv("FAKE_NEEDS_YOU", "1")
+    tid = create_task(cfg, db, title).spec.id
+    assert run_attempt(cfg, db, tid, adapter_provider=fake_provider).state == TaskState.NEEDS_YOU
+    env.delenv("FAKE_NEEDS_YOU")
+    return tid
+
+
+def _planned(cfg, db, title="Write a long essay", plan="# Plan\n\n- Outline\n- Draft\n"):
+    tid = create_task(cfg, db, title, needs_approval=True, estimated_minutes=45).spec.id
+    if plan is not None:
+        (Path(db.get_task(tid)["folder"]) / "plan.md").write_text(plan)
+    return tid
+
+
+def _reapproval(cfg, db, title="Paused too long"):
+    tid = create_task(cfg, db, title).spec.id
+    db.transition(tid, TaskState.PAUSED_USAGE, "usage limit")
+    db.transition(tid, TaskState.AWAITING_APPROVAL, "paused too long; needs re-approval")
+    return tid
+
+
+def _inbox(html):
+    return html[html.index('<section class="inbox"'):html.index("</section>")]
+
+
+def _buttons(html, tid):
+    return {a for a in dashboard.DECISIONS if f'action="/tasks/{tid}/{a}"' in html}
+
+
+def _decide(client, db, tid, action, **kw):
+    """Press Approve or Deny as the inbox shows it now."""
+    key = dashboard.control.request_key(db, tid)
+    return _act(client, tid, action, request=str(key), **kw)
+
+
+def _decider(cfg):
+    return TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+
+
+def test_inbox_shows_approve_and_deny_for_every_kind_it_can_decide(cfg, db, env):  # noqa: F811
+    from nightshift import spend
+    asks = _asking(cfg, db, env)
+    plan = _planned(cfg, db)
+    again = _reapproval(cfg, db)
+    capped = create_task(cfg, db, "Over the monthly cap").spec.id
+    db.transition(capped, TaskState.PAUSED_SPEND, "monthly cap",
+                  set_fields={"pause_kind": spend.KIND_MONTH})
+
+    inbox = _inbox(_client(cfg).get("/").text)
+
+    for tid in (asks, plan, again):
+        assert _buttons(inbox, tid) == {"approve", "deny"}, tid
+    assert _buttons(inbox, capped) == set()  # only orch raise-cap releases it
+    assert "orch raise-cap" in inbox
+    for text in ("approval", "May I push?", "git push", "plan approval", "re-approval"):
+        assert text in inbox
+    assert "<details class=\"plan\" open>" in inbox and "<li>Outline</li>" in inbox  # the plan
+    assert 'name="request"' in inbox and 'hx-target="#inbox"' in inbox
+    assert f'hx-confirm="Deny the plan of Task {plan}?' in inbox  # deny cancels a plan
+    assert f'hx-confirm="Deny the plan of Task {asks}?' not in inbox  # a request is requeued
+
+
+def test_inbox_plans_never_inject_raw_html(cfg, db):
+    _planned(cfg, db, plan="# Plan\n\n<script>alert(1)</script>\n")
+    inbox = _inbox(_client(cfg).get("/").text)
+    assert "<script>alert(1)" not in inbox and "&lt;script&gt;" in inbox
+
+
+def test_approving_a_plan_queues_it_and_it_leaves_the_inbox(cfg, db):
+    tid = _planned(cfg, db)
+    client = _decider(cfg)
+    r = _decide(client, db, tid, "approve")
+    assert r.status_code == 200
+    assert r.text.lstrip().startswith('<section class="inbox" id="inbox">')  # swapped in
+    assert f"Task {tid} approved and queued." in r.text
+    assert tid not in _inbox(r.text).split("</p>")[-1] and "Nothing needs you" in r.text
+    assert db.task_state(tid) == TaskState.QUEUED
+    [a] = db.approvals(tid)
+    assert (a["subject"], a["decision"], a["via"]) == ("plan", "approved", "dashboard")
+    assert "plan approved (dashboard)" in db.transitions(tid)[-1]["reason"]
+
+
+def test_denying_a_plan_cancels_it(cfg, db):
+    tid = _planned(cfg, db)
+    r = _decide(_decider(cfg), db, tid, "deny")
+    assert f"Task {tid} denied and cancelled." in r.text and "Nothing needs you" in r.text
+    assert db.task_state(tid) == TaskState.CANCELLED
+    [a] = db.approvals(tid)
+    assert (a["subject"], a["decision"], a["via"]) == ("plan", "denied", "dashboard")
+
+
+@pytest.mark.parametrize("action, to", [("approve", TaskState.QUEUED),
+                                        ("deny", TaskState.CANCELLED)])
+def test_a_reapproval_is_decided_like_a_plan(cfg, db, action, to):
+    tid = _reapproval(cfg, db)
+    r = _decide(_decider(cfg), db, tid, action)
+    assert "Nothing needs you" in r.text and db.task_state(tid) == to
+    assert db.approvals(tid)[-1]["via"] == "dashboard"
+
+
+@pytest.mark.parametrize("action", ["approve", "deny"])
+def test_deciding_a_request_requeues_it(cfg, db, env, action):  # noqa: F811
+    tid = _asking(cfg, db, env)
+    other = _planned(cfg, db, title="Still waiting")
+    r = _decide(_decider(cfg), db, tid, action)
+    word = "approved" if action == "approve" else "denied"
+    assert f"Task {tid}: request {word}; queued" in r.text
+    assert db.task_state(tid) == TaskState.QUEUED
+    [a] = db.approvals(tid)
+    assert (a["subject"], a["decision"], a["via"], a["request_kind"]) == (
+        "request", word, "dashboard", "approval")
+    assert f"needs-you request {word} (dashboard)" in db.transitions(tid)[-1]["reason"]
+    inbox = _inbox(r.text)
+    assert _buttons(inbox, tid) == set() and _buttons(inbox, other) == {"approve", "deny"}
+    assert 'name="csrf"' in inbox  # what's left can still be pressed
+
+
+def test_a_plain_form_decision_gets_the_home_page(cfg, db):
+    tid = _planned(cfg, db)
+    r = _decide(_decider(cfg), db, tid, "approve", htmx=False)
+    assert r.status_code == 200 and "<!doctype html>" in r.text and ">Running<" in r.text
+    assert f"Task {tid} approved and queued." in _inbox(r.text)
+    assert 'content="30; url=/"' in r.text  # its refresh goes home, not to the POST URL
+
+
+def test_a_stale_button_reports_the_state_instead_of_acting(cfg, db):
+    tid = _planned(cfg, db)
+    client = _decider(cfg)
+    key = dashboard.control.request_key(db, tid)
+    assert dashboard.control.approve(cfg, db, tid, via="telegram").ok  # decided elsewhere
+    r = _act(client, tid, "deny", request=str(key))
+    assert r.status_code == 200
+    assert (f"Not done: already decided, or changed since this was shown: Task {tid} is "
+            "queued (plan approved via telegram).") in r.text
+    assert db.task_state(tid) == TaskState.QUEUED and len(db.approvals(tid)) == 1
+
+
+def test_a_stale_button_never_decides_a_newer_request(cfg, db, env):  # noqa: F811
+    tid = _asking(cfg, db, env)
+    client = _decider(cfg)
+    old = dashboard.control.request_key(db, tid)
+    assert dashboard.control.approve(cfg, db, tid, via="orch approve").ok
+    env.setenv("FAKE_NEEDS_YOU", "1")
+    assert run_attempt(cfg, db, tid, adapter_provider=fake_provider).state == TaskState.NEEDS_YOU
+    # The same Task asks again: the button shown for the first request is stale.
+    r = _act(client, tid, "deny", request=str(old))
+    assert "Not done: already decided" in r.text and "request approved via orch approve" in r.text
+    assert db.task_state(tid) == TaskState.NEEDS_YOU and len(db.approvals(tid)) == 1
+    assert _buttons(_inbox(r.text), tid) == {"approve", "deny"}  # the new request's buttons
+    r = _act(client, tid, "approve")  # no request named at all: never current
+    assert "Not done: already decided" in r.text and db.task_state(tid) == TaskState.NEEDS_YOU
+
+
+def test_deciding_what_approve_and_deny_dont_apply_to_is_refused(cfg, db):
+    from nightshift import spend
+    capped = create_task(cfg, db, "Over the cap").spec.id
+    db.transition(capped, TaskState.PAUSED_SPEND, "monthly cap",
+                  set_fields={"pause_kind": spend.KIND_MONTH})
+    r = _decide(_decider(cfg), db, capped, "approve")
+    assert "Not done: " in r.text and "not awaiting approval" in r.text
+    assert db.task_state(capped) == TaskState.PAUSED_SPEND and db.approvals(capped) == []
+    assert "Not done: no Task &#39;zzzz&#39;" in _act(_decider(cfg), "zzzz", "approve").text
+
+
+def test_dashboard_decisions_count_as_interventions(cfg, db, env):  # noqa: F811
+    from nightshift import cleanweek
+    plan = _planned(cfg, db)
+    asks = _asking(cfg, db, env)
+    client = _decider(cfg)
+    _decide(client, db, plan, "approve")
+    _decide(client, db, asks, "deny")
+    week = cleanweek.check(cfg, db, dashboard.local_now(cfg.timezone) + timedelta(minutes=5))
+    hands = [(i.command, i.task_id) for i in week.interventions]
+    assert ("dashboard", plan) in hands and ("dashboard", asks) in hands, hands
+
+
+@pytest.mark.parametrize("action", dashboard.DECISIONS)
+@pytest.mark.parametrize("origin, token", [(None, None), ("http://evil.example", None),
+                                           (ORIGIN, ""), (ORIGIN, "wrong")])
+def test_decisions_are_behind_the_guard(cfg, db, action, origin, token):
+    tid = _planned(cfg, db)
+    client = _decider(cfg)
+    key = str(dashboard.control.request_key(db, tid))
+    for htmx in (True, False):
+        r = _act(client, tid, action, origin=origin, token=token, htmx=htmx, request=key)
+        _refused(r)
+    assert db.task_state(tid) == TaskState.AWAITING_APPROVAL and db.approvals(tid) == []
+    r = _act(client, tid, action, origin=origin, token=token, request=key)
+    assert tid in _inbox(r.text) and 'role="status"' in r.text  # the inbox, unchanged
+
+
+@pytest.mark.parametrize("action", dashboard.DECISIONS)
+def test_get_requests_to_decisions_are_refused(cfg, db, action):
+    tid = _planned(cfg, db)
+    client = _decider(cfg)
+    r = client.get(f"/tasks/{tid}/{action}?csrf={client.app.state.csrf_token}",
+                   headers={"Origin": ORIGIN})
+    assert r.status_code == 405 and db.task_state(tid) == TaskState.AWAITING_APPROVAL
 
 
 # --------------------------------------------------------------------------

@@ -7,19 +7,24 @@ daemon. Opening the database (as every `orch` command does) may migrate it.
 
 Its one write surface is the Task controls: ``POST /tasks/<id>/<action>``
 for ``cancel``, ``pause``, ``resume``, ``retry`` and ``priority`` (form field
-``level``), each a call into ``nightshift.control`` with ``via: dashboard``
-(so the clean-week check counts it), never logic of its own. The buttons are
-shown only where ``control.available`` says the Task's state allows them,
-and the result replaces them in place (an HTMX swap; a plain form post gets
-a result page). Every action is POST only and must pass
+``level``), and the inbox's ``approve`` and ``deny`` (form field ``request``,
+the ``control.request_key`` the button was shown with), each a call into
+``nightshift.control`` with ``via: dashboard`` (so the clean-week check
+counts it), never logic of its own. The buttons are shown only where
+``control.available`` (or, in the inbox, ``control.decidable``) says the
+Task's state allows them, and the result replaces them in place (an HTMX
+swap of the controls row, or of the whole inbox; a plain form post gets a
+result page, or the home page). A decision on a request that was decided
+elsewhere meanwhile only reports the Task's state now. Every action is POST
+only and must pass
 :func:`refuse_cross_site`: an ``Origin`` that is this very ``Host`` (itself
 one of :func:`allowed_hosts`), and the CSRF token the pages carry, random
 per dashboard process. Anything else changes nothing.
 
-Read routes: ``/`` (the "needs you" inbox, then Tasks grouped by status,
-with their controls), ``/tasks/<id>/report`` (the Task's ``report.md``
-rendered as Markdown, with its controls),
-``/live`` (a live tail of the running Task's logs, streamed from
+Read routes: ``/`` (the "needs you" inbox, with each plan awaiting approval
+and Approve / Deny, then Tasks grouped by status, with their controls),
+``/tasks/<id>/report`` (the Task's ``report.md`` rendered as Markdown, with
+its controls), ``/live`` (a live tail of the running Task's logs, streamed from
 ``/live/events`` as server-sent events), ``/schedules`` (tonight's queue
 preview, then the Schedule list) and ``/usage`` (the usage meter per agent
 and Window, with live reset countdowns, and the spend tracker against the
@@ -35,6 +40,7 @@ import json
 import secrets
 import socket
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -352,6 +358,60 @@ def parse_form(body: bytes) -> dict[str, str]:
     return {k: v[0] for k, v in fields.items()}
 
 
+# --------------------------------------------------------------------------
+# The inbox's Approve / Deny
+# --------------------------------------------------------------------------
+
+APPROVE, DENY = "approve", "deny"
+DECISIONS = (APPROVE, DENY)
+
+#: The form field that names the request a decision is about.
+REQUEST_FIELD = "request"
+
+
+@dataclass(frozen=True)
+class InboxEntry:
+    """One inbox item as the dashboard shows it."""
+
+    request: queries.NeedsYouRequest
+    #: ``control.request_key`` when approve and deny apply (the buttons
+    #: carry it); None for a request they don't decide (a spend cap).
+    key: int | None
+    #: The plan awaiting approval, rendered; None when there is no plan.md.
+    plan: Markup | None
+    #: Deny cancels the Task (a plan) rather than requeueing it (a request).
+    cancels: bool
+
+
+def inbox_entries(cfg: Config, db: Database) -> list[InboxEntry]:
+    out = []
+    for r in queries.needs_you_inbox(cfg, db):
+        row = db.get_task(r.task_id)
+        key = control.request_key(db, r.task_id) if control.decidable(db, row) else None
+        plan = None
+        awaiting = r.state == TaskState.AWAITING_APPROVAL
+        if awaiting:
+            # The folder comes from the database, never from the URL.
+            try:
+                text = (Path(row["folder"]) / "plan.md").read_text(errors="replace")
+            except OSError:
+                text = ""
+            if text.strip():
+                plan = render_markdown(cfg.secrets.redact(text))
+        out.append(InboxEntry(request=r, key=key, plan=plan, cancels=awaiting))
+    return out
+
+
+def run_decision(cfg: Config, db: Database, task_id: str, action: str,
+                 form: dict[str, str]) -> control.Result:
+    """Approve or deny, through the shared control layer, only the request
+    the button was shown for: a button without one is never current."""
+    seen = form.get(REQUEST_FIELD, "")
+    decide = control.approve if action == APPROVE else control.deny
+    return decide(cfg, db, task_id, via=control.VIA_DASHBOARD,
+                  seen=int(seen) if seen.isdigit() else -1)
+
+
 def run_control(cfg: Config, db: Database, task_id: str, action: str, form: dict[str, str], *,
                 at: datetime) -> control.Result:
     """One dashboard control, through the shared control layer. Cancel and
@@ -395,19 +455,26 @@ def create_app(
     def now() -> datetime:
         return clock() if clock is not None else local_now(cfg.timezone)
 
-    @app.get("/", response_class=HTMLResponse)
-    def home() -> str:
-        at = now()
+    def with_db(work: Callable[[Database], str]) -> str:
         db = Database(cfg.db_path, tz=cfg.timezone)
         try:
-            inbox = queries.needs_you_inbox(cfg, db)
-            groups = queries.task_groups(cfg, db, at)
-            shown = {t.id for g in groups for t in g.tasks}
-            controls = {r["id"]: controls_of(r) for r in db.list_tasks() if r["id"] in shown}
+            return work(db)
         finally:
             db.close()
-        return env.get_template("tasks.html").render(inbox=inbox, groups=groups, now=at,
-                                                     controls=controls)
+
+    def home_page(db: Database, *, result: control.Result | None = None) -> str:
+        at = now()
+        inbox = inbox_entries(cfg, db)
+        groups = queries.task_groups(cfg, db, at)
+        shown = {t.id for g in groups for t in g.tasks}
+        controls = {r["id"]: controls_of(r) for r in db.list_tasks() if r["id"] in shown}
+        return env.get_template("tasks.html").render(
+            inbox=inbox, groups=groups, now=at, controls=controls, csrf=token, result=result,
+            refused=None)
+
+    @app.get("/", response_class=HTMLResponse)
+    def home() -> str:
+        return with_db(home_page)
 
     @app.get("/schedules", response_class=HTMLResponse)
     def schedule_page() -> str:
@@ -460,9 +527,23 @@ def create_app(
         why = refuse_cross_site(request.headers, form, token=token, allowed=hosts)
         if why is not None:
             # No buttons and no token in a refusal: nothing to retry with.
-            html = env.get_template("_controls.html" if fragment else "action.html").render(
-                c=None, result=None, refused=f"Refused: {why}. Nothing was changed.")
+            refusal = f"Refused: {why}. Nothing was changed."
+            if fragment and action in DECISIONS:
+                html = await run_in_threadpool(with_db, lambda db: inbox_fragment(
+                    db, result=None, refused=refusal))
+            else:
+                html = env.get_template("_controls.html" if fragment else "action.html").render(
+                    c=None, result=None, refused=refusal)
             return HTMLResponse(html, status_code=403)
+
+        if action in DECISIONS:
+            def decide(db: Database) -> str:
+                res = run_decision(cfg, db, task_id, action, form)
+                if fragment:
+                    return inbox_fragment(db, result=res, refused=None)
+                return home_page(db, result=res)
+
+            return HTMLResponse(await run_in_threadpool(with_db, decide))
 
         def work() -> tuple[control.Result, dict[str, Any] | None]:
             db = Database(cfg.db_path, tz=cfg.timezone)
@@ -478,12 +559,19 @@ def create_app(
             result=res, c=c, refused=None)
         return HTMLResponse(html)
 
+    def inbox_fragment(db: Database, *, result: control.Result | None,
+                       refused: str | None) -> str:
+        """The inbox after a decision, or under a refusal (then with no buttons)."""
+        return env.get_template("_inbox.html").render(
+            inbox=inbox_entries(cfg, db), result=result, refused=refused,
+            csrf=token if refused is None else None)
+
     def action_route(action: str) -> Callable[..., Any]:
         async def route(task_id: str, request: Request) -> HTMLResponse:
             return await act(task_id, action, request)
         return route
 
-    for name in ACTIONS:  # one route each, POST only: a GET is a 405
+    for name in ACTIONS + DECISIONS:  # one route each, POST only: a GET is a 405
         app.post(f"/tasks/{{task_id}}/{name}", response_class=HTMLResponse)(action_route(name))
 
     @app.get("/static/htmx.min.js")

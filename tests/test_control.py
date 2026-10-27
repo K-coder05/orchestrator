@@ -319,3 +319,26 @@ def test_available_controls_follow_the_controls_own_rules(cfg, db, at, monkeypat
         db.transition(tid, state, "t")
         assert avail(tid) == ({T} if state == TaskState.FAILED else set())
 
+
+
+# -- which Tasks approve and deny apply to; a stale decision -----------------
+
+def test_decidable_is_a_plan_or_an_agents_request(cfg, db):
+    plan = create_task(cfg, db, "plan", needs_approval=True).spec.id
+    assert control.decidable(db, db.get_task(plan))
+    capped = create_task(cfg, db, "capped").spec.id
+    _running(db, capped)
+    db.transition(capped, TaskState.NEEDS_YOU, "per-Task spend cap")  # no request to decide
+    assert not control.decidable(db, db.get_task(capped))
+    assert not control.decidable(db, db.get_task(create_task(cfg, db, "q").spec.id))
+
+
+def test_a_decision_with_a_stale_request_key_only_reports(cfg, db):
+    tid = create_task(cfg, db, "plan", needs_approval=True).spec.id
+    seen = control.request_key(db, tid)
+    assert control.approve(cfg, db, tid, via="telegram", seen=seen).ok
+    assert control.request_key(db, tid) != seen
+    res = control.deny(cfg, db, tid, via="dashboard", seen=seen)
+    assert res.refusal == control.STATE_CHANGED
+    assert res.message.endswith(f"Task {tid} is queued (plan approved via telegram).")
+    assert db.task_state(tid) == TaskState.QUEUED and len(db.approvals(tid)) == 1

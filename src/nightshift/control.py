@@ -24,6 +24,9 @@ return at once (``CANCEL_REQUESTED``/``PAUSE_REQUESTED``), and
 Approve and deny decide a Task awaiting approval (its plan; a denied plan
 cancels the Task) or the agent's "needs you" request a Task in ``needs_you``
 waits on (``nightshift.needsyou``; approved or denied, the Task is requeued).
+:func:`decidable` says whether they apply; a surface that shows a button
+passes the :func:`request_key` it was shown with as ``seen``, so a press
+after the request was decided elsewhere only reports the current state.
 
 Intake is split so a caller without a terminal can drive it step by step:
 :func:`propose` (the estimate and Task type; a planning call for a free-form
@@ -212,23 +215,57 @@ def available(row: Any) -> tuple[str, ...]:
 # --------------------------------------------------------------------------
 
 
-def approve(cfg: Config, db: Database, task_id: str, *, via: str) -> Result:
+def decidable(db: Database, row: Any) -> bool:
+    """Whether approve and deny apply to the Task in ``row`` now: its plan
+    awaits approval (or re-approval after a long pause), or it waits on an
+    agent's "needs you" request. Not a Task held by a spend cap: only
+    ``orch raise-cap`` (or the month ending) releases that."""
+    return (TaskState(row["state"]) == TaskState.AWAITING_APPROVAL
+            or needsyou.open_request(db, row) is not None)
+
+
+def request_key(db: Database, task_id: str) -> int | None:
+    """What identifies the request a Task waits on now: the id of its last
+    transition (the one into ``awaiting_approval`` or ``needs_you``). Any
+    decision, or a new request after one, changes it."""
+    ts = db.transitions(task_id)
+    return ts[-1]["id"] if ts else None
+
+
+def decision_state(db: Database, task_id: str) -> str:
+    """A Task's state now and its last plan or request decision."""
+    text = f"Task {task_id} is {db.task_state(task_id)}"
+    last = db.approvals(task_id)
+    if last:
+        text += f" ({last[-1]['subject']} {last[-1]['decision']} via {last[-1]['via']})"
+    return text + "."
+
+
+def approve(cfg: Config, db: Database, task_id: str, *, via: str,
+            seen: int | None = None) -> Result:
     """Approve a Task awaiting approval (its plan.md) and queue it, or approve
-    the "needs you" request a Task in ``needs_you`` waits on and requeue it."""
-    return _decide(cfg, db, task_id, True, via)
+    the "needs you" request a Task in ``needs_you`` waits on and requeue it.
+    With ``seen`` (a :func:`request_key`), only that very request."""
+    return _decide(cfg, db, task_id, True, via, seen)
 
 
-def deny(cfg: Config, db: Database, task_id: str, *, via: str) -> Result:
+def deny(cfg: Config, db: Database, task_id: str, *, via: str,
+         seen: int | None = None) -> Result:
     """Deny a Task awaiting approval (it is cancelled), or deny the "needs
-    you" request a Task waits on (it is requeued, to carry on without it)."""
-    return _decide(cfg, db, task_id, False, via)
+    you" request a Task waits on (it is requeued, to carry on without it).
+    With ``seen`` (a :func:`request_key`), only that very request."""
+    return _decide(cfg, db, task_id, False, via, seen)
 
 
-def _decide(cfg: Config, db: Database, task_id: str, approve_it: bool, via: str) -> Result:
+def _decide(cfg: Config, db: Database, task_id: str, approve_it: bool, via: str,
+            seen: int | None) -> Result:
     row, bad = _lookup(db, task_id)
     if bad:
         return bad
     state = TaskState(row["state"])
+    if seen is not None and request_key(db, task_id) != seen:
+        return refused(STATE_CHANGED, "already decided, or changed since this was shown: "
+                                      + decision_state(db, task_id), task_id, state)
     if state == TaskState.NEEDS_YOU:
         return _decide_request(cfg, db, row, approve_it, via)
     if state != TaskState.AWAITING_APPROVAL:

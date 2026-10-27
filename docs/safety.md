@@ -211,9 +211,10 @@ Task's web fetch tool could GET a page from localhost; those tools only
 GET, and an action also needs a same-origin POST (below). What the guard
 is mainly for is a web page in *your* browser, or someone else on the
 network, driving the buttons. Since Phase 3 it has one write surface:
-the Task controls (`POST /tasks/<id>/cancel|pause|resume|retry|priority`),
-which call `nightshift.control` with `via: dashboard` and do nothing else.
-Approve/deny from the dashboard and Schedule editing are not built yet.
+the Task controls (`POST /tasks/<id>/cancel|pause|resume|retry|priority`)
+and the inbox's Approve / Deny (`POST /tasks/<id>/approve|deny`), which call
+`nightshift.control` with `via: dashboard` and do nothing else. Schedule
+editing is not built yet.
 
 | Limit | Status | How |
 |---|---|---|
@@ -222,6 +223,7 @@ Approve/deny from the dashboard and Schedule editing are not built yet.
 | Changes only by POST | **Technically enforced** | The action routes accept POST only (a GET is a 405); every other route is GET only. |
 | Cross-site requests (CSRF) | **Technically enforced** | Each action needs an `Origin` that is exactly `http://` + the request's `Host` (scheme, name and port; the name one of the allowed hosts); a missing or `null` Origin is refused. `Sec-Fetch-Site`, when the browser sends it, must be `same-origin`. And the form must carry the CSRF token, 32 random bytes made when the dashboard process starts, compared in constant time. A refusal is a 403 that changes nothing and carries no token. |
 | What a control can do | **Enforced by Nightshift** | Exactly what `orch cancel|pause|resume|retry|priority` can, with the same state checks and refusals; no new power. Each change is recorded with `(dashboard)` in its reason or intervention record, so the clean-week check counts it. |
+| What Approve / Deny can do | **Enforced by Nightshift** | Exactly what `orch approve|deny` can: decide a plan awaiting approval (or re-approval) or an agent's "needs you" request, recorded in `approvals` with `via: dashboard`. A Task held by a spend cap has no buttons; raising a cap stays `orch raise-cap`. Each button names the request it was shown for (the Task's last transition); if that request was decided elsewhere, or the Task moved on or asked again since, the press only reports the Task's state and decides nothing. |
 | Script injection | **Technically enforced** | Jinja autoescaping on every page and fragment; HTMX 2.0.4 is vendored and served by the dashboard (no CDN), with `allowEval` and `allowScriptTags` off and `selfRequestsOnly` on. |
 | No login | **Gap (by design)** | Single user: anyone who can open the page (this Mac, your tailnet) can press the buttons. There is no account or session. |
 | Token lifetime | **Gap (minor)** | The token lasts as long as the dashboard process; it is not tied to a session or rotated per page. A page left open across a dashboard restart gets "stale CSRF token (reload the page)". |
