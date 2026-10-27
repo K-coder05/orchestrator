@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}{% if c %}Task {{ c.id }}{% else %}Refused{% endif %} · Nightshift{% endblock %}
+{% block body %}
+  <nav><a href="/">&larr; Nightshift</a>{% if c %} · <a href="/tasks/{{ c.id }}/report">Task {{ c.id }}</a>{% endif %}</nav>
+  {% include "_controls.html" %}
+{% endblock %}

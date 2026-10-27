@@ -1,38 +1,55 @@
-"""The read-only dashboard (§4 item 8): a FastAPI app over ``queries``.
+"""The dashboard (§4 item 8, §5 item 2): a FastAPI app over ``queries``.
 
 It binds to 127.0.0.1 and this Mac's Tailscale address only, never to every
 interface, the LAN or a public address, and refuses to start otherwise. It
 runs as its own launchd agent (`orch dashboard install`), apart from the
-daemon. It has no route that changes anything; opening the database (as
-every `orch` command does) may still migrate it.
+daemon. Opening the database (as every `orch` command does) may migrate it.
 
-Routes: ``/`` (the "needs you" inbox, then Tasks grouped by status),
-``/tasks/<id>/report`` (the Task's ``report.md`` rendered as Markdown),
+Its one write surface is the Task controls: ``POST /tasks/<id>/<action>``
+for ``cancel``, ``pause``, ``resume``, ``retry`` and ``priority`` (form field
+``level``), each a call into ``nightshift.control`` with ``via: dashboard``
+(so the clean-week check counts it), never logic of its own. The buttons are
+shown only where ``control.available`` says the Task's state allows them,
+and the result replaces them in place (an HTMX swap; a plain form post gets
+a result page). Every action is POST only and must pass
+:func:`refuse_cross_site`: an ``Origin`` that is this very ``Host`` (itself
+one of :func:`allowed_hosts`), and the CSRF token the pages carry, random
+per dashboard process. Anything else changes nothing.
+
+Read routes: ``/`` (the "needs you" inbox, then Tasks grouped by status,
+with their controls), ``/tasks/<id>/report`` (the Task's ``report.md``
+rendered as Markdown, with its controls),
 ``/live`` (a live tail of the running Task's logs, streamed from
 ``/live/events`` as server-sent events), ``/schedules`` (tonight's queue
 preview, then the Schedule list) and ``/usage`` (the usage meter per agent
 and Window, with live reset countdowns, and the spend tracker against the
-caps).
+caps). ``/static/htmx.min.js`` is HTMX 2.0.4, vendored (no CDN).
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import ipaddress
 import json
+import secrets
 import socket
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markdown_it import MarkdownIt
 from markupsafe import Markup
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import daemon, queries, tonight, views
+from . import control, daemon, queries, tonight, views
+from . import priority as prio
 from .config import Config
 from .db import Database
 from .host import Host
@@ -137,6 +154,7 @@ def open_sockets(addresses: list[str], *, port: int, tailscale_ip: str | None) -
 # --------------------------------------------------------------------------
 
 TEMPLATES = Path(__file__).parent / "dashboard_templates"
+STATIC = Path(__file__).parent / "dashboard_static"
 
 
 def _short_time(value: str) -> str:
@@ -273,6 +291,83 @@ def allowed_hosts(tailscale_ip: str | None) -> list[str]:
     return hosts
 
 
+# --------------------------------------------------------------------------
+# Task controls: the write surface
+# --------------------------------------------------------------------------
+
+#: The controls, in the order their buttons are shown.
+ACTIONS = (control.CANCEL, control.PAUSE, control.RESUME, control.RETRY, control.PRIORITY)
+
+#: The form field that carries the CSRF token.
+CSRF_FIELD = "csrf"
+
+#: A control's form is a few dozen bytes; anything much bigger is refused unread.
+MAX_FORM_BYTES = 4096
+
+
+def _host_allowed(host: str, allowed: list[str]) -> bool:
+    """``host`` (no port) is one of ``allowed`` (``*.name`` matches subdomains),
+    as TrustedHostMiddleware matches them."""
+    host = host.lower()
+    return any(host == a or (a.startswith("*") and host.endswith(a[1:])) for a in allowed)
+
+
+def refuse_cross_site(headers: Any, form: dict[str, str], *, token: str,
+                      allowed: list[str]) -> str | None:
+    """Why a control request is refused, or None when it may go ahead.
+
+    The ``Origin`` must be ``http://`` + this request's ``Host`` exactly (so
+    same scheme, name and port), and that name one of ``allowed``. Browsers
+    send ``Origin`` on every POST, so one without it is refused rather than
+    trusted. ``Sec-Fetch-Site``, when sent, must say same-origin. Then the
+    form's CSRF token must be the one this dashboard put in its pages."""
+    host = (headers.get("host") or "").lower()
+    origin = headers.get("origin")
+    if not origin:
+        return "no Origin header"
+    try:
+        parts = urlsplit(origin)
+        origin_host = parts.hostname or ""
+    except ValueError:
+        return "a malformed Origin header"
+    if parts.scheme != "http" or parts.netloc.lower() != host or not host:
+        return "a cross-origin request"
+    if not _host_allowed(origin_host, allowed):
+        return "a request from a host the dashboard doesn't answer to"
+    site = headers.get("sec-fetch-site")
+    if site is not None and site not in ("same-origin", "none"):
+        return "a cross-site request"
+    sent = form.get(CSRF_FIELD, "")
+    if not sent or not hmac.compare_digest(sent.encode(), token.encode()):
+        return "a missing or stale CSRF token (reload the page)"
+    return None
+
+
+def parse_form(body: bytes) -> dict[str, str]:
+    """An ``application/x-www-form-urlencoded`` body, first value per field."""
+    try:
+        fields = parse_qs(body.decode("utf-8"), keep_blank_values=True, max_num_fields=10)
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return {k: v[0] for k, v in fields.items()}
+
+
+def run_control(cfg: Config, db: Database, task_id: str, action: str, form: dict[str, str], *,
+                at: datetime) -> control.Result:
+    """One dashboard control, through the shared control layer. Cancel and
+    pause of a running Task return the request at once (no wait)."""
+    via = control.VIA_DASHBOARD
+    if action == control.CANCEL:
+        return control.cancel(cfg, db, task_id, via=via, at=at)
+    if action == control.PAUSE:
+        return control.pause(cfg, db, task_id, via=via, at=at)
+    if action == control.RESUME:
+        return control.resume(cfg, db, task_id, via=via, at=at)
+    if action == control.RETRY:
+        return control.retry(cfg, db, task_id, via=via, at=at)
+    return control.set_priority(cfg, db, task_id, form.get("level", ""), via=via, at=at)
+
+
 def create_app(
     cfg: Config, *, tailscale_ip: str | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -283,8 +378,19 @@ def create_app(
     ``/live/events`` polls the logs every ``live_interval`` seconds until the
     browser goes away (or, in tests, after ``live_polls`` polls)."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts(tailscale_ip))
+    hosts = allowed_hosts(tailscale_ip)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
     env = _environment()
+    #: Put in every page with controls and checked on every action. New
+    #: each time the dashboard starts: a page left open across a restart
+    #: must be reloaded before its buttons work again.
+    token = secrets.token_urlsafe(32)
+    app.state.csrf_token = token
+
+    def controls_of(row: Any) -> dict[str, Any]:
+        """What ``_controls.html`` needs for one Task."""
+        return {"id": row["id"], "controls": control.available(row),
+                "priority": row["priority"], "priorities": prio.PRIORITIES, "csrf": token}
 
     def now() -> datetime:
         return clock() if clock is not None else local_now(cfg.timezone)
@@ -296,9 +402,12 @@ def create_app(
         try:
             inbox = queries.needs_you_inbox(cfg, db)
             groups = queries.task_groups(cfg, db, at)
+            shown = {t.id for g in groups for t in g.tasks}
+            controls = {r["id"]: controls_of(r) for r in db.list_tasks() if r["id"] in shown}
         finally:
             db.close()
-        return env.get_template("tasks.html").render(inbox=inbox, groups=groups, now=at)
+        return env.get_template("tasks.html").render(inbox=inbox, groups=groups, now=at,
+                                                     controls=controls)
 
     @app.get("/schedules", response_class=HTMLResponse)
     def schedule_page() -> str:
@@ -341,7 +450,46 @@ def create_app(
         except FileNotFoundError:
             text = None
         return env.get_template("report.html").render(
-            task=dict(row), report=render_markdown(text) if text is not None else None)
+            task=dict(row), report=render_markdown(text) if text is not None else None,
+            c=controls_of(row))
+
+    async def act(task_id: str, action: str, request: Request) -> HTMLResponse:
+        fragment = request.headers.get("hx-request") == "true"
+        body = await request.body()
+        form = parse_form(body) if len(body) <= MAX_FORM_BYTES else {}
+        why = refuse_cross_site(request.headers, form, token=token, allowed=hosts)
+        if why is not None:
+            # No buttons and no token in a refusal: nothing to retry with.
+            html = env.get_template("_controls.html" if fragment else "action.html").render(
+                c=None, result=None, refused=f"Refused: {why}. Nothing was changed.")
+            return HTMLResponse(html, status_code=403)
+
+        def work() -> tuple[control.Result, dict[str, Any] | None]:
+            db = Database(cfg.db_path, tz=cfg.timezone)
+            try:
+                res = run_control(cfg, db, task_id, action, form, at=now())
+                row = db.get_task(task_id)
+                return res, controls_of(row) if row is not None else None
+            finally:
+                db.close()
+
+        res, c = await run_in_threadpool(work)
+        html = env.get_template("_controls.html" if fragment else "action.html").render(
+            result=res, c=c, refused=None)
+        return HTMLResponse(html)
+
+    def action_route(action: str) -> Callable[..., Any]:
+        async def route(task_id: str, request: Request) -> HTMLResponse:
+            return await act(task_id, action, request)
+        return route
+
+    for name in ACTIONS:  # one route each, POST only: a GET is a 405
+        app.post(f"/tasks/{{task_id}}/{name}", response_class=HTMLResponse)(action_route(name))
+
+    @app.get("/static/htmx.min.js")
+    def htmx() -> FileResponse:
+        return FileResponse(STATIC / "htmx.min.js", media_type="text/javascript",
+                            headers={"Cache-Control": "max-age=86400"})
 
     @app.get("/live", response_class=HTMLResponse)
     def live() -> str:

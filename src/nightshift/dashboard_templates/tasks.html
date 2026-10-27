@@ -1,5 +1,6 @@
 {% extends "base.html" %}
-{% block head %}<meta http-equiv="refresh" content="30">{% endblock %}
+{% block head %}<meta http-equiv="refresh" content="30">
+{% include "_htmx.html" %}{% endblock %}
 {% block style %}
   section { margin-top: 18px; }
   .group { display: flex; align-items: baseline; gap: 8px; border-bottom: 1px solid var(--line);
@@ -66,6 +67,7 @@
           <span>{{ t.effective_priority or t.priority }}</span>
           <span>{{ t.created_at|short_time }}</span>
         </div>
+        {% with c=controls[t.id], result=none, refused=none %}{% include "_controls.html" %}{% endwith %}
       </li>
       {% endfor %}
     </ul>

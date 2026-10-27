@@ -177,6 +177,37 @@ def _lookup(db: Database, task_id: str) -> tuple[Any, Result | None]:
 
 
 # --------------------------------------------------------------------------
+# Which controls a Task's state allows (for surfaces that show buttons)
+# --------------------------------------------------------------------------
+
+CANCEL, PAUSE, RESUME, RETRY, PRIORITY = "cancel", "pause", "resume", "retry", "priority"
+
+
+def available(row: Any) -> tuple[str, ...]:
+    """The controls (CANCEL, PAUSE, RESUME, RETRY, PRIORITY) the Task in
+    ``row`` would accept now, by the same rules the controls check, so a
+    surface shows a button only where pressing it can work. The Task may
+    still move before the press; the control then refuses as usual."""
+    state = TaskState(row["state"])
+    if state in TERMINAL:
+        return (RETRY,) if state in failures.RETRYABLE else ()
+    out = []
+    cancel_asked = state == TaskState.RUNNING and bool(row["cancel_requested_at"])
+    pause_asked = state == TaskState.RUNNING and bool(row["pause_requested_at"])
+    if not cancel_asked:
+        out.append(CANCEL)
+    by_hand = state == TaskState.PAUSED_USAGE and row["pause_kind"] == pauses.KIND_BY_HAND
+    if state in pauses.PAUSABLE and not by_hand and not pause_asked and not cancel_asked:
+        out.append(PAUSE)
+    if state == TaskState.PAUSED_USAGE or pause_asked:
+        out.append(RESUME)
+    if state in failures.RETRYABLE:
+        out.append(RETRY)
+    out.append(PRIORITY)
+    return tuple(out)
+
+
+# --------------------------------------------------------------------------
 # Approve / deny (§2.4, §1.6)
 # --------------------------------------------------------------------------
 

@@ -1,0 +1,30 @@
+{# One Task's controls, and the outcome of the last one pressed. An HTMX
+   swap replaces the whole block with this template's answer. #}
+<div class="controls">
+  {% if refused %}<p class="outcome refused" role="status">{{ refused }}</p>{% endif %}
+  {% if result %}
+  <p class="outcome{% if not result.ok %} refused{% endif %}" role="status">{% if not result.ok %}Not done: {% endif %}{{ result.message }}</p>
+  {% if result.note %}<p class="outcome note">{{ result.note }}</p>{% endif %}
+  {% endif %}
+  {% if c and c.controls %}
+  <div class="buttons">
+    {% for a in ["cancel", "pause", "resume", "retry"] if a in c.controls %}
+    <form method="post" action="/tasks/{{ c.id }}/{{ a }}" hx-post="/tasks/{{ c.id }}/{{ a }}"
+          hx-target="closest .controls" hx-swap="outerHTML"{% if a == "cancel" %} hx-confirm="Cancel Task {{ c.id }}?"{% endif %}>
+      <input type="hidden" name="csrf" value="{{ c.csrf }}">
+      <button type="submit" class="b-{{ a }}">{{ a|capitalize }}</button>
+    </form>
+    {% endfor %}
+    {% if "priority" in c.controls %}
+    <form class="prio" method="post" action="/tasks/{{ c.id }}/priority" hx-post="/tasks/{{ c.id }}/priority"
+          hx-target="closest .controls" hx-swap="outerHTML">
+      <input type="hidden" name="csrf" value="{{ c.csrf }}">
+      <select name="level" aria-label="Priority of Task {{ c.id }}">
+        {% for p in c.priorities %}<option value="{{ p }}"{% if p == c.priority %} selected{% endif %}>{{ p }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="b-priority">Set</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>

@@ -1,10 +1,10 @@
-"""The read-only dashboard (§4 item 8): where it binds, and its routes."""
+"""The dashboard (§4 item 8, §5 item 2): where it binds, its routes and its controls."""
 
 from __future__ import annotations
 
 import json
 import plistlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -210,10 +210,12 @@ def test_inbox_lists_each_request_with_its_task_kind_and_summary(cfg, db):
 
 
 def test_inbox_has_no_action_buttons(cfg, db):
+    # Approve / deny in the inbox are #37; the Task controls are in the groups.
     _needs_you(cfg, db, "Asks", {"kind": "approval", "summary": "OK to push?"})
     create_task(cfg, db, "Wants a plan approved", needs_approval=True)
     html = _client(cfg).get("/").text.lower()
-    assert "<button" not in html and "<form" not in html and 'method="post"' not in html
+    inbox = html[html.index(">inbox<"):html.index(">running<")]
+    assert "<button" not in inbox and "<form" not in inbox and 'method="post"' not in inbox
 
 
 def test_inbox_says_when_nothing_needs_you(cfg):
@@ -694,6 +696,281 @@ def test_usage_page_is_read_only(cfg):
     assert client.post("/usage").status_code == 405
     html = client.get("/usage").text
     assert "<form" not in html and "<button" not in html
+
+
+# --------------------------------------------------------------------------
+# Task controls (§5 item 2): the write surface
+# --------------------------------------------------------------------------
+
+ORIGIN = "http://127.0.0.1:8765"
+
+
+def _app(cfg):
+    return dashboard.create_app(cfg, tailscale_ip=TAILSCALE_IP, clock=lambda: NOW)
+
+
+def _act(client, tid, action, *, htmx=True, origin=ORIGIN, token=None, **form):
+    headers = {"HX-Request": "true"} if htmx else {}
+    if origin is not None:
+        headers["Origin"] = origin
+    data = {"csrf": client.app.state.csrf_token if token is None else token, **form}
+    if token == "":
+        del data["csrf"]
+    return client.post(f"/tasks/{tid}/{action}", data=data, headers=headers)
+
+
+def _shown(html, tid):
+    """The controls shown for Task ``tid`` on a page."""
+    return {a for a in dashboard.ACTIONS if f'action="/tasks/{tid}/{a}"' in html}
+
+
+@pytest.fixture
+def daemon_up(monkeypatch):
+    monkeypatch.setattr(dashboard.control.daemon, "daemon_running", lambda cfg: True)
+
+
+def test_controls_are_shown_only_in_states_that_allow_them(cfg, db, daemon_up):
+    queued = create_task(cfg, db, "Queued").spec.id
+    running = _running(cfg, db, "Running")
+    failed = create_task(cfg, db, "Failed").spec.id
+    db.transition(failed, TaskState.FAILED, "crashed")
+    done = create_task(cfg, db, "Done").spec.id
+    db.transition(done, TaskState.RUNNING, "picked")
+    db.transition(done, TaskState.DONE, "finished")
+    spend = create_task(cfg, db, "Spend").spec.id
+    db.transition(spend, TaskState.PAUSED_SPEND, "cap")
+
+    html = _client(cfg).get("/").text
+
+    assert _shown(html, queued) == {"cancel", "pause", "priority"}
+    assert _shown(html, running) == {"cancel", "pause", "priority"}
+    assert _shown(html, failed) == {"retry"}
+    assert _shown(html, done) == set()
+    assert _shown(html, spend) == {"cancel", "priority"}
+    assert 'hx-confirm="Cancel Task' in html  # a mis-tap on a phone doesn't cancel
+    page = _client(cfg).get(f"/tasks/{failed}/report").text
+    assert _shown(page, failed) == {"retry"}
+    assert _shown(_client(cfg).get(f"/tasks/{done}/report").text, done) == set()
+
+
+def test_cancel_works_end_to_end(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = _act(client, tid, "cancel")
+    assert r.status_code == 200
+    assert f"Task {tid} cancelled (was queued)." in r.text
+    assert db.task_state(tid) == TaskState.CANCELLED
+    assert "cancelled by hand (dashboard)" in db.transitions(tid)[-1]["reason"]
+    assert r.text.lstrip().startswith('<div class="controls">')  # a fragment to swap in
+    assert _shown(r.text, tid) == set()  # nothing left to press
+
+
+def test_cancel_of_a_running_task_asks_the_daemon(cfg, db, daemon_up):
+    tid = _running(cfg, db)
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = _act(client, tid, "cancel")
+    assert "asked the daemon to stop it" in r.text
+    assert db.task_state(tid) == TaskState.RUNNING
+    assert db.request_via(tid, "cancel") == "dashboard"
+    assert _shown(r.text, tid) == {"priority"}  # no second cancel, no pause
+
+
+def test_pause_and_resume_work_end_to_end(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = _act(client, tid, "pause")
+    assert f"Task {tid} paused (was queued)" in r.text
+    assert db.task_state(tid) == TaskState.PAUSED_USAGE
+    assert _shown(r.text, tid) == {"cancel", "resume", "priority"}
+    r = _act(client, tid, "resume")
+    assert f"Task {tid}: resumed by hand (dashboard)" in r.text
+    assert "orch daemon install" in r.text  # the control layer's note: no daemon
+    assert db.task_state(tid) == TaskState.QUEUED
+    assert _shown(r.text, tid) == {"cancel", "pause", "priority"}
+
+
+def test_pause_of_a_running_task_asks_the_daemon_and_resume_withdraws_it(cfg, db, daemon_up):
+    tid = _running(cfg, db)
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = _act(client, tid, "pause")
+    assert "asked the daemon to pause it after the current Step" in r.text
+    assert db.request_via(tid, "pause") == "dashboard"
+    assert _shown(r.text, tid) == {"cancel", "resume", "priority"}
+    r = _act(client, tid, "resume")
+    assert "pause request withdrawn" in r.text
+    assert db.get_task(tid)["pause_requested_at"] is None
+
+
+def test_retry_works_end_to_end(cfg, db):
+    tid = create_task(cfg, db, "Broken scrape").spec.id
+    db.transition(tid, TaskState.FAILED, "crashed")
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = _act(client, tid, "retry")
+    assert f"Task {tid} queued: retried by hand from failed (dashboard)" in r.text
+    assert db.task_state(tid) == TaskState.QUEUED
+
+
+def test_priority_works_end_to_end(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    html = client.get("/").text
+    assert '<option value="normal" selected>' in html
+    r = _act(client, tid, "priority", level="urgent")
+    assert f"Task {tid} priority normal -&gt; urgent" in r.text
+    assert db.get_task(tid)["priority"] == "urgent"
+    assert '<option value="urgent" selected>' in r.text
+    r = _act(client, tid, "priority", level="asap")
+    assert "Not done: unknown priority" in r.text
+    assert db.get_task(tid)["priority"] == "urgent"
+
+
+def test_a_control_the_state_refuses_says_so_and_changes_nothing(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id  # queued: nothing to retry
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = _act(client, tid, "retry")
+    assert r.status_code == 200 and "Not done:" in r.text and "can be retried" in r.text
+    assert db.task_state(tid) == TaskState.QUEUED
+    assert "Not done: no Task &#39;zzzz&#39;" in _act(client, "zzzz", "cancel").text
+
+
+def test_a_plain_form_post_gets_a_result_page(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = _act(client, tid, "cancel", htmx=False)
+    assert r.status_code == 200 and "<!doctype html>" in r.text
+    assert 'name="color-scheme" content="dark"' in r.text and "width=device-width" in r.text
+    assert f"Task {tid} cancelled" in r.text and f'href="/tasks/{tid}/report"' in r.text
+
+
+def test_dashboard_controls_count_as_interventions(cfg, db):
+    from nightshift import cleanweek
+
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    c = create_task(cfg, db, "c").spec.id
+    p = create_task(cfg, db, "p").spec.id
+    f = create_task(cfg, db, "f").spec.id
+    db.transition(f, TaskState.FAILED, "crashed")
+    pr = create_task(cfg, db, "pr").spec.id
+    _act(client, c, "cancel")
+    _act(client, p, "pause")
+    _act(client, p, "resume")
+    _act(client, f, "retry")
+    _act(client, pr, "priority", level="background")
+    week = cleanweek.check(cfg, db, dashboard.local_now(cfg.timezone) + timedelta(minutes=5))
+    hands = [(i.command, i.task_id) for i in week.interventions]
+    for tid, n in ((c, 1), (p, 2), (f, 1), (pr, 1)):
+        assert hands.count(("dashboard", tid)) == n, (tid, hands)
+    assert not week.hands_off
+
+
+def _refused(r):
+    assert r.status_code == 403 and "Nothing was changed" in r.text
+    assert 'name="csrf"' not in r.text and "<form" not in r.text  # no token handed out
+
+
+@pytest.mark.parametrize("origin", [
+    None,                              # no Origin at all
+    "null",                            # a sandboxed or file: page
+    "http://evil.example",             # another site
+    "http://127.0.0.1:9999",           # another port on this Mac
+    "https://127.0.0.1:8765",          # another scheme
+    f"http://{TAILSCALE_IP}:8765",     # an allowed host, but not this request's
+])
+def test_cross_origin_posts_are_refused(cfg, db, origin):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    _refused(_act(client, tid, "cancel", origin=origin))
+    _refused(_act(client, tid, "cancel", origin=origin, htmx=False))
+    assert db.task_state(tid) == TaskState.QUEUED and db.interventions() == []
+
+
+@pytest.mark.parametrize("token", ["", "wrong", "x" * 43])
+def test_missing_or_bad_csrf_tokens_are_refused(cfg, db, token):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    for action in dashboard.ACTIONS:
+        _refused(_act(client, tid, action, token=token, level="urgent"))
+    assert db.task_state(tid) == TaskState.QUEUED and db.get_task(tid)["priority"] == "normal"
+
+
+def test_a_token_from_another_dashboard_process_is_refused(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    old = _app(cfg).state.csrf_token
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    assert client.app.state.csrf_token != old
+    _refused(_act(client, tid, "cancel", token=old))
+
+
+def test_cross_site_fetch_metadata_is_refused(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = client.post(f"/tasks/{tid}/cancel", data={"csrf": client.app.state.csrf_token},
+                    headers={"Origin": ORIGIN, "Sec-Fetch-Site": "cross-site"})
+    _refused(r)
+    assert db.task_state(tid) == TaskState.QUEUED
+
+
+def test_the_host_allowlist_still_applies_to_actions(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://evil.example")
+    r = client.post(f"/tasks/{tid}/cancel", data={"csrf": client.app.state.csrf_token},
+                    headers={"Origin": "http://evil.example"})
+    assert r.status_code == 400 and db.task_state(tid) == TaskState.QUEUED
+
+
+def test_actions_work_on_the_tailscale_name_from_the_same_origin(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://mac.tail1234.ts.net:8765")
+    r = _act(client, tid, "cancel", origin="http://mac.tail1234.ts.net:8765")
+    assert r.status_code == 200 and db.task_state(tid) == TaskState.CANCELLED
+
+
+@pytest.mark.parametrize("action", dashboard.ACTIONS)
+def test_get_requests_to_actions_are_refused(cfg, db, action):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    db.transition(tid, TaskState.FAILED, "crashed")
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = client.get(f"/tasks/{tid}/{action}?csrf={client.app.state.csrf_token}&level=urgent",
+                   headers={"Origin": ORIGIN})
+    assert r.status_code == 405
+    assert db.task_state(tid) == TaskState.FAILED
+
+
+def test_an_oversized_form_is_refused_unread(cfg, db):
+    tid = create_task(cfg, db, "Scan postings").spec.id
+    client = TestClient(_app(cfg), base_url="http://127.0.0.1:8765")
+    r = _act(client, tid, "cancel", pad="x" * dashboard.MAX_FORM_BYTES)
+    _refused(r)
+
+
+def test_htmx_is_served_from_the_dashboard_itself(cfg, db):
+    create_task(cfg, db, "Scan postings")
+    client = _client(cfg)
+    html = client.get("/").text
+    assert '<script src="/static/htmx.min.js" defer></script>' in html
+    assert "https://" not in html  # no CDN
+    assert '"allowEval":false' in html
+    js = client.get("/static/htmx.min.js")
+    assert js.status_code == 200 and js.text.startswith("var htmx=function()")
+    assert js.headers["content-type"].startswith("text/javascript")
+
+
+def test_the_guard_on_its_own():
+    allowed = dashboard.allowed_hosts(TAILSCALE_IP)
+    ok = {"host": "127.0.0.1:8765", "origin": ORIGIN}
+    assert dashboard.refuse_cross_site(ok, {"csrf": "t"}, token="t", allowed=allowed) is None
+    assert dashboard.refuse_cross_site({**ok, "host": "localhost:8765",
+                                        "origin": "http://LOCALHOST:8765"}, {"csrf": "t"},
+                                       token="t", allowed=allowed) is None
+    assert "Origin" in dashboard.refuse_cross_site({"host": "127.0.0.1:8765"}, {"csrf": "t"},
+                                                   token="t", allowed=allowed)
+    assert "host" in dashboard.refuse_cross_site(
+        {"host": "evil.example", "origin": "http://evil.example"}, {"csrf": "t"},
+        token="t", allowed=allowed)
+    assert "CSRF" in dashboard.refuse_cross_site(ok, {"csrf": "u"}, token="t", allowed=allowed)
+    assert dashboard.parse_form(b"csrf=a%2Fb&level=urgent&level=normal") == {
+        "csrf": "a/b", "level": "urgent"}
+    assert dashboard.parse_form(b"\xff\xfe") == {}
 
 
 # --------------------------------------------------------------------------

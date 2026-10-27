@@ -28,7 +28,7 @@ orch = "nightshift.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-nightshift = ["defaults.yaml", "dashboard_templates/*.html"]
+nightshift = ["defaults.yaml", "dashboard_templates/*.html", "dashboard_static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

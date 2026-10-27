@@ -2039,3 +2039,72 @@ lasting consequences go in `docs/adr/` instead.
   its Needs you section. No Approve / Deny buttons on needs-you alerts yet:
   the commands work; buttons were not asked for here.
 - **SPEC §7** records the deny semantics as resolved.
+
+## Phase 3, issue #36: dashboard controls (cancel, pause, resume, retry, priority)
+
+- **Where.** Each Task in the status groups on `/` and the Task page
+  (`/tasks/<id>/report`, the only per-Task page) gets a controls row:
+  Cancel, Pause, Resume, Retry, and a priority select with Set. The inbox
+  still has no buttons; approve/deny there is #37.
+- **Shown only where allowed: `control.available(row)`**, new in the
+  control layer next to the controls it describes, so the dashboard holds
+  no state rules of its own. It mirrors the checks the controls make: cancel
+  in any unfinished state (not once a cancel of a running Task is asked);
+  pause in queued, retry_wait, running and paused_usage (not when already
+  paused by hand or a pause or cancel is pending); resume in paused_usage,
+  or on a running Task with a pending pause (it withdraws it); retry in
+  failed, partial and retry_wait; priority in any unfinished state.
+  `paused_spend` and a re-approval Task get no resume: the control would
+  refuse them. A Task that moves before the press gets the control
+  layer's refusal ("Not done: ..."), shown in place.
+- **No waiting.** Cancel and pause of a running Task under a live daemon
+  answer at once with the control layer's request message ("... asked the
+  daemon to stop it."). `wait_for_cancel`/`wait_for_pause` aren't called: a
+  web request shouldn't hang for up to 30 s, and the page's 30 s refresh
+  shows the outcome. The control layer's note (daemon not running) is
+  shown under the result.
+- **HTMX, vendored.** `htmx.min.js` 2.0.4 from the npm tarball (sha512
+  checked against the registry's integrity) in
+  `src/nightshift/dashboard_static/`, served at `/static/htmx.min.js`, as
+  #24 planned. Each control is a real `<form method="post">` with
+  `hx-post`, swapping the whole controls row (`outerHTML`, `closest
+  .controls`) for the answer: the outcome line plus the buttons the new
+  state allows. Without JavaScript the same form posts and gets a small
+  result page. Cancel asks to confirm (`hx-confirm`), against a mis-tap on
+  a phone. htmx config: `allowEval` and `allowScriptTags` off,
+  `selfRequestsOnly` on, and a 403 is swapped in too, so a refusal is
+  visible.
+- **The guard** (`refuse_cross_site`), on every action, after the Host
+  allowlist:
+  - **POST only**: one route per action; a GET is a 405.
+  - **Same origin**: `Origin` must be exactly `http://` + `Host`, with that
+    name one of the allowed hosts. A request with no `Origin` is refused
+    rather than falling back to `Referer`: Safari, Chrome and Firefox all
+    send `Origin` on POST, same-origin form posts included. `Sec-Fetch-Site`,
+    when present, must be `same-origin` (or `none`).
+  - **CSRF token**: `secrets.token_urlsafe(32)` per dashboard process, a
+    hidden field in every controls form, compared with
+    `hmac.compare_digest`. No cookie or session: one user, and a page from
+    another origin can't read ours to learn it (Host allowlist + same-origin
+    policy). A restart makes open pages' tokens stale: reload. A refusal is
+    a 403 saying why, with no buttons and no token in it.
+  - Forms are parsed by hand (`application/x-www-form-urlencoded`, at most
+    4 KB, 10 fields): no `python-multipart` dependency for two fields.
+  The bind is unchanged (127.0.0.1 and the Tailscale address only).
+- **Interventions.** Nothing new: the control layer writes `(dashboard)`
+  into transition reasons and `command=dashboard` into priority
+  intervention records, which `cleanweek` already counts. A test drives
+  each control through the app and checks the clean-week list.
+- **Docs.** The module docstring and `docs/safety.md` ("The dashboard's
+  write surface") describe the write surface, its guard and its gaps (no
+  login: anyone on the tailnet who can open the page can press the
+  buttons).
+- **Tests.** `control.available` per state (`tests/test_control.py`);
+  through TestClient against a real DB, each control end to end (queued and
+  running cancel and pause, resume and withdraw, retry, priority with a bad
+  level), state refusals, the plain-form result page, which buttons each
+  state shows on both pages, clean-week interventions, and the guard:
+  missing, `null`, foreign, other-port, other-scheme and other-host
+  Origins, missing, wrong and old-process tokens on every action,
+  cross-site fetch metadata, a foreign Host, GETs to every action, an
+  oversized form, and HTMX served locally (`tests/test_dashboard.py`).

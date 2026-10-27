@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ task.title }} · Nightshift{% endblock %}
+{% block head %}{% include "_htmx.html" %}{% endblock %}
 {% block style %}
-  nav { font-size: 14px; margin-bottom: 10px; }
   .meta { color: var(--muted); font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 4px 10px; }
   .empty { color: var(--muted); }
   article { background: var(--panel); border-radius: 8px; padding: 4px 14px 12px; margin-top: 12px;
@@ -34,6 +34,7 @@
     <span>{{ task.task_type }} · {{ task.agent }}</span>
     <span>{{ task.created_at|short_time }}</span>
   </div>
+  {% with result=none, refused=none %}{% include "_controls.html" %}{% endwith %}
   {% if report is none %}
   <p class="empty">No report.md yet.</p>
   {% else %}

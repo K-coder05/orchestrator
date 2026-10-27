@@ -279,3 +279,43 @@ def test_a_failed_plan_call_is_a_refusal_and_the_task_waits(cfg, db, at, planner
     res = control.plan(cfg, db, tid, adapter_provider=plan_provider)
     assert res.refusal == control.NO_PLAN and res.message.startswith("Could not write a plan")
     assert db.task_state(tid) == TaskState.AWAITING_APPROVAL
+
+
+# -- which controls a state allows ---------------------------------------------
+
+def test_available_controls_follow_the_controls_own_rules(cfg, db, at, monkeypatch):
+    monkeypatch.setattr(daemon, "daemon_running", lambda cfg: True)
+    C, P, R, T, PR = (control.CANCEL, control.PAUSE, control.RESUME, control.RETRY,
+                      control.PRIORITY)
+
+    def avail(tid):
+        return set(control.available(db.get_task(tid)))
+
+    q = create_task(cfg, db, "queued").spec.id
+    assert avail(q) == {C, P, PR}
+    control.pause(cfg, db, q, via="dashboard", at=at)
+    assert avail(q) == {C, R, PR}  # paused by hand: no second pause
+    usage = create_task(cfg, db, "usage").spec.id
+    db.transition(usage, TaskState.PAUSED_USAGE, "limit", set_fields={"pause_kind": "usage"})
+    assert avail(usage) == {C, P, R, PR}
+    spend = create_task(cfg, db, "spend").spec.id
+    db.transition(spend, TaskState.PAUSED_SPEND, "cap")
+    assert avail(spend) == {C, PR}  # resumes on its own once the cap lifts
+    approval = create_task(cfg, db, "approval", needs_approval=True).spec.id
+    assert avail(approval) == {C, PR}
+    run = create_task(cfg, db, "running").spec.id
+    _running(db, run)
+    assert avail(run) == {C, P, PR}
+    control.pause(cfg, db, run, via="dashboard", at=at)
+    assert avail(run) == {C, R, PR}  # resume withdraws the pending pause
+    control.cancel(cfg, db, run, via="dashboard", at=at)
+    assert avail(run) == {R, PR}
+    wait = create_task(cfg, db, "retry wait").spec.id
+    _running(db, wait)
+    db.transition(wait, TaskState.RETRY_WAIT, "crashed")
+    assert avail(wait) == {C, P, T, PR}
+    for state in (TaskState.FAILED, TaskState.CANCELLED):
+        tid = create_task(cfg, db, str(state)).spec.id
+        db.transition(tid, state, "t")
+        assert avail(tid) == ({T} if state == TaskState.FAILED else set())
+

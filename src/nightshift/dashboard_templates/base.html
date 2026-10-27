@@ -24,6 +24,23 @@
   h1 { font-size: 20px; margin: 0 0 12px; }
   .asof { color: var(--muted); font-size: 13px; white-space: nowrap; }
   code { font: 12px ui-monospace, Menlo, monospace; }
+  nav { font-size: 14px; margin-bottom: 10px; }
+  .controls { margin-top: 8px; }
+  .controls .buttons { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .controls form { margin: 0; display: flex; gap: 6px; }
+  .controls button, .controls select {
+    font: inherit; font-size: 13px; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; min-height: 34px;
+  }
+  .controls button { cursor: pointer; }
+  .controls button:active { background: var(--line); }
+  .controls .b-cancel { color: var(--failed); }
+  .controls .b-retry, .controls .b-resume { color: var(--running); }
+  .controls .b-pause { color: var(--paused); }
+  .controls.htmx-request { opacity: 0.6; }
+  .outcome { font-size: 13px; margin: 0 0 6px; overflow-wrap: anywhere; color: var(--done); }
+  .outcome.refused { color: var(--failed); }
+  .outcome.note { color: var(--muted); }
 {% block style %}{% endblock %}
 </style>
 </head>
