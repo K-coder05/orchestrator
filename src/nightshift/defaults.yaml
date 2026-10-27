@@ -191,7 +191,9 @@ templates:
     cover_letter_template: ~/Documents/career/resume/cover_letter_template.tex
   # Inputs of the posting-scan template (§1.8). Fill these in: the public
   # internship tracker repos (GitHub URLs) and your target companies' career
-  # page URLs the daily scan checks. Never LinkedIn.
+  # page URLs the daily scan checks. Never LinkedIn. company-rescrape
+  # re-scrapes the same career_pages every 2 days (snapshots and diffs in
+  # <agents_root>/data/snapshots/company-rescrape/).
   posting_scan:
     # Only postings for this season match; Nightshift rejects other rows.
     season: Summer 2027
@@ -286,6 +288,34 @@ task_types:
   study:
     internet: "on"
     failover: {agents: [claude, gemini], when: always}
+
+school:
+  # Your school folder (§1.4): slides, syllabi. Agents may read it, never
+  # write it, so it must be in permissions.read_only_dirs. The study-guide
+  # template reads only folders inside it.
+  dir: ~/school
+  # Each course's AI policy (§1.6). It wins over everything else: Nightshift
+  # injects it at the top of the agent protocol of every Task for that
+  # course. A Task naming a course with no policy here refuses to start.
+  # Key: a course id (lowercase letters, digits, - or _). A request or a
+  # calendar event names the course by its id, name or an alias, ignoring
+  # case, spaces, - and _ ("CS 61A" = "cs61a" = "CS-61A"). Per course:
+  #   name: how it is written (default: the id)
+  #   aliases: other names for it
+  #   policy: the course's AI policy as text, e.g. pasted from the syllabus
+  #   limits: hard limits, one rule per line, the agent must never break
+  #   ai_allowed: false if the course allows no AI use at all; Nightshift
+  #     then refuses every Task for it (default true)
+  # Example:
+  #   cs61a:
+  #     name: CS 61A
+  #     aliases: [61A]
+  #     policy: |
+  #       AI may be used to study and to explain course concepts. Never use
+  #       it to write or debug code for graded assignments.
+  #     limits:
+  #       - No solutions to homework, lab or project problems
+  courses: {}
 
 permissions:
   # Per-Task agent access (§1.4). The Task folder is the only writable place.

@@ -2353,3 +2353,104 @@ lasting consequences go in `docs/adr/` instead.
     Usage: 110k input / 31k output tokens, 10 requests, $0.62
     cost-equivalent, $0 spent (subscription). `company-brief` was not run
     for real (same hook and path; its prompt differs only in content).
+
+## Phase 3, issue #40: `study-guide` and the per-course AI policy
+
+- **Config: `school:`** (in `defaults.yaml` and `config.example.yaml`, now
+  byte-identical again: an old comment had drifted, and a test now compares
+  the files, not just the parsed YAML). `school.dir` (`~/school`) and
+  `school.courses.<id>`: `name`, `aliases`, `policy` (text), `limits` (hard
+  limits, one rule per line) and `ai_allowed` (false: the course allows no
+  AI use, so Nightshift refuses every Task for it). Ids are lowercase
+  slugs; a course may be listed with no policy yet (#41 can match its
+  calendar events), but no Task runs for it. The loader validates it all
+  (`nightshift.school.validate`, called from `config._validate`): unknown
+  keys are refused (a typo like `polcy` would otherwise look like "no
+  policy"), and no two courses may share a name or alias. Shipped with
+  `courses: {}` and a commented example; you fill in your courses.
+- **One module for #41 to reuse.** `nightshift.school`: `courses(cfg)`,
+  `find_courses(cfg, text)` (which configured courses a text names, in
+  order of mention), `course(cfg, id)` (a usable course or a clear
+  refusal), `protocol_section(course)`. A course is named by its id, name or
+  an alias, whole (not inside a longer code), ignoring case, spaces, `-` and
+  `_`: `CS 61A` = `cs61a` = `CS-61A`, but not `CS 61AB`. That is the rule
+  #41 can use to match calendar event titles.
+- **How a request names the course and folder.** Template `inputs` gain two
+  kinds: `from: course` (the one configured course the request names; it
+  must have a policy) and `from: school_folder` (the one `~/...` or `/...`
+  path in it; quote a path with spaces). The folder path counts as naming
+  the course, so `Study guide from ~/school/cs61a/week5` works on its own,
+  and a request naming one course with another's folder names two and is
+  refused. A `school_folder` input needs a `course` input in the same
+  template. Refused at intake, before any Task exists (`orch add`, Telegram
+  intake and Schedules all go through `templates.instantiate`), each with its
+  own message: no configured course named (lists the configured ones), more
+  than one, no policy, `ai_allowed: false`; no folder, more than one, a
+  folder outside `school.dir` (resolved first, so `..` and symlinks can't
+  leave it; `school.dir` itself is refused too, being no course's folder),
+  missing, not a folder, holding no (non-hidden) file, or `school.dir` not
+  in `permissions.read_only_dirs` (the agent couldn't read it).
+- **The Task keeps its course** in a new `tasks.course` column (migration
+  17), not in `task.yaml`, whose fields §2.2 lists. Not the policy text:
+  the runner reads the policy from config again before every Attempt, like
+  the permission policy, so an edit applies to the next Attempt. If the
+  course or its policy is gone by then, the Attempt never starts and the
+  Task fails with "course ... has no AI policy configured ... The Task did
+  not start" (the path a missing API key takes); `orch retry` after fixing
+  config. #41 can give course Tasks their due-date deadlines from this
+  column.
+- **The policy heads the protocol.** `agent_protocol(course_policy=...)`
+  puts a `## Course AI policy: <course>` section before the numbered rules,
+  and the intro line says the rules override anything else "except the
+  course AI policy below, which wins over them" (§1.6: it wins over
+  everything else). The section quotes the policy verbatim, lists the hard
+  limits, and says the policy only narrows what the agent does: it never
+  lifts the folder limits or the never-without-approval list. A policy that
+  happens to allow more than Nightshift does (say, "AI may help with
+  homework") still doesn't make graded work allowed: the section ends with
+  the §1.6 coursework rule (study material and practice problems only;
+  never graded work, never submit or upload). The same protocol goes to
+  any agent, so a failover to Gemini gets it too. Tasks without a course
+  get the protocol exactly as before.
+- **Template `study-guide`**: Task type `study`, agent `claude`, failover
+  to Gemini (§2.8's "Study plans and practice problems" row, through
+  `task_types.study.failover`). §0 lists "long-document and lecture
+  summaries" among Gemini's jobs, but §2.8 puts study material on Claude
+  first, and Gemini's AI Studio key keeps hitting quota on this Mac (#39);
+  `--agent gemini` tries it per Task. Internet **off**, though the `study`
+  type defaults on: the slides are local, and an internet-off Task can't
+  leak course material to the web or pull in outside answers (`--internet
+  on` turns it on). 30 minutes estimated (no plan approval, §2.4), 90-minute
+  cap, not long. Outputs `output/study_guide.md` (sections per lecture or
+  topic, each naming its source file and slide) and
+  `output/practice_problems.md` (new problems, never copied from an
+  assignment, ending in `## Answers`), both checked by `require_outputs`.
+  The prompt repeats that the policy wins and that the agent skips any part
+  the policy rules out and says so under Needs you.
+- **The report** gets a `### Course AI policy` section after section 9
+  naming the course whose policy headed the protocol (and its number of
+  hard limits); the policy text stays in config.
+- **Not done here:** free-form Tasks that read `~/school/` get no course
+  policy (nothing names a course); course due-date deadlines and the
+  calendar feeds are #41. A plan.md planning call (only for templates over
+  30 minutes; study-guide is not) doesn't get the policy.
+- **Tests.** `tests/test_study.py`: the defaults and the byte-identical
+  example, course config validation, matching (id, name, alias, the
+  folder; whole names only; order), folder extraction (quoted, trailing
+  punctuation, URLs not folders, none, two), the template loading and
+  rendering, every refusal above, bad template inputs, the protocol
+  section, and end to end with the fake Claude (`FAKE_STUDY`, also in the
+  fake Gemini): `orch add --template study-guide` queued without a plan,
+  run to `done` with the policy and hard limit heading the protocol the
+  agent got, `~/school` its only `--add-dir`, the folder in its prompt and
+  the Course AI policy section in the report; a missing output failing the
+  Attempt; `orch add` refusing; a policy removed before the run failing
+  the Task without starting the agent; the Telegram intake.
+  `test_study_guide_real` is the opt-in real run.
+- **Real run (2026-10-27).** `test_study_guide_real` on Claude (the CLI's
+  default model): a throwaway school folder with two Markdown "slide decks"
+  (recursion, trees) under a CS 61A policy with one hard limit. Passed in
+  1m 36s: a sectioned study guide citing slides, labelling extras *beyond
+  the slides*, and new practice problems with an `## Answers` section;
+  the slides folder untouched. A second run straight after hit Claude's
+  five-hour limit and paused (expected handling, not a defect).

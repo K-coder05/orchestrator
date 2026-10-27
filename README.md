@@ -23,6 +23,7 @@ orch add "Tailor my resume" --priority urgent --deadline 2026-11-01 --at 02:00
 orch add "Tailor my resume and a cover letter for <posting URL>" --template resume-tailor
 orch add "Research <topic>" --template research-report
 orch add "Brief me on <company> for my interview with <names>" --template company-brief --priority urgent
+orch add "Study guide for CS 61A from ~/school/cs61a/week5" --template study-guide
 orch priority <id> background   # urgent | normal | background
 orch approve <id>            # or `orch deny <id>`, for Tasks awaiting approval
 orch retry <id>              # failed/partial: run again; retry_wait: retry now
@@ -91,6 +92,12 @@ write `output/research.md` / `output/brief.md`; the Attempt fails unless
 every claim cites a URL or is labelled *unverified*, at least 5 distinct
 sources are cited and it is at least a page (500 words). The report lists
 the sources.
+`study-guide` reads a folder of lecture slides inside `~/school/` (read-only)
+and writes `output/study_guide.md` and `output/practice_problems.md`. The
+request names the course, which needs an AI policy in config
+(`school.courses`): that policy heads the agent protocol and wins over
+everything else. A course with no policy, or a folder outside `~/school/`,
+is refused. It never does or submits graded work.
 
 The queue runs by Effective priority: urgent first (nearest deadline first),
 then normal in order, then background only when nothing else can start. A

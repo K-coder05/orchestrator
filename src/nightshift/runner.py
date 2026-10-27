@@ -14,10 +14,10 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from . import failover, failures, needsyou, pauses, report, spend, templates, usage
+from . import failover, failures, needsyou, pauses, report, school, spend, templates, usage
 from .adapters import get_adapter, load_api_key
 from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
-from .config import Config
+from .config import Config, ConfigError
 from .db import Database
 from .failures import PostHook
 from .ids import new_task_id, slugify, title_from_prompt
@@ -58,6 +58,7 @@ def create_task(
     agent_override: bool | None = None,
     schedule_name: str | None = None,
     occurrence_date: date | None = None,
+    course: str | None = None,
 ) -> NewTask:
     """Create a Task: DB row, Task folder, ``task.yaml``.
 
@@ -78,7 +79,8 @@ def create_task(
     template Tasks whose prompt is the rendered template. ``agent_override``
     defaults to whether ``agent`` was given. ``schedule_name`` makes the
     Task an Occurrence of that Schedule: its folder is
-    ``recurring/<schedule-name>/<occurrence_date>/`` (§1.3).
+    ``recurring/<schedule-name>/<occurrence_date>/`` (§1.3). ``course`` (a
+    ``school.courses`` id) ties the Task to that course's AI policy (§1.6).
     """
     created = now(cfg.timezone)
     ttype = task_type or cfg.default("task_type")
@@ -124,6 +126,7 @@ def create_task(
     )
     fields = spec.to_dict() | {
         "folder": str(folder), "simulate_rate_limit_after": simulate_rate_limit_after,
+        "course": course,
     }
     state = TaskState.AWAITING_APPROVAL if needs_approval else TaskState.QUEUED
     db.insert_task(fields, state, reason)
@@ -451,6 +454,14 @@ def run_attempt(
     # The API key an agent signs in with (a paid path's, §1.5, or Gemini's
     # free-tier key); loading it registers it for redaction.
     load_api_key(adapter, cfg.secrets, required=True)
+    # A course Task's AI policy, from config as it is now (§1.6): without one
+    # the Attempt never starts and the Task fails with the reason.
+    course_policy = None
+    if row["course"]:
+        try:
+            course_policy = school.protocol_section(school.course(cfg, row["course"]))
+        except school.CourseError as exc:
+            raise ConfigError(f"{exc}. The Task did not start") from None
 
     # A fresh policy every Attempt, so config changes apply and nothing the
     # agent did to an earlier one carries over.
@@ -484,7 +495,7 @@ def run_attempt(
         internet=row["internet"],
         protocol=agent_protocol(
             folder, permissions.read_only_dirs, internet=policy.internet,
-            denied_domains=policy.denied_domains,
+            denied_domains=policy.denied_domains, course_policy=course_policy,
         ),
     )
     resume_session = choice.session_id if choice is not None else None

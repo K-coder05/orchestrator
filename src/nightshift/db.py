@@ -428,6 +428,12 @@ MIGRATIONS: list[str] = [
     -- cleared when that Attempt starts.
     ALTER TABLE tasks ADD COLUMN request_decision_id INTEGER REFERENCES approvals(id);
     """,
+    # 17: the course a school Task is for (nightshift.school).
+    """
+    -- A school.courses id. Its AI policy is read from config before every
+    -- Attempt and heads the agent protocol (§1.6); NULL: not a course Task.
+    ALTER TABLE tasks ADD COLUMN course TEXT;
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -440,7 +446,7 @@ TRANSITION_FIELDS = frozenset({
 TASK_COLUMNS = (
     "id title slug prompt template task_type agent agent_override priority deadline run_at "
     "internet long estimated_minutes max_runtime_minutes approved approved_at schedule_name "
-    "created_at folder simulate_rate_limit_after"
+    "created_at folder simulate_rate_limit_after course"
 ).split()
 
 

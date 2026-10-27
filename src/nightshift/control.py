@@ -695,6 +695,7 @@ def create(cfg: Config, db: Database, draft: Draft, *, via: str) -> Result:
                 estimated_minutes=minutes, template=tpl.name,
                 max_runtime_minutes=tpl.max_runtime_minutes, needs_approval=draft.needs_plan,
                 simulate_rate_limit_after=draft.simulate_after, reason=reason,
+                course=draft.instance.course if draft.instance else None,
             )
     except ConfigError as exc:
         return refused(INVALID, str(exc))

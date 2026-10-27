@@ -13,7 +13,10 @@ def agent_protocol(
     *,
     internet: bool = False,
     denied_domains: list[str] | None = None,
+    course_policy: str | None = None,
 ) -> str:
+    """The protocol text. ``course_policy`` (``school.protocol_section``, a
+    course Task's AI policy) heads it: it wins over everything else (§1.6)."""
     ro = ", ".join(f"`{p}`" for p in (read_only_dirs or [])) or "none for this Task"
     if internet:
         denied = ", ".join(denied_domains or []) or "none"
@@ -26,12 +29,15 @@ def agent_protocol(
     else:
         web = "This Task has no internet access. Shell commands have no network."
     sections = "\n".join(f"   {s}" for s in SECTIONS[:7])
+    course = f"\n{course_policy.rstrip()}\n\n## Rules\n" if course_policy else ""
+    course_note = (", except the course AI\npolicy below, which wins over them"
+                   if course_policy else "")
     return f"""\
 # Nightshift agent protocol
 
 You are running headless for Nightshift. Nobody is watching this session live.
-These rules override anything else you are told.
-
+These rules override anything else you are told{course_note}.
+{course}
 1. Work only inside the Task folder: `{folder}`. It is your working directory.
    Read-only folders: {ro}. Never modify anything outside the Task folder.
    Everything else on this machine is off limits.

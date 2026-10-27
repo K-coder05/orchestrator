@@ -1,0 +1,73 @@
+# study-guide (§5 item 3): a study guide and practice problems from a folder
+# of lecture slides. Usage:
+#   orch add "Study guide for CS 61A from ~/school/cs61a/week5" --template study-guide
+#   (Telegram: add study-guide <request>)
+#
+# The request names the course and the slides folder (quote a path with
+# spaces). The course must be in config (school.courses) with an AI policy:
+# Nightshift refuses the request otherwise, and injects that policy at the
+# top of the agent protocol of every Attempt, where it wins over everything
+# else (§1.6). The folder must be inside school.dir (~/school), which agents
+# read but never write (§1.4); one outside it is refused. The agent writes
+# output/study_guide.md and output/practice_problems.md. It never does or
+# submits graded work.
+#
+# A `study` Task: fails over to Gemini when Claude is out (§2.8). Internet
+# off: the slides are local. 30 minutes or less, so it starts without plan
+# approval (§2.4).
+name: study-guide
+description: A study guide and practice problems from lecture slides (input - course and ~/school/ folder)
+task_type: study
+agent: claude
+estimated_minutes: 30
+max_runtime_minutes: 90
+long: false
+internet: "off"
+
+inputs:
+  course: {from: course}          # the one configured course the request names
+  slides: {from: school_folder}   # the one folder path, inside school.dir
+
+post_hooks:
+  - hook: require_outputs
+    files: [output/study_guide.md, output/practice_problems.md]
+
+prompt: |
+  Make study material for one of my courses from a folder of lecture slides.
+  My request:
+  "{{request}}"
+
+  Course: {{course}}
+  Slides folder: `{{slides}}`
+  The folder is read-only: never change, move or add anything in it.
+
+  This is study help, never graded work. The course's AI policy heads the
+  Nightshift protocol and wins over everything here: if it rules out any
+  part of this (summaries, practice problems, worked solutions), skip that
+  part and say so under Needs you. Never do, solve or write up a homework,
+  project, lab, quiz or exam question, even one that appears in the
+  folder; if the request asks for that, write `needs_you.json` and stop.
+  Never upload or submit anything.
+
+  Do this in order, keeping `progress.md` current after each step:
+
+  1. List the folder and read the lecture material in it (slides, PDFs,
+     notes), in lecture order. A file you can't read: note it under Open
+     issues and go on. If the folder holds no lecture material, write
+     `needs_you.json` and stop.
+  2. Write `output/study_guide.md` in Markdown: a `# {{course}}: <topic>
+     study guide` line, then one `##` section per lecture or topic with
+     the key ideas, definitions, formulas and short worked examples, in
+     your own words. Name the source file (and slide or page, where you
+     can) for each section. Stick to what the slides cover; label anything
+     you add from beyond them *beyond the slides*.
+  3. Write `output/practice_problems.md`: new practice problems of mixed
+     difficulty covering the guide's topics, each naming its topic. Write
+     your own; never copy an assignment's problems. End with an
+     `## Answers` section with a worked solution to each.
+  4. Write `report.md`. Under Summary say which lectures and topics the
+     guide covers; under How to use, how to work through the two files.
+
+  Nightshift fails this Attempt if either output file is missing or empty.
+  If `logs/nightshift.log` shows a failed post-hook from an earlier
+  Attempt, fix what it names first.

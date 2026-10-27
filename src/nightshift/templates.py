@@ -12,7 +12,10 @@ Variables in ``prompt``:
 
 - ``{{request}}``: the ``orch add`` text, verbatim.
 - each of ``inputs``: a value taken from the request (``from: url`` = the
-  first http(s) URL in it).
+  first http(s) URL in it; ``from: course`` = the one configured course it
+  names, which must have an AI policy, and ties the Task to that course
+  (``nightshift.school``); ``from: school_folder`` = the one folder path it
+  names, which must be inside ``school.dir``).
 - each of ``files``: a file named by a config key, copied into the Task
   folder (``to:``) when the Task is created; the variable is that relative
   path. A pristine copy is kept in ``<agents_root>/data/inputs/<task-id>/``,
@@ -38,7 +41,8 @@ One with a ``snapshot_pages`` post-hook (company-rescrape) gets a Career pages
 snapshot section: the diff against the previous Task's snapshot as counts
 (``snapshots``). One with a ``research_rules`` post-hook (research-report,
 company-brief) gets a Sources section: the distinct sources its result cites,
-read by Nightshift from the result file (``research``).
+read by Nightshift from the result file (``research``). A course Task
+(study-guide) gets a Course AI policy section naming the policy it ran under.
 """
 
 from __future__ import annotations
@@ -56,7 +60,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from . import latex, research, snapshots, trace, tracker
+from . import latex, research, school, snapshots, trace, tracker
 from .config import Config
 from .db import Database
 from .failures import PostHook, PostHookFailed
@@ -84,6 +88,8 @@ OPTIONAL = ("name", "description", "inputs", "files", "values", "deadline", "pos
             "report_diffs", "schedule")
 #: Keys of a template's ``schedule:`` block (its standard Schedule's rules).
 SCHEDULE_KEYS = ("cron", "catch_up", "overlap", "request")
+#: What an ``inputs`` entry takes from the request (``from:``).
+INPUT_KINDS = ("url", "course", "school_folder")
 _VAR = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _URL = re.compile(r"https?://[^\s<>\"'`]+")
 
@@ -184,8 +190,16 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
     if not isinstance(inputs, dict):
         raise TemplateError(f"template {name!r}: inputs must be a mapping")
     for var, spec in inputs.items():
-        if not isinstance(spec, dict) or spec.get("from") != "url":
-            raise TemplateError(f"template {name!r}: input {var!r} needs from: url")
+        if not isinstance(spec, dict) or set(spec) != {"from"} or spec["from"] not in INPUT_KINDS:
+            raise TemplateError(f"template {name!r}: input {var!r} needs from: "
+                                + " | ".join(INPUT_KINDS))
+    kinds = [spec["from"] for spec in inputs.values()]
+    for kind in ("course", "school_folder"):
+        if kinds.count(kind) > 1:
+            raise TemplateError(f"template {name!r}: at most one input from: {kind}")
+    if "school_folder" in kinds and "course" not in kinds:
+        raise TemplateError(f"template {name!r}: an input from: school_folder needs one from: "
+                            "course too (school work runs under its course's AI policy)")
     files = data.get("files") or {}
     if not isinstance(files, dict):
         raise TemplateError(f"template {name!r}: files must be a mapping")
@@ -305,6 +319,8 @@ class Instance:
     prompt: str  # rendered: what the agent gets
     values: dict[str, str]
     files: list[InputFile]
+    #: The ``school.courses`` id of a ``from: course`` input, else None.
+    course: str | None = None
 
 
 def config_value(cfg: Config, dotted: str) -> Any:
@@ -351,7 +367,18 @@ def instantiate(cfg: Config, tpl: Template, request: str) -> Instance:
     """Fill in the template for ``request``. Reads the input files now, so a
     missing one fails ``orch add`` before any Task exists."""
     values: dict[str, str] = {"request": request.strip()}
+    course = None
     for var, spec in tpl.inputs.items():
+        try:
+            if spec["from"] == "course":
+                c = school.course_for_request(cfg, request)
+                values[var], course = c.label, c.id
+                continue
+            if spec["from"] == "school_folder":
+                values[var] = str(school.school_folder(cfg, request))
+                continue
+        except school.CourseError as exc:
+            raise TemplateError(f"template {tpl.name!r}: {exc}") from None
         found = _URL.search(request)
         if not found:
             raise TemplateError(f"template {tpl.name!r} needs a {var} (an http(s) URL) in the request")
@@ -376,7 +403,8 @@ def instantiate(cfg: Config, tpl: Template, request: str) -> Instance:
     for var, spec in tpl.values.items():
         values[var] = render_value(config_value(cfg, spec["config"]))
     prompt = _VAR.sub(lambda m: values[m.group(1)], tpl.prompt)
-    return Instance(template=tpl, request=request, prompt=prompt, values=values, files=files)
+    return Instance(template=tpl, request=request, prompt=prompt, values=values, files=files,
+                    course=course)
 
 
 def pristine_dir(cfg: Config, task_id: str) -> Path:
@@ -824,6 +852,20 @@ def research_sources(cfg: Config, row: Mapping[str, Any], h: dict) -> str:
     return research.sources_section(res, h["file"])
 
 
+def course_section(cfg: Config, course_id: str) -> str:
+    """The report's Course AI policy section: which course's policy the
+    agent ran under (the policy itself is in config)."""
+    title = "### Course AI policy"
+    c = school.courses(cfg).get(course_id)
+    if c is None or c.policy is None:
+        return (f"{title}\n\nCourse {course_id} has no AI policy in config now "
+                f"(`school.courses.{course_id}.policy`); no Attempt starts without one.")
+    limits = f", with {len(c.limits)} hard limit{'s' if len(c.limits) != 1 else ''}" if (
+        c.limits) else ""
+    return (f"{title}\n\n{c.label}: its AI policy (`school.courses.{c.id}` in config"
+            f"{limits}) headed the agent protocol of every Attempt, ahead of everything else.")
+
+
 def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
     """The Nightshift-written part of a template Task's ``report.md``: each
     ``report_diffs`` item as a unified diff of an output against the pristine
@@ -836,6 +878,8 @@ def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
     except TemplateError:
         return None
     parts = []
+    if "course" in row.keys() and row["course"]:
+        parts.append(course_section(cfg, row["course"]))
     if any(h["hook"] == "merge_tracker" for h in tpl.post_hooks):
         parts.append(new_postings(cfg, row))
     if any(h["hook"] == "snapshot_pages" for h in tpl.post_hooks):

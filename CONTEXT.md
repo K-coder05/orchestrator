@@ -68,6 +68,15 @@ A candidate Tracker row an agent writes to its task folder for Nightshift to val
 A posting whose Proposed row was actually appended to the Tracker by the merge; anything deduped away is not new.
 _Avoid_: Fresh posting, unseen posting
 
+### School
+
+**Course**:
+A class configured under `school.courses`, named in requests by its id, name or an alias. A Task tied to a Course runs under its AI policy.
+
+**AI policy**:
+A Course's rules for AI use, from config, with optional hard limits. It heads the agent protocol of every Attempt of that Course's Tasks and wins over everything else; a Course with no AI policy gets no Tasks.
+_Avoid_: Course rules, honor code
+
 ### Usage
 
 **Window**:

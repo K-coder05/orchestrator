@@ -378,7 +378,7 @@ def _occurrence(cfg: Config, db: Database, s: Schedule, fire_at: datetime, *,
         long=tpl.long, internet=tpl.internet, estimated_minutes=proposal.estimated_minutes,
         template=tpl.name, max_runtime_minutes=tpl.max_runtime_minutes,
         # Scheduled templates are pre-approved, so nothing stalls at 2am (§2.4).
-        needs_approval=False, schedule_name=s.name, occurrence_date=day,
+        needs_approval=False, schedule_name=s.name, occurrence_date=day, course=instance.course,
         reason=f"Occurrence of Schedule {s.name} ({why}); pre-approved",
     )
     templates.install_inputs(cfg, instance, new.folder, new.spec.id)

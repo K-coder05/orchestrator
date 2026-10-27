@@ -161,6 +161,12 @@ if os.environ.get("FAKE_RESEARCH"):
     Path("output").mkdir(exist_ok=True)
     Path(os.environ.get("FAKE_RESEARCH_TO") or "output/research.md").write_text(
         Path(os.environ["FAKE_RESEARCH"]).read_text())
+if os.environ.get("FAKE_STUDY"):
+    # A study-guide agent's output: every file of the folder FAKE_STUDY,
+    # copied into output/.
+    Path("output").mkdir(exist_ok=True)
+    for f in sorted(Path(os.environ["FAKE_STUDY"]).iterdir()):
+        Path("output", f.name).write_text(f.read_text())
 
 result = os.environ.get("FAKE_RESULT", "done")
 if result != "none":

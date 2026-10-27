@@ -24,7 +24,8 @@ FAKE_PROPOSED (shared with fake_claude.py): a posting-scan agent's
 Proposed rows, copied to output/proposed_rows.csv. FAKE_PAGES (also
 shared): a company-rescrape agent's output/career_pages.json.
 FAKE_RESEARCH (also shared): a research template's result, copied to
-FAKE_RESEARCH_TO (default output/research.md).
+FAKE_RESEARCH_TO (default output/research.md). FAKE_STUDY (also shared): a
+folder whose files a study-guide agent writes into output/.
 """
 import json
 import os
@@ -170,6 +171,9 @@ if os.environ.get("FAKE_PAGES"):
 if os.environ.get("FAKE_RESEARCH"):
     Path(os.environ.get("FAKE_RESEARCH_TO") or "output/research.md").write_text(
         Path(os.environ["FAKE_RESEARCH"]).read_text())
+if os.environ.get("FAKE_STUDY"):
+    for f in sorted(Path(os.environ["FAKE_STUDY"]).iterdir()):
+        Path("output", f.name).write_text(f.read_text())
 with open("progress.md", "a") as f:
     f.write("- gemini: wrote output/notes.md\n")
 result = os.environ.get("FAKE_GEMINI_RESULT", "done")
