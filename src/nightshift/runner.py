@@ -667,7 +667,8 @@ def run_attempt(
             end_reason = (f"Attempt {attempt_no} hit a simulated rate limit {step_note} "
                           f"(--simulate-rate-limit-after {simulate_after})")
         elif kind == pauses.KIND_BY_HAND:
-            end_reason = f"Attempt {attempt_no} paused by hand (orch pause) {step_note}"
+            end_reason = (f"Attempt {attempt_no} paused by hand "
+                          f"({db.request_via(task_id, 'pause')}) {step_note}")
         else:
             ltype = f" ({limit.limit_type})" if limit is not None and limit.limit_type else ""
             end_reason = f"Attempt {attempt_no} hit {agent_name}'s usage limit{ltype} {step_note}"
@@ -715,7 +716,8 @@ def run_attempt(
         )
     if stop == STOP_CANCEL:
         state, outcome = TaskState.CANCELLED, "cancelled"
-        end_reason = f"cancelled by hand (orch cancel) during Attempt {attempt_no}"
+        end_reason = (f"cancelled by hand ({db.request_via(task_id, 'cancel')}) "
+                      f"during Attempt {attempt_no}")
         detail = end_reason
     elif stop == STOP_SPEND_CAP and spend_watcher is not None and spend_watcher.error:
         failed_attempt = f"Attempt {attempt_no} stopped: could not record spend: {spend_watcher.error}"
@@ -859,7 +861,8 @@ def fail_orphaned(
     for row in db.tasks_in_state(TaskState.RUNNING):
         cancel = row["cancel_requested_at"] is not None
         reason = (
-            "cancelled by hand (orch cancel); the daemon stopped before it could stop the Attempt"
+            f"cancelled by hand ({db.request_via(row['id'], 'cancel')}); the daemon stopped "
+            "before it could stop the Attempt"
             if cancel else "crashed: the daemon stopped unexpectedly while an Attempt was running"
         )
         last = None

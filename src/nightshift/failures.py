@@ -217,6 +217,10 @@ class NotAllowed(Exception):
     """The Task's state doesn't allow this command."""
 
 
+class StillChanging(NotAllowed, StateChanged):
+    """The daemon kept moving the Task while this command looked at it."""
+
+
 def retry_by_hand(cfg: Config, db: Database, task_id: str, *, at: datetime,
                   via: str = "orch retry") -> str:
     """Requeue a ``failed`` or ``partial`` Task with a fresh retry budget, or
@@ -265,7 +269,7 @@ def cancel(cfg: Config, db: Database, task_id: str, *, at: datetime, daemon_up: 
         if state in TERMINAL:
             raise NotAllowed(f"Task {task_id} is already {state}")
         if state == TaskState.RUNNING and daemon_up:
-            db.request_cancel(task_id)
+            db.request_cancel(task_id, via)
             return CancelResult("requested", state)
         reason = f"{why or f'cancelled by hand ({via})'} while {state}"
         try:
@@ -279,4 +283,4 @@ def cancel(cfg: Config, db: Database, task_id: str, *, at: datetime, daemon_up: 
                                   end_reason=reason, session_id=None)
         finalize(cfg, db, db.get_task(task_id), TaskState.CANCELLED, reason, at=at)
         return CancelResult("cancelled", state)
-    raise NotAllowed(f"Task {task_id} kept changing state; try again")
+    raise StillChanging(f"Task {task_id} kept changing state; try again")

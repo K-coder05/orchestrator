@@ -389,6 +389,13 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX interventions_at ON interventions(at);
     """,
+    # 14: the surface a pending cancel or pause came from (nightshift.control).
+    """
+    -- `orch cancel`, `telegram` or `dashboard`: named in the transition the
+    -- daemon writes when it stops or pauses the running Attempt.
+    ALTER TABLE tasks ADD COLUMN cancel_requested_via TEXT;
+    ALTER TABLE tasks ADD COLUMN pause_requested_via TEXT;
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -548,27 +555,38 @@ class Database:
             if c.execute("UPDATE tasks SET deadline = ? WHERE id = ?", (deadline, task_id)).rowcount != 1:
                 raise KeyError(task_id)
 
-    def request_cancel(self, task_id: str) -> None:
-        """Ask the daemon to cancel a running Task (see ``nightshift.failures``)."""
+    def request_cancel(self, task_id: str, via: str = "orch cancel") -> None:
+        """Ask the daemon to cancel a running Task (see ``nightshift.failures``).
+        The first request's time and surface (``via``) stand."""
         with self.tx() as c:
             c.execute(
-                "UPDATE tasks SET cancel_requested_at = COALESCE(cancel_requested_at, ?) "
-                "WHERE id = ?",
-                (self._now(), task_id),
+                "UPDATE tasks SET cancel_requested_via = CASE WHEN cancel_requested_at IS NULL "
+                "THEN ? ELSE cancel_requested_via END, "
+                "cancel_requested_at = COALESCE(cancel_requested_at, ?) WHERE id = ?",
+                (via, self._now(), task_id),
             )
 
-    def request_pause(self, task_id: str) -> None:
+    def request_pause(self, task_id: str, via: str = "orch pause") -> None:
         """Ask the daemon to pause a running Task after its current Step."""
         with self.tx() as c:
             c.execute(
-                "UPDATE tasks SET pause_requested_at = COALESCE(pause_requested_at, ?) "
-                "WHERE id = ?",
-                (self._now(), task_id),
+                "UPDATE tasks SET pause_requested_via = CASE WHEN pause_requested_at IS NULL "
+                "THEN ? ELSE pause_requested_via END, "
+                "pause_requested_at = COALESCE(pause_requested_at, ?) WHERE id = ?",
+                (via, self._now(), task_id),
             )
 
     def clear_pause_request(self, task_id: str) -> None:
         with self.tx() as c:
-            c.execute("UPDATE tasks SET pause_requested_at = NULL WHERE id = ?", (task_id,))
+            c.execute("UPDATE tasks SET pause_requested_at = NULL, pause_requested_via = NULL "
+                      "WHERE id = ?", (task_id,))
+
+    def request_via(self, task_id: str, kind: str) -> str:
+        """The surface a pending ``cancel`` or ``pause`` request came from."""
+        row = self.conn.execute(
+            f"SELECT {kind}_requested_via FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        return (row[0] if row is not None else None) or f"orch {kind}"
 
     def cancel_requested(self, task_id: str) -> bool:
         row = self.conn.execute(

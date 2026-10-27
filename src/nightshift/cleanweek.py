@@ -19,8 +19,9 @@ against the three conditions of a clean week:
    failed, or Nightshift could not start it), with its explanation. A crash
    with no error message, a daemon that died mid-Attempt, or an agent that
    reported failed without saying why is listed as unexplained.
-3. **Manual interventions.** Every CLI change to a Task (``orch cancel``,
-   ``retry``, ``pause``, ``resume``, ``priority``), every approval or denial
+3. **Manual interventions.** Every change to a Task by hand (``orch cancel``,
+   ``retry``, ``pause``, ``resume``, ``priority``, or the same control from
+   Telegram or the dashboard), every approval or denial
    (except the y/n answer of ``orch add`` itself, part of asking for the
    work), every ``orch schedule run-now``, ``enable``, ``disable`` or
    ``remove`` and every ``orch raise-cap``.
@@ -60,9 +61,11 @@ _NO_CAUSE = (
     re.compile(r"daemon stopped unexpectedly"),
 )
 _AGENT_FAILED = "agent finished; report says failed"
-#: A transition a person caused: `orch cancel|retry|pause|resume|approve|deny`,
+#: A transition a person caused: `orch cancel|retry|pause|resume|approve|deny`
+#: or the same control from Telegram or the dashboard (``nightshift.control``),
 #: Ctrl-C of a foreground run.
-_BY_HAND = re.compile(r"\bby hand\b|\(orch [a-z][a-z -]*\)|Ctrl-C")
+_VIA = r"\((orch [a-z][a-z -]*|telegram|dashboard)\)"
+_BY_HAND = re.compile(r"\bby hand\b|" + _VIA + r"|Ctrl-C")
 _NOT_BY_HAND = "(orch add)"  # approving the plan while adding the Task
 
 
@@ -316,7 +319,7 @@ def _interventions(db: Database, start: datetime, end: datetime) -> list[Interve
         if (t["from_state"] is None or not _within(t["at"], start, end)
                 or not _BY_HAND.search(reason) or _NOT_BY_HAND in reason):
             continue
-        m = re.search(r"\((orch [a-z][a-z -]*)\)", reason)
+        m = re.search(_VIA, reason)
         command = m.group(1) if m else "by hand"
         out.append(Intervention(parse_iso(t["at"]), command,
                                 f"{t['from_state']} -> {t['to_state']}: {reason}",

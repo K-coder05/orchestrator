@@ -4,27 +4,23 @@ from __future__ import annotations
 
 import signal
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import click
 
-from . import alerts, cleanweek, daemon, failures, pauses, planning, queries, schedules, spend
+from . import alerts, cleanweek, control, daemon, queries, schedules, spend
 from . import templates, views
 from . import usage as usage_mod
 from . import priority as prio
 from .adapters import get_adapter
 from .config import ConfigError, load_config
-from . import db as db_mod
 from .db import Database
 from .doctor import format_report, run_doctor
 from .host import MacHost
-from .runner import create_task
-from .states import TERMINAL, TaskState
+from .states import TaskState
 from .timeutil import iso, now
-from .workspace import read_task_yaml, write_task_yaml
 
 
 def _open(config_dir: str | None):
@@ -69,12 +65,25 @@ def _ask(question: str) -> bool:
 
 
 def _daemon_note(cfg, what: str = "nothing will pick this Task up yet") -> None:
-    if not daemon.daemon_running(cfg):
-        click.echo(
-            f"Note: the daemon isn't running, so {what}. "
-            "Start it with `orch daemon install` (or `orch daemon run` in a terminal).",
-            err=True,
-        )
+    _note(control.daemon_note(cfg, what))
+
+
+def _note(note: str | None) -> None:
+    if note:
+        click.echo(note, err=True)
+
+
+def _done(res: control.Result) -> control.Result:
+    """A control's result: a refusal ends the command (exit 1)."""
+    if not res.ok:
+        raise click.ClickException(res.message)
+    return res
+
+
+def _show(res: control.Result) -> None:
+    """Print a control's result: its message, then the daemon note."""
+    click.echo(_done(res).message)
+    _note(res.note)
 
 
 @main.command()
@@ -123,143 +132,52 @@ def add(ctx, prompt, template_name, task_type, agent, priority, deadline, at, in
     """
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        if template_name:
-            _add_from_template(cfg, db, prompt, template_name, task_type=task_type, agent=agent,
-                               priority=priority, deadline=deadline, at=at, internet=internet,
-                               simulate_after=simulate_after)
+        draft = _done(control.propose(
+            cfg, prompt, at=_clock(cfg), template=template_name, task_type=task_type,
+            agent=agent, priority=priority, deadline=deadline, run_at=at, internet=internet,
+            simulate_after=simulate_after, adapter_provider=planning_provider,
+            progress=lambda line: click.echo(line, err=True),
+        )).draft
+        for line in control.describe(cfg, draft):
+            click.echo(line)
+        # A template sets everything, so only a free-form Task is confirmed.
+        if not template_name and not yes and not _ask("Create this Task?"):
+            click.echo(control.decline(db, draft).message)
             return
-        try:
-            cfg.agent(agent or cfg.default("agent"))
-            # Parse times before spending a planning call on a typo.
-            current = _clock(cfg)
-            deadline_at = prio.parse_deadline(deadline, current, cfg.timezone) if deadline else None
-            run_at = prio.parse_at(at, current, cfg.timezone) if at else None
-            click.echo("Planning: asking for an estimate and a Task type...", err=True)
-            proposal = planning.estimate(cfg, prompt, adapter_provider=planning_provider)
-        except (ConfigError, planning.PlanningError) as exc:
-            raise click.ClickException(f"{exc}. Nothing was queued.") from None
-        ttype = task_type or proposal.task_type
-        type_note = "proposed" if task_type is None or task_type == proposal.task_type else (
-            f"from --type; proposed {proposal.task_type}"
-        )
-        click.echo(f"Estimate:  {proposal.estimated_minutes} minutes")
-        click.echo(f"Task type: {ttype} ({type_note})")
-        if proposal.reason:
-            click.echo(f"Reason:    {proposal.reason}")
-        long_task = planning.needs_plan(cfg, proposal.estimated_minutes)
-        if long_task:
-            click.echo(
-                f"Over {planning.threshold(cfg):g} minutes: a plan.md will be written "
-                "for your approval."
-            )
-        if not yes and not _ask("Create this Task?"):
-            planning.record_usage(db, None, "estimate", proposal)
-            click.echo("Not queued.")
-            return
-        try:
-            new = create_task(
-                cfg, db, prompt, task_type=ttype, agent=agent, priority=priority,
-                deadline=deadline_at, run_at=run_at, internet=internet, estimated_minutes=proposal.estimated_minutes,
-                needs_approval=long_task, simulate_rate_limit_after=simulate_after,
-                reason=f"created by orch add (estimated {proposal.estimated_minutes} min"
-                + (", needs plan approval)" if long_task else ", no plan needed)"),
-            )
-        except ConfigError as exc:
-            raise click.ClickException(str(exc)) from None
-        planning.record_usage(db, new.spec.id, "estimate", proposal)
-        _after_create(cfg, db, new, long_task=long_task, simulate_after=simulate_after)
+        new = _done(control.create(cfg, db, draft, via="orch add"))
+        _after_create(cfg, db, new)
     finally:
         db.close()
 
 
-def _add_from_template(cfg, db, prompt, name, *, task_type, agent, priority, deadline, at,
-                       internet, simulate_after) -> None:
-    """``orch add --template``: estimate, type and settings from the template."""
-    try:
-        tpl = templates.load(cfg, name)
-        instance = templates.instantiate(cfg, tpl, prompt)
-        proposal = planning.from_template(tpl.as_dict())
-        cfg.agent(agent or tpl.agent)
-        current = _clock(cfg)
-        deadline_at = prio.parse_deadline(deadline, current, cfg.timezone) if deadline else None
-        run_at = prio.parse_at(at, current, cfg.timezone) if at else None
-    except (ConfigError, planning.PlanningError, templates.TemplateError) as exc:
-        raise click.ClickException(f"{exc}. Nothing was queued.") from None
-    ttype = task_type or tpl.task_type
-    click.echo(f"Template:  {tpl.name}" + (f" ({tpl.description})" if tpl.description else ""))
-    click.echo(f"Estimate:  {proposal.estimated_minutes} minutes (from the template)")
-    click.echo(f"Task type: {ttype}" + (" (from --type)" if task_type else ""))
-    for var in tpl.inputs:
-        click.echo(f"Input:     {var} = {instance.values[var]}")
-    for f in instance.files:
-        click.echo(f"Input:     {f.source} -> {f.to}")
-    if tpl.deadline and not deadline_at:
-        click.echo(f"Deadline:  from the agent's {tpl.deadline['from_output']} "
-                   f"({tpl.deadline['field']}), if the posting states one")
-    long_task = planning.needs_plan(cfg, proposal.estimated_minutes)
-    try:
-        new = create_task(
-            cfg, db, instance.prompt, title=prompt, task_type=ttype, agent=agent or tpl.agent,
-            agent_override=agent is not None, priority=priority, deadline=deadline_at,
-            run_at=run_at, long=tpl.long, internet=internet or tpl.internet,
-            estimated_minutes=proposal.estimated_minutes, template=tpl.name,
-            max_runtime_minutes=tpl.max_runtime_minutes, needs_approval=long_task,
-            simulate_rate_limit_after=simulate_after,
-            reason=f"created by orch add --template {tpl.name} (estimated "
-                   f"{proposal.estimated_minutes} min"
-                   + (", needs plan approval)" if long_task else ", no plan needed)"),
-        )
-    except ConfigError as exc:
-        raise click.ClickException(str(exc)) from None
-    templates.install_inputs(cfg, instance, new.folder, new.spec.id)
-    _after_create(cfg, db, new, long_task=long_task, simulate_after=simulate_after)
-
-
-def _after_create(cfg, db, new, *, long_task: bool, simulate_after) -> None:
+def _after_create(cfg, db, new: control.Result) -> None:
     """Report the new Task and, over the plan threshold, plan and ask."""
-    tid = new.spec.id
-    _timing_notes(cfg, new.spec)
-    if simulate_after:
-        click.echo(f"Fault injection: a simulated rate limit after {simulate_after} "
-                   f"Step{'s' if simulate_after != 1 else ''}")
-    if not long_task:
-        click.echo(f"Task {tid} queued: {new.folder}")
-        _daemon_note(cfg)
+    tid = new.task_id
+    for line in new.details:
+        click.echo(line)
+    click.echo(new.message)
+    _note(new.note)
+    if new.to_state != TaskState.AWAITING_APPROVAL:
         return
 
-    click.echo(f"Task {tid} is awaiting approval: {new.folder}")
     click.echo("Planning: writing plan.md...", err=True)
-    try:
-        plan_text = planning.write_plan(cfg, db, tid, adapter_provider=planning_provider)
-    except planning.PlanningError as exc:
-        click.echo(f"Could not write a plan: {exc}", err=True)
+    planned = control.plan(cfg, db, tid, adapter_provider=planning_provider)
+    if not planned.ok:
+        click.echo(planned.message, err=True)
         click.echo(f"Approve it without a plan with `orch approve {tid}`, or `orch deny {tid}`.")
         return
     click.echo("")
-    click.echo(plan_text.rstrip())
+    click.echo(planned.message)
     click.echo("")
     if _ask("Approve this plan?"):
-        planning.approve(cfg, db, tid, via="orch add")
+        res = _done(control.approve(cfg, db, tid, via="orch add"))
         click.echo(f"Task {tid} queued.")
-        _daemon_note(cfg)
+        _note(res.note)
     else:
         click.echo(
             f"Task {tid} stays awaiting approval. "
             f"`orch approve {tid}` queues it; `orch deny {tid}` cancels it."
         )
-
-
-def _timing_notes(cfg, spec) -> None:
-    """Say when a new Task can start, so a held-back Task is never a surprise."""
-    if spec.deadline:
-        click.echo(f"Deadline:  {spec.deadline} (urgent from "
-                   f"{prio.deadline_urgent_hours(cfg):g}h before)")
-    if spec.run_at:
-        click.echo(f"Starts:    no earlier than {spec.run_at}")
-    if spec.long:
-        start, end = prio.long_window(cfg)
-        click.echo(f"Long Task: starts only between {start:%H:%M} and {end:%H:%M} "
-                   f"({cfg.timezone}) unless urgent")
 
 
 @main.command("priority")
@@ -270,41 +188,8 @@ def set_priority(ctx, task_id, level):
     """Change a Task's assigned Priority (urgent, normal or background)."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        row = _task_row(db, task_id)
-        if TaskState(row["state"]) in TERMINAL:
-            raise click.ClickException(f"Task {task_id} is {row['state']}; its priority is final")
-        old = row["priority"]
-        db.set_priority(task_id, level)
-        db.record_intervention(at=iso(_clock(cfg)), command="orch priority", task_id=task_id,
-                               detail=f"priority {old} -> {level}")
-        folder = Path(row["folder"])
-        if (folder / "task.yaml").exists():
-            spec = read_task_yaml(folder)
-            spec.priority = level  # the assigned Priority only, never the effective one
-            write_task_yaml(folder, spec)
-        (folder / "logs").mkdir(parents=True, exist_ok=True)
-        with open(folder / "logs" / "nightshift.log", "a") as f:
-            f.write(f"{iso(_clock(cfg))} priority {old} -> {level} via orch priority\n")
-        eff = prio.evaluate(cfg, db.get_task(task_id), _clock(cfg)).effective
-        note = "" if eff == level else f" (effective {eff}: deadline {row['deadline']})"
-        click.echo(f"Task {task_id} priority {old} -> {level}{note}")
-    finally:
-        db.close()
-
-
-def _decide(ctx, task_id: str, approve_it: bool) -> None:
-    cfg, db = _open(ctx.obj["config_dir"])
-    try:
-        row = _task_row(db, task_id)
-        if row["state"] != str(TaskState.AWAITING_APPROVAL):
-            raise click.ClickException(f"Task {task_id} is {row['state']}, not awaiting approval")
-        if approve_it:
-            planning.approve(cfg, db, task_id, via="orch approve")
-            click.echo(f"Task {task_id} approved and queued.")
-            _daemon_note(cfg)
-        else:
-            planning.deny(cfg, db, task_id, via="orch deny")
-            click.echo(f"Task {task_id} denied and cancelled.")
+        _show(control.set_priority(cfg, db, task_id, level, via="orch priority",
+                                   at=_clock(cfg)))
     finally:
         db.close()
 
@@ -314,7 +199,11 @@ def _decide(ctx, task_id: str, approve_it: bool) -> None:
 @click.pass_context
 def approve(ctx, task_id):
     """Approve a Task awaiting approval (its plan.md) and queue it."""
-    _decide(ctx, task_id, True)
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        _show(control.approve(cfg, db, task_id, via="orch approve"))
+    finally:
+        db.close()
 
 
 @main.command()
@@ -322,7 +211,11 @@ def approve(ctx, task_id):
 @click.pass_context
 def deny(ctx, task_id):
     """Deny a Task awaiting approval; it is cancelled."""
-    _decide(ctx, task_id, False)
+    cfg, db = _open(ctx.obj["config_dir"])
+    try:
+        _show(control.deny(cfg, db, task_id, via="orch deny"))
+    finally:
+        db.close()
 
 
 @main.command()
@@ -333,19 +226,9 @@ def retry(ctx, task_id):
     in retry_wait now. It runs again on the same agent."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        _task_row(db, task_id)
-        try:
-            reason = failures.retry_by_hand(cfg, db, task_id, at=_clock(cfg))
-        except (failures.NotAllowed, db_mod.StateChanged) as exc:
-            raise click.ClickException(str(exc)) from None
-        click.echo(f"Task {task_id} queued: {reason}")
-        _daemon_note(cfg)
+        _show(control.retry(cfg, db, task_id, via="orch retry", at=_clock(cfg)))
     finally:
         db.close()
-
-
-# How long `orch pause` waits for the daemon to pause a running Attempt.
-PAUSE_WAIT_SECONDS = 30.0
 
 
 @main.command()
@@ -357,34 +240,15 @@ def pause(ctx, task_id, no_wait):
     Step, then stops; resuming continues the same agent session if it can."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        _task_row(db, task_id)
-        try:
-            res = pauses.pause_by_hand(
-                cfg, db, task_id, at=_clock(cfg), daemon_up=daemon.daemon_running(cfg)
-            )
-        except pauses.NotAllowed as exc:
-            raise click.ClickException(str(exc)) from None
-        if res.status == "paused":
-            click.echo(f"Task {task_id} paused (was {res.from_state}). "
-                       f"`orch resume {task_id}` queues it again.")
+        res = _done(control.pause(cfg, db, task_id, via="orch pause", at=_clock(cfg)))
+        if res.action == control.PAUSED:
+            click.echo(res.message)
             return
-        click.echo(f"Task {task_id} is running; asked the daemon to pause it after the "
-                   "current Step.", err=True)
+        click.echo(res.message, err=True)
         if no_wait:
             click.echo(f"Pause requested for Task {task_id}.")
             return
-        # A Step may run for a while; wait for it within reason.
-        limit = time.monotonic() + max(PAUSE_WAIT_SECONDS, cfg.usage("step_grace_seconds") + 5)
-        while time.monotonic() < limit and db.task_state(task_id) == TaskState.RUNNING:
-            time.sleep(0.2)
-        state = db.task_state(task_id)
-        if state == TaskState.PAUSED_USAGE:
-            click.echo(f"Task {task_id} paused (was running). "
-                       f"`orch resume {task_id}` continues it.")
-        elif state == TaskState.RUNNING:
-            click.echo(f"Pause requested for Task {task_id}; the current Step hasn't finished yet.")
-        else:
-            click.echo(f"Task {task_id} ended {state} before it could be paused.")
+        click.echo(_done(control.wait_for_pause(cfg, db, task_id)).message)
     finally:
         db.close()
 
@@ -397,20 +261,9 @@ def resume(ctx, task_id):
     `orch pause`). Its next Attempt resumes the same session if it can."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        _task_row(db, task_id)
-        try:
-            reason = pauses.resume_by_hand(cfg, db, task_id, at=_clock(cfg))
-        except (pauses.NotAllowed, db_mod.StateChanged) as exc:
-            raise click.ClickException(str(exc)) from None
-        click.echo(f"Task {task_id}: {reason}")
-        if db.task_state(task_id) == TaskState.QUEUED:
-            _daemon_note(cfg)
+        _show(control.resume(cfg, db, task_id, via="orch resume", at=_clock(cfg)))
     finally:
         db.close()
-
-
-# How long `orch cancel` waits for the daemon to stop a running Attempt.
-CANCEL_WAIT_SECONDS = 30.0
 
 
 @main.command()
@@ -422,33 +275,15 @@ def cancel(ctx, task_id, no_wait):
     stopped by the daemon (usually within a few seconds)."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
-        _task_row(db, task_id)
-        try:
-            res = failures.cancel(
-                cfg, db, task_id, at=_clock(cfg), daemon_up=daemon.daemon_running(cfg)
-            )
-        except failures.NotAllowed as exc:
-            raise click.ClickException(str(exc)) from None
-        if res.status == "cancelled":
-            click.echo(f"Task {task_id} cancelled (was {res.from_state}).")
+        res = _done(control.cancel(cfg, db, task_id, via="orch cancel", at=_clock(cfg)))
+        if res.action == control.CANCELLED:
+            click.echo(res.message)
             return
-        click.echo(f"Task {task_id} is running; asked the daemon to stop it.", err=True)
+        click.echo(res.message, err=True)
         if no_wait:
             click.echo(f"Cancel requested for Task {task_id}.")
             return
-        deadline = time.monotonic() + CANCEL_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            state = db.task_state(task_id)
-            if state != TaskState.RUNNING:
-                break
-            time.sleep(0.2)
-        state = db.task_state(task_id)
-        if state == TaskState.CANCELLED:
-            click.echo(f"Task {task_id} cancelled (was running).")
-        elif state == TaskState.RUNNING:
-            click.echo(f"Cancel requested for Task {task_id}; the daemon hasn't stopped it yet.")
-        else:
-            click.echo(f"Task {task_id} ended {state} before it could be cancelled.")
+        click.echo(_done(control.wait_for_cancel(cfg, db, task_id)).message)
     finally:
         db.close()
 

@@ -318,6 +318,10 @@ class NotAllowed(Exception):
     """The Task's state doesn't allow this command."""
 
 
+class StillChanging(NotAllowed, StateChanged):
+    """The daemon kept moving the Task while this command looked at it."""
+
+
 PAUSABLE = frozenset({TaskState.QUEUED, TaskState.RETRY_WAIT, TaskState.RUNNING,
                       TaskState.PAUSED_USAGE})
 
@@ -350,7 +354,7 @@ def pause_by_hand(cfg: Config, db: Database, task_id: str, *, at: datetime, daem
         if state == TaskState.PAUSED_USAGE and row["pause_kind"] == KIND_BY_HAND:
             raise NotAllowed(f"Task {task_id} is already paused by hand")
         if state == TaskState.RUNNING and daemon_up:
-            db.request_pause(task_id)
+            db.request_pause(task_id, via)
             return PauseResult("requested", state)
         reason = f"paused by hand ({via}) while {state}"
         fields: dict[str, Any] = {
@@ -379,7 +383,7 @@ def pause_by_hand(cfg: Config, db: Database, task_id: str, *, at: datetime, daem
                                   end_reason=reason, session_id=None)
         _log(cfg, row, at, reason)
         return PauseResult("paused", state)
-    raise NotAllowed(f"Task {task_id} kept changing state; try again")
+    raise StillChanging(f"Task {task_id} kept changing state; try again")
 
 
 def resume_by_hand(cfg: Config, db: Database, task_id: str, *, at: datetime,
