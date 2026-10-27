@@ -24,6 +24,7 @@ orch add "Tailor my resume and a cover letter for <posting URL>" --template resu
 orch add "Research <topic>" --template research-report
 orch add "Brief me on <company> for my interview with <names>" --template company-brief --priority urgent
 orch add "Study guide for CS 61A from ~/school/cs61a/week5" --template study-guide
+orch add "Punch up ~/Documents/comedy/dentist.md" --template punch-up
 orch priority <id> background   # urgent | normal | background
 orch approve <id>            # or `orch deny <id>`, for Tasks awaiting approval
 orch retry <id>              # failed/partial: run again; retry_wait: retry now
@@ -108,6 +109,14 @@ agent never sees the URLs. Put them in `~/.config/nightshift/.env` (or the
 Keychain) as `BCOURSES_ICAL_URL` and `GOOGLE_CALENDAR_ICAL_URL`; `orch doctor`
 says whether they are set. Each course's AI policy heads its protocol; a
 course without one gets its due dates listed and no study plan.
+`punch-up` punches up a script or idea for one of your YouTube comedy videos,
+in your voice, into `output/punched_up.md`. The request names a file or
+folder inside `~/Documents/comedy/` (read-only; `comedy.dir` in config), or
+none, and the agent finds the bit it describes there. The output must end
+with a "Close to a known bit" section flagging anything close to a
+well-known comic's bit (it may say "None"), which Nightshift copies into the
+report. Always waits for Claude; internet off; Telegram shows it by id and
+state only, and nothing is posted or shared.
 
 The queue runs by Effective priority: urgent first (nearest deadline first),
 then normal in order, then background only when nothing else can start. A

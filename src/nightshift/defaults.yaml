@@ -335,6 +335,13 @@ school:
     # Each feed's fetch gives up after this long.
     timeout_seconds: 20
 
+comedy:
+  # Your YouTube comedy material (§1.4): scripts, ideas, bits. Agents may read
+  # it, never write it, so it must be in permissions.read_only_dirs. The
+  # punch-up template reads only material inside it. Unreleased material goes
+  # to the model providers and nowhere else: Telegram gets status lines only.
+  dir: ~/Documents/comedy
+
 permissions:
   # Per-Task agent access (§1.4). The Task folder is the only writable place.
   # docs/safety.md says which of these limits are technically enforced.

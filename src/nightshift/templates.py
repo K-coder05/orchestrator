@@ -15,7 +15,9 @@ Variables in ``prompt``:
   first http(s) URL in it; ``from: course`` = the one configured course it
   names, which must have an AI policy, and ties the Task to that course
   (``nightshift.school``); ``from: school_folder`` = the one folder path it
-  names, which must be inside ``school.dir``).
+  names, which must be inside ``school.dir``; ``from: comedy_path`` = the
+  one file or folder path it names inside ``comedy.dir``, or that folder
+  itself when it names none (``nightshift.comedy``)).
 - each of ``files``: a file named by a config key, copied into the Task
   folder (``to:``) when the Task is created; the variable is that relative
   path. A pristine copy is kept in ``<agents_root>/data/inputs/<task-id>/``,
@@ -41,7 +43,9 @@ One with a ``snapshot_pages`` post-hook (company-rescrape) gets a Career pages
 snapshot section: the diff against the previous Task's snapshot as counts
 (``snapshots``). One with a ``research_rules`` post-hook (research-report,
 company-brief) gets a Sources section: the distinct sources its result cites,
-read by Nightshift from the result file (``research``). A course Task
+read by Nightshift from the result file (``research``). One with a
+``require_section`` post-hook (punch-up) gets that section of the output
+copied in, read from the file. A course Task
 (study-guide) gets a Course AI policy section naming the policy it ran under.
 
 ``pre_hooks``: Nightshift's own steps before each Attempt (``PRE_HOOKS``).
@@ -66,7 +70,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from . import ical, latex, research, school, snapshots, trace, tracker
+from . import comedy, ical, latex, research, school, snapshots, trace, tracker
 from .config import Config
 from .db import Database
 from .failures import PostHook, PostHookFailed
@@ -95,7 +99,7 @@ OPTIONAL = ("name", "description", "inputs", "files", "values", "deadline", "pos
 #: Keys of a template's ``schedule:`` block (its standard Schedule's rules).
 SCHEDULE_KEYS = ("cron", "catch_up", "overlap", "request")
 #: What an ``inputs`` entry takes from the request (``from:``).
-INPUT_KINDS = ("url", "course", "school_folder")
+INPUT_KINDS = ("url", "course", "school_folder", "comedy_path")
 _VAR = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _URL = re.compile(r"https?://[^\s<>\"'`]+")
 
@@ -205,7 +209,7 @@ def parse(cfg: Config, name: str, path: Path, data: Any) -> Template:
             raise TemplateError(f"template {name!r}: input {var!r} needs from: "
                                 + " | ".join(INPUT_KINDS))
     kinds = [spec["from"] for spec in inputs.values()]
-    for kind in ("course", "school_folder"):
+    for kind in ("course", "school_folder", "comedy_path"):
         if kinds.count(kind) > 1:
             raise TemplateError(f"template {name!r}: at most one input from: {kind}")
     if "school_folder" in kinds and "course" not in kinds:
@@ -403,7 +407,10 @@ def instantiate(cfg: Config, tpl: Template, request: str) -> Instance:
             if spec["from"] == "school_folder":
                 values[var] = str(school.school_folder(cfg, request))
                 continue
-        except school.CourseError as exc:
+            if spec["from"] == "comedy_path":
+                values[var] = str(comedy.material(cfg, request))
+                continue
+        except (school.CourseError, comedy.ComedyError) as exc:
             raise TemplateError(f"template {tpl.name!r}: {exc}") from None
         found = _URL.search(request)
         if not found:
@@ -794,6 +801,75 @@ def _build_research(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHook
     return _named(hook, "research_rules")
 
 
+def _validate_section(name: str, h: dict) -> None:
+    unknown = sorted(set(h) - {"hook", "file", "heading"})
+    if unknown:
+        raise TemplateError(f"template {name!r}: require_section has unknown keys "
+                            f"{', '.join(unknown)}")
+    _rel_path(name, "require_section file", h.get("file"))
+    if not str(h["file"]).endswith(".md"):
+        raise TemplateError(f"template {name!r}: require_section checks a Markdown (.md) file")
+    if not isinstance(h.get("heading"), str) or not _heading_key(h["heading"]):
+        raise TemplateError(f"template {name!r}: require_section needs a heading (text)")
+
+
+_MD_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+
+
+def _heading_key(text: str) -> str:
+    """A heading compared loosely: case, ``*``/``_``/`` ` `` emphasis, a
+    leading number (``3.``) and trailing punctuation don't count."""
+    text = re.sub(r"[*_`]", "", text).strip()
+    text = re.sub(r"^\d+[.)]?\s*", "", text)
+    return re.sub(r"\s+", " ", text).rstrip(" :.!?").lower()
+
+
+def markdown_section(text: str, heading: str) -> str | None:
+    """The body of the first Markdown section headed ``heading`` (any level,
+    matched by :func:`_heading_key`), up to the next heading of the same or
+    a higher level; None when there is no such heading. Headings inside
+    fenced code don't count."""
+    want = _heading_key(heading)
+    level, body, fence = 0, [], False
+    for line in text.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        m = None if fence else _MD_HEADING.match(line)
+        if level:
+            if m and len(m.group(1)) <= level:
+                break
+            body.append(line)
+        elif m and _heading_key(m.group(2)) == want:
+            level = len(m.group(1))
+    return "\n".join(body).strip() if level else None
+
+
+def _section_of(folder: Path, h: dict) -> str:
+    """The required section's body; raises PostHookFailed if it is missing
+    or empty."""
+    text = _read_text(_regular_file(folder, h["file"]), h["file"])
+    body = markdown_section(text, h["heading"])
+    if body is None:
+        raise PostHookFailed(f"{h['file']} has no \"{h['heading']}\" section (a heading "
+                             "with that title)")
+    if not body:
+        raise PostHookFailed(f"the \"{h['heading']}\" section of {h['file']} is empty; "
+                             "write \"None\" if there is nothing to put there")
+    return body
+
+
+def _build_section(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHook:
+    """The output has a non-empty section with a given heading (punch-up:
+    "Close to a known bit", §2.11; it may say "None")."""
+
+    def hook(folder: Path, row: Mapping[str, Any]) -> None:
+        body = _section_of(folder, h)
+        lines = len(body.splitlines())
+        log_line(folder, f"section \"{h['heading']}\" of {h['file']}: present, {lines} "
+                 f"line{'s' if lines != 1 else ''}", cfg.secrets.redact, cfg.timezone)
+    return _named(hook, f"require_section({h['heading']})")
+
+
 HOOKS: dict[str, HookKind] = {
     "require_outputs": HookKind(_validate_require, _build_require),
     "compile_latex": HookKind(_validate_compile, _build_compile),
@@ -802,6 +878,7 @@ HOOKS: dict[str, HookKind] = {
     "merge_tracker": HookKind(_validate_merge, _build_merge),
     "snapshot_pages": HookKind(_validate_snapshot, _build_snapshot),
     "research_rules": HookKind(_validate_research, _build_research),
+    "require_section": HookKind(_validate_section, _build_section),
 }
 
 
@@ -979,6 +1056,17 @@ def research_sources(cfg: Config, row: Mapping[str, Any], h: dict) -> str:
     return research.sources_section(res, h["file"])
 
 
+def required_section(row: Mapping[str, Any], h: dict) -> str:
+    """The report's copy of a ``require_section`` section, read from the
+    output file by Nightshift (never from the agent's report)."""
+    title = f"### {h['heading']}"
+    try:
+        body = _section_of(Path(row["folder"]), h)
+    except PostHookFailed as exc:
+        return f"{title}\n\nNot copied: {exc}."
+    return f"{title}\n\nFrom `{h['file']}`:\n\n{body}"
+
+
 def course_section(cfg: Config, course_id: str) -> str:
     """The report's Course AI policy section: which course's policy the
     agent ran under (the policy itself is in config)."""
@@ -1066,6 +1154,8 @@ def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
     for h in tpl.post_hooks:
         if h["hook"] == "research_rules":
             parts.append(research_sources(cfg, row, h))
+        if h["hook"] == "require_section":
+            parts.append(required_section(row, h))
     if not tpl.report_diffs:
         return "\n\n".join(parts) or None
     folder = Path(row["folder"])

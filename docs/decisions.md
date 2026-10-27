@@ -2580,3 +2580,78 @@ lasting consequences go in `docs/adr/` instead.
   `orch doctor`. No URL in any written file is checked twice. There is no
   real-agent run for this issue: the agent's part is the same Claude path
   as study-guide (#40), and the fetch is Nightshift code tested here.
+
+## Phase 3, issue #42: the `punch-up` comedy template
+
+- **Config: `comedy.dir`** (`~/Documents/comedy`, in `defaults.yaml` and
+  `config.example.yaml`), like `school.dir`. It must be in
+  `permissions.read_only_dirs` (it is by default). `nightshift.comedy`
+  validates it (unknown keys refused) and resolves a request's material.
+- **How a request names the material.** A new template input kind,
+  `from: comedy_path`: the one `~/...` or `/...` path in the request (quote
+  one with spaces; the same rule as a slides folder, now
+  `school.paths_in_request`), a file or a folder, which must resolve
+  (symlinks and `..` included) inside `comedy.dir`. **No path is allowed**:
+  the input is then `comedy.dir` itself and the agent finds the bit the
+  request describes there (or writes `needs_you.json` naming the candidates
+  by file name if it can't tell). Why optional: typing a full path on a
+  phone is painful, and "Punch up the dentist bit" is how I'd ask. Refused
+  at intake: two paths, a path outside the folder, one that doesn't exist,
+  a folder with no files, `comedy.dir` empty or missing, or not read-only
+  to agents. **Refusals never echo the path**, unlike study-guide's: they
+  can go back to Telegram (`add punch-up ...`), and a file name like
+  `dentist-landlord.md` carries a premise.
+- **Template `punch-up`**: Task type `comedy` (always waits for Claude, no
+  failover, §2.8; internet off by default and in the template), agent
+  `claude`, 30 minutes estimated (no plan approval, §2.4; a comedy plan
+  never goes to Telegram anyway), 90-minute cap, not long. One deliverable,
+  `output/punched_up.md`: the punched-up version, what changed, alternates,
+  and last a `## Close to a known bit` section, each entry naming the comic
+  and the bit, how close and how to steer away; exactly `None.` if nothing
+  is close. The prompt says to keep my voice (read a few of my other
+  scripts in the folder to learn it), never invent personal facts (`[TK:
+  ...]` instead), and never post, upload or share the material.
+- **Where the "close to a known bit" section lives: in the deliverable, and
+  Nightshift copies it into the report.** The issue wants it in the report
+  and checked by a post-hook. The agent's own `report.md` is a poor place
+  to check: `report.finalize` keeps only the numbered `## N.` sections and
+  rewrites 8 and 9, so an extra `## Close to a known bit` the agent
+  appends after section 9 (where an agent editing the skeleton puts it)
+  would be dropped. So a new generic post-hook, **`require_section`**
+  (`file`, `heading`), fails the Attempt unless the Markdown file has a
+  section with that heading (any level; case, emphasis, a leading number
+  and trailing punctuation ignored; not inside fenced code) whose body,
+  up to the next heading of the same or a higher level, isn't empty.
+  "None." passes. The report's appendix then gets `### Close to a known
+  bit`, copied from the file by Nightshift (like research-report's
+  Sources), or "Not copied: <why>" when it is missing.
+- **Comedy data rules (§1.6)** were already by Task type (#18, #27, #33,
+  #34): alerts, the digest, `status`/`list` replies and the intake reply
+  are id and state only (the intake drops `Input:` lines, so the material
+  path isn't sent), and a comedy plan.md is never sent. Nothing new was
+  needed there beyond the path-free refusals; a test drives the whole
+  thing through the fake Bot API for punch-up Tasks: intake, a refusal,
+  `status`, `list`, `retry`, and the done, failed (post-hook) and needs-you
+  alerts, checking no word of the request, the script or the output
+  reaches any message.
+- **Not done here:** other comedy templates (premise research, video
+  descriptions and captions) aren't in §5 item 3; `--internet on` still
+  works per Task as for any comedy Task.
+- **Tests.** `tests/test_comedy.py`: the defaults, bad `comedy` config, the
+  template loading, input resolution (file, folder, none) and every
+  refusal (none of them echoing the path), bad template parts,
+  `markdown_section`, end to end with the fake Claude (`FAKE_STUDY` copies
+  the output file in): `orch add --template punch-up` queued without a
+  plan, run to `done` with the material's path in the prompt, the comedy
+  folder its only `--add-dir` and untouched, and the section in the
+  report; "None." passing; a missing file, missing section or empty section
+  failing the Attempt; and the Telegram test above.
+  `test_punch_up_real` is the opt-in real run.
+- **Real run (2026-10-27).** `test_punch_up_real` on Claude (the CLI's
+  default model): a throwaway comedy folder with two short scripts,
+  punching up one by path. Passed in 51s on the first Attempt: the
+  punched-up script kept the original jokes and tag and built on them,
+  marked a personal fact as `[TK: ...]`, called back to the other script,
+  and ended with a Close to a known bit section naming one comic's routine
+  (low overlap, with how to steer away); the report carried it and the
+  comedy folder was untouched.

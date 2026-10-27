@@ -1,0 +1,86 @@
+# punch-up (§5 item 3): punch up a bit, a script or idea for one of my
+# YouTube comedy videos, in my voice. Usage:
+#   orch add "Punch up ~/Documents/comedy/dentist.md, tighter tags" --template punch-up
+#   orch add "Punch up the dentist bit" --template punch-up
+#   (Telegram: add punch-up <request>)
+#
+# The request names the script or idea as a file or folder path inside
+# comedy.dir (~/Documents/comedy; quote a path with spaces). Naming no path,
+# the agent finds what the request describes in that folder. Agents read the
+# folder but never write it (§1.4); a path outside it is refused. The agent
+# writes output/punched_up.md, which ends with a "Close to a known bit"
+# section flagging any premise or tag close to a well-known comic's bit
+# (§2.11; it may say "None"). Nightshift checks both and copies the section
+# into the report.
+#
+# A `comedy` Task: always waits for Claude (no failover, §2.8), internet off.
+# Unreleased material goes to the model provider and nowhere else (§1.6):
+# Telegram, the digest and alerts show the Task by id and state only, and
+# the agent posts or shares nothing. 30 minutes or less, so it starts
+# without plan approval (§2.4).
+name: punch-up
+description: Punch up a script or idea for a YouTube comedy video, in my voice (input - ~/Documents/comedy/)
+task_type: comedy
+agent: claude
+estimated_minutes: 30
+max_runtime_minutes: 90
+long: false
+internet: "off"
+
+inputs:
+  material: {from: comedy_path}   # the file or folder the request names, else comedy.dir
+
+post_hooks:
+  - hook: require_outputs
+    files: [output/punched_up.md]
+  - hook: require_section
+    file: output/punched_up.md
+    heading: Close to a known bit
+
+prompt: |
+  Punch up a bit for one of my YouTube comedy videos: a script or an idea
+  I wrote. My request:
+  "{{request}}"
+
+  Material: `{{material}}`
+  If that is a file, it is the script or idea to punch up. If it is a
+  folder, find in it the one script or idea my request describes; if you
+  can't tell which one it is, write `needs_you.json` naming the candidates
+  by file name and stop. Everything under my comedy folder is read-only:
+  never change, move or add anything there.
+
+  This is unreleased material. Never post, upload, publish or share it
+  anywhere, and never send it to anyone; it stays in this Task folder.
+
+  Do this in order, keeping `progress.md` current after each step:
+
+  1. Read the script or idea. To learn my voice, also read a few of my
+     other scripts in the same folder, if there are any.
+  2. Punch it up in my voice: sharper premise, tighter setups, stronger
+     punchlines and tags, better act-outs and a cleaner button. Keep my
+     point of view, rhythm, vocabulary and kind of jokes; don't turn it
+     into someone else's style or a generic sitcom voice. Keep what
+     already works. Don't invent personal facts about me; mark any you
+     need as `[TK: ...]` for me to fill in.
+  3. Write `output/punched_up.md` in Markdown:
+     - A `# <working title>` line.
+     - `## Punched-up version`: the full punched-up script (or, for an
+       idea, a worked-up treatment with the premise, beats and jokes),
+       ready for me to read through.
+     - `## What changed`: a short list of the main changes and why each
+       is funnier.
+     - `## Alternates`: alternate tags or lines worth trying, if any.
+     - Last, `## Close to a known bit`: every premise, joke or tag that
+       sounds close to a well-known comic's bit, each naming the comic
+       and the bit and saying how close it is and how to steer away from
+       it. If nothing is close, write exactly `None.` under the heading.
+       Never leave this section out.
+  4. Write `report.md`. Under Summary say what the bit is about in one
+     line and the biggest changes; under How to use, how to read the
+     file. Nightshift copies the Close to a known bit section into the
+     report.
+
+  Nightshift fails this Attempt if `output/punched_up.md` is missing or
+  empty, or has no non-empty `## Close to a known bit` section. If
+  `logs/nightshift.log` shows a failed post-hook from an earlier Attempt,
+  fix what it names first.

@@ -204,9 +204,9 @@ _QUOTED_PATH = re.compile(r"""(["'`“])((?:~|/)[^"'`”\n]*)["'`”]""")
 _BARE_PATH = re.compile(r"(?<![^\s(\[])(~/[^\s\"'`]*|~(?=[\s.,;:)\]]|$)|/[^\s\"'`]+)")
 
 
-def folder_in_request(request: str) -> str:
-    """The one folder path (``~/...`` or ``/...``) ``request`` names. Quote
-    a path that has spaces."""
+def paths_in_request(request: str) -> list[str]:
+    """Every path (``~/...`` or ``/...``) ``request`` names, in order, once
+    each. A path with spaces must be quoted; URLs are not paths."""
     found: list[str] = []
     rest = request
     for m in _QUOTED_PATH.finditer(request):
@@ -214,7 +214,13 @@ def folder_in_request(request: str) -> str:
         rest = rest.replace(m.group(0), " ")
     for m in _BARE_PATH.finditer(rest):
         found.append(m.group(1).rstrip(".,;:)]}!?"))
-    paths = list(dict.fromkeys(p.rstrip("/") or "/" for p in found if p))
+    return list(dict.fromkeys(p.rstrip("/") or "/" for p in found if p))
+
+
+def folder_in_request(request: str) -> str:
+    """The one folder path (``~/...`` or ``/...``) ``request`` names. Quote
+    a path that has spaces."""
+    paths = paths_in_request(request)
     if not paths:
         raise CourseError("the request names no folder; give the slides folder as a path "
                           "under your school folder, e.g. ~/school/cs61a/week5 (quote it if "
