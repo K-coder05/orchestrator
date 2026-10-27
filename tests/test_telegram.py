@@ -69,6 +69,26 @@ def test_send_message_posts_to_the_user(server):
                                              "disable_web_page_preview": True})]
 
 
+def test_inline_buttons_edits_and_callback_answers(server):
+    api = HttpBotAPI(TOKEN, base_url=server.url)
+    api.send_message(4242, "Approve?", buttons=[[("Approve", "approve:k3f9"),
+                                                 ("Deny", "deny:k3f9")]])
+    api.edit_message_text(4242, 17, "Approve?\n\nApproved.")
+    api.answer_callback_query("q1", "Approved")
+    api.answer_callback_query("q2")
+    assert server.calls == [
+        ("sendMessage", {"chat_id": 4242, "text": "Approve?", "disable_web_page_preview": True,
+                         "reply_markup": {"inline_keyboard": [[
+                             {"text": "Approve", "callback_data": "approve:k3f9"},
+                             {"text": "Deny", "callback_data": "deny:k3f9"}]]}}),
+        # No reply_markup: the buttons go with the edit.
+        ("editMessageText", {"chat_id": 4242, "message_id": 17, "text": "Approve?\n\nApproved.",
+                             "disable_web_page_preview": True}),
+        ("answerCallbackQuery", {"callback_query_id": "q1", "text": "Approved"}),
+        ("answerCallbackQuery", {"callback_query_id": "q2"}),
+    ]
+
+
 def test_get_updates_long_polls_with_offset(server):
     server.updates = [{"update_id": 5, "message": {"from": {"id": 1}}}]
     got = HttpBotAPI(TOKEN, base_url=server.url).get_updates(5, 1)

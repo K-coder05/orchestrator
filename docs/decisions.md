@@ -1947,3 +1947,47 @@ lasting consequences go in `docs/adr/` instead.
 - **Comedy Tasks are id and state only** in `status` and `list`. Control
   replies are built from ids, states and fixed reasons, never the title,
   request or Result, so they need no special case.
+
+## Phase 3, issue #34: Telegram Task intake with one-tap plan approval
+
+- **`add <prompt>` and `add <template> <request>`**, with `orch add`'s
+  options anywhere in the message: `--type`, `--agent`, `--priority`,
+  `--deadline`, `--at`, `--internet` and `--template` (`--opt value` or
+  `--opt=value`; a value may be quoted, smart quotes included, and a
+  `YYYY-MM-DD HH:MM` time needs no quotes). The first word is a template
+  when it names one in the templates dir. Fault injection and `--yes` stay
+  CLI-only. Unknown values (priority, internet, Task type) and a missing
+  request are refused before any planning call.
+- **The intake is `nightshift.control`'s**, step by step: `propose`, then
+  a free-form Task's estimate and Task type wait for **Create** / **Don't
+  create** (a template Task is created at once, as `orch add --template`
+  asks nothing), then over 30 minutes `plan` writes `plan.md` and it is sent
+  (trimmed at a line to fit one message) with **Approve** / **Deny**. A
+  failed plan call still sends the buttons (approve without a plan).
+- **Pending free-form drafts are kept in the DB** (`telegram_drafts`,
+  migration 15; `control.Draft.to_json`/`from_json`), so a draft survives a
+  daemon restart and its decision is set once: a second tap, or a tap on a
+  stale copy, only reports what happened ("Already decided: Task k3f9 is
+  queued."). Approve / Deny are idempotent through the control layer: a
+  refused decision reports the Task's state and its last approval record.
+- **`via: telegram add` for the add flow, `via: telegram` elsewhere.**
+  Creating the Task and the plan decision tapped on the plan message the
+  add flow sent are part of asking for the work, like `orch add`'s y/n
+  (the clean-week rule), so `(telegram add)` is excluded from the
+  clean-week interventions just as `(orch add)` is. Approve / Deny on an
+  alert, and the `approve`/`deny` commands, are `via: telegram` and count.
+  The buttons say which: `plan-approve:<id>`/`plan-deny:<id>` come only
+  from the add flow, `approve:<id>`/`deny:<id>` from alerts.
+- **Alerts with buttons.** The only alert for a Task awaiting approval is
+  re-approval (paused too long); it now carries Approve / Deny. A Task
+  left awaiting approval by `orch add` (you said no at the prompt) gets no
+  alert, as before.
+- **Presses.** Only `callback_query` updates from `telegram.user_id` are
+  acted on; anyone else's are logged by sender ID and never answered. Each
+  press is answered (the spinner stops, with a short toast) and its message
+  edited to show the decision, which also removes its buttons; a message
+  too old to edit gets a new message instead. Replies never carry a Task's
+  folder path (its name holds the title).
+- **Comedy.** A comedy Task's plan is never sent: the message says to read
+  it on the dashboard or with `orch show <id>`. The proposal message leaves
+  out the planner's reason and a template's inputs for comedy Tasks.

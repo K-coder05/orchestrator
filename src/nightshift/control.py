@@ -11,6 +11,9 @@ Every control takes ``via``, the surface it came from: ``orch <command>``,
 ``telegram`` or ``dashboard``. It goes into the transition reason, the
 approval record and the intervention record, so the clean-week check
 (``nightshift.cleanweek``) sees every change by hand, wherever it was made.
+Intake is the exception: ``orch add`` and ``telegram add`` (Telegram's
+``add`` and the buttons it sends) create the Task and decide its plan as
+part of asking for the work, which the clean-week check doesn't count.
 
 Cancelling or pausing a ``running`` Task under a live daemon is a request
 the daemon carries out within a Step or so: :func:`cancel` and :func:`pause`
@@ -28,15 +31,17 @@ Every function that needs the time takes it from the caller.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import daemon, failures, pauses, planning, templates
 from . import priority as prio
+from .adapters.base import Usage
 from .config import Config, ConfigError
 from .db import Database, StateChanged
 from .runner import create_task
@@ -47,6 +52,9 @@ from .workspace import TaskSpec, read_task_yaml, write_task_yaml
 #: Surfaces other than ``orch <command>``.
 VIA_TELEGRAM = "telegram"
 VIA_DASHBOARD = "dashboard"
+#: Telegram's ``add`` flow, like ``orch add``: its plan decision is part of
+#: asking for the work, not an intervention.
+VIA_TELEGRAM_ADD = "telegram add"
 
 # What happened (``Result.action``).
 APPROVED = "approved"
@@ -101,6 +109,23 @@ class Draft:
     @property
     def estimated_minutes(self) -> int:
         return self.proposal.estimated_minutes
+
+    def to_json(self) -> str:
+        """A free-form draft as JSON, to :func:`create` it later (a caller
+        that waits for an answer across requests). A template draft is
+        made again from its template instead."""
+        if self.template is not None:
+            raise ValueError("only a free-form draft is stored")
+        data = asdict(replace(self, template=None, instance=None))
+        del data["template"], data["instance"]
+        return json.dumps(data)
+
+    @classmethod
+    def from_json(cls, text: str) -> Draft:
+        data = json.loads(text)
+        p = data.pop("proposal")
+        p["usage"] = [Usage(**u) for u in p.get("usage") or []]
+        return cls(proposal=planning.Proposal(**p), **data)
 
 
 @dataclass(frozen=True)

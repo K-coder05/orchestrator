@@ -22,8 +22,8 @@ against the three conditions of a clean week:
 3. **Manual interventions.** Every change to a Task by hand (``orch cancel``,
    ``retry``, ``pause``, ``resume``, ``priority``, or the same control from
    Telegram or the dashboard), every approval or denial
-   (except the y/n answer of ``orch add`` itself, part of asking for the
-   work), every ``orch schedule run-now``, ``enable``, ``disable`` or
+   (except the plan decision of ``orch add`` or Telegram's ``add`` itself,
+   part of asking for the work), every ``orch schedule run-now``, ``enable``, ``disable`` or
    ``remove`` and every ``orch raise-cap``.
 
 The week is clean only if all three hold; ``orch clean-week`` exits 1
@@ -66,7 +66,8 @@ _AGENT_FAILED = "agent finished; report says failed"
 #: Ctrl-C of a foreground run.
 _VIA = r"\((orch [a-z][a-z -]*|telegram|dashboard)\)"
 _BY_HAND = re.compile(r"\bby hand\b|" + _VIA + r"|Ctrl-C")
-_NOT_BY_HAND = "(orch add)"  # approving the plan while adding the Task
+#: Deciding the plan while adding the Task, at `orch add` or Telegram's `add`.
+_NOT_BY_HAND = ("(orch add)", "(telegram add)")
 
 
 @dataclass(frozen=True)
@@ -317,7 +318,7 @@ def _interventions(db: Database, start: datetime, end: datetime) -> list[Interve
     for t in db.all_transitions():
         reason = t["reason"]
         if (t["from_state"] is None or not _within(t["at"], start, end)
-                or not _BY_HAND.search(reason) or _NOT_BY_HAND in reason):
+                or not _BY_HAND.search(reason) or any(n in reason for n in _NOT_BY_HAND)):
             continue
         m = re.search(_VIA, reason)
         command = m.group(1) if m else "by hand"

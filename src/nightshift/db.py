@@ -396,6 +396,21 @@ MIGRATIONS: list[str] = [
     ALTER TABLE tasks ADD COLUMN cancel_requested_via TEXT;
     ALTER TABLE tasks ADD COLUMN pause_requested_via TEXT;
     """,
+    # 15: free-form Tasks proposed from Telegram, waiting for a button (§5 item 1).
+    """
+    -- The estimate and Task type a Telegram `add` proposed, held until you
+    -- tap Create or Don't create. `draft` is control.Draft as JSON; decision
+    -- (created, declined, failed) is set once, so a second or stale tap
+    -- only reports it. task_id is the Task a `created` draft made.
+    CREATE TABLE telegram_drafts (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at  TEXT NOT NULL,
+        draft       TEXT NOT NULL,
+        decision    TEXT,
+        decided_at  TEXT,
+        task_id     TEXT REFERENCES tasks(id)
+    );
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
@@ -1055,6 +1070,31 @@ class Database:
                       "last_error = COALESCE(?, last_error), "
                       "dropped_at = COALESCE(?, dropped_at) WHERE id = ?",
                       (0 if dropped_at else 1, sent_at, error, dropped_at, digest_id))
+
+    # -- Telegram drafts (§5 item 1) ------------------------------------------------
+    def insert_telegram_draft(self, draft: str, *, at: str) -> int:
+        with self.tx() as c:
+            cur = c.execute("INSERT INTO telegram_drafts (created_at, draft) VALUES (?, ?)",
+                            (at, draft))
+            return int(cur.lastrowid)
+
+    def telegram_draft(self, draft_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM telegram_drafts WHERE id = ?",
+                                 (draft_id,)).fetchone()
+
+    def decide_telegram_draft(self, draft_id: int, decision: str, *, at: str) -> bool:
+        """Set the draft's decision; False if it already had one (a second tap)."""
+        with self.tx() as c:
+            cur = c.execute("UPDATE telegram_drafts SET decision = ?, decided_at = ? "
+                            "WHERE id = ? AND decision IS NULL", (decision, at, draft_id))
+            return cur.rowcount == 1
+
+    def finish_telegram_draft(self, draft_id: int, *, decision: str,
+                              task_id: str | None = None) -> None:
+        """After a claimed decision: the Task it made, or that making it failed."""
+        with self.tx() as c:
+            c.execute("UPDATE telegram_drafts SET decision = ?, task_id = ? WHERE id = ?",
+                      (decision, task_id, draft_id))
 
     # -- Interventions (Gate 2) -----------------------------------------------------
     def record_intervention(self, *, at: str, command: str, detail: str,

@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
-from nightshift import cleanweek, daemon, remote
+from nightshift import cleanweek, control, daemon, remote
 from nightshift.alerts import OFFSET_KEY, Notifier
 from nightshift.runner import create_task
 from nightshift.states import TaskState
 from nightshift.timeutil import now
 
 from test_alerts import TOKEN, USER_ID, _msg, api, notifier, tg_cfg, tg_db  # noqa: F401
+from test_planning import plan_provider, planner  # noqa: F401  (pytest fixture)
 
 
 class Chat:
@@ -55,7 +57,7 @@ def _running(db, tid):
 def test_help_lists_every_command(chat):
     text = chat.reply("help")
     for cmd in ("status", "list", "approve", "deny", "cancel", "pause", "resume", "retry",
-                "priority", "help"):
+                "priority", "add", "help"):
         assert f"\n{cmd} " in text, cmd
     assert chat.reply("/help") == text == chat.reply("/HELP@nightshift_bot")
     assert chat.reply("hello there") == "Unknown command. Send help for the list."
@@ -296,7 +298,7 @@ def test_a_failing_command_or_reply_never_stops_the_poll(chat, notifier, api, tg
     tid = create_task(tg_cfg, tg_db, "x").spec.id
     real_send = api.send_message
 
-    def refuse(chat_id, text):
+    def refuse(chat_id, text, buttons=None):
         from nightshift.telegram import TelegramError
         raise TelegramError("sendMessage: HTTP 502")
 
@@ -319,3 +321,318 @@ def test_non_message_updates_from_you_are_ignored(chat, notifier, api, tg_cfg, t
                                                        "chat": {"id": USER_ID}, "photo": []}})
     notifier.poll_updates()
     assert api.sent[-1][1] == "Unknown command. Send help for the list."
+
+
+# -- add and inline buttons (#34) ----------------------------------------------------
+
+class Phone(Chat):
+    """You, typing commands and tapping inline buttons. A message's id is its
+    index in ``api.sent``; an edit replaces the text you see."""
+
+    def text_of(self, message_id: int) -> str:
+        edits = [t for _, mid, t in self.api.edits if mid == message_id]
+        return edits[-1] if edits else self.api.sent[message_id][1]
+
+    def with_buttons(self) -> list[int]:
+        return [i for i, b in enumerate(self.api.buttons) if b]
+
+    def tap(self, message_id: int, label: str, *, sender: int = USER_ID,
+            text: str | None = None) -> str | None:
+        """Tap ``label`` on a message; return the toast (None: no answer)."""
+        [data] = [d for row in self.api.buttons[message_id] for lab, d in row if lab == label]
+        before = len(self.api.answers)
+        self.api.updates.append({"update_id": self.next_id, "callback_query": {
+            "id": f"q{self.next_id}", "from": {"id": sender, "is_bot": False}, "data": data,
+            "chat_instance": "x",
+            "message": {"message_id": message_id, "chat": {"id": USER_ID, "type": "private"},
+                        "text": self.api.sent[message_id][1] if text is None else text}}})
+        self.next_id += 1
+        assert self.notifier.poll_updates() is True
+        new = self.api.answers[before:]
+        assert len(new) <= 1
+        return new[0][1] if new else None
+
+
+@pytest.fixture
+def phone(notifier, api, planner):  # noqa: F811
+    notifier.cancel_wait = notifier.pause_wait = 0
+    notifier.adapter_provider = plan_provider
+    return Phone(notifier, api)
+
+
+def _tasks(db):
+    return db.conn.execute("SELECT * FROM tasks ORDER BY created_at").fetchall()
+
+
+def _hands_on(cfg, db):
+    week = cleanweek.check(cfg, db, now(cfg.timezone) + timedelta(minutes=5))
+    return [(i.command, i.task_id) for i in week.interventions]
+
+
+def test_free_form_add_confirms_the_estimate_with_buttons(phone, api, tg_cfg, tg_db,  # noqa: F811
+                                                          planner):
+    replies = phone.send("add Fix the typo in README.md --type coding --priority URGENT")
+    assert replies[0] == "Planning: asking for an estimate and a Task type..."
+    assert replies[1].splitlines() == [
+        "Estimate:  10 minutes", "Task type: coding (from --type; proposed general)",
+        "Reason:    a small job", "Create this Task?"]
+    [msg] = phone.with_buttons()
+    assert [lab for lab, _ in api.buttons[msg][0]] == ["Create", "Don't create"]
+    assert _tasks(tg_db) == []  # nothing until you tap
+
+    assert phone.tap(msg, "Create") == "Created."
+    [row] = _tasks(tg_db)
+    tid = row["id"]
+    assert (row["state"], row["task_type"], row["priority"]) == ("queued", "coding", "urgent")
+    assert row["prompt"] == "Fix the typo in README.md"
+    assert tg_db.transitions(tid)[0]["reason"].startswith("created by telegram add (estimated")
+    # Coding Tasks are long: the timing note says when it can start.
+    assert phone.text_of(msg).endswith(
+        "Create this Task?\n\nLong Task: starts only between 00:00 and 07:00 "
+        f"(America/Los_Angeles) unless urgent\nTask {tid} queued.\n"
+        + control.daemon_note(tg_cfg))
+    assert str(row["folder"]) not in "".join(t for _, t in api.sent)
+    # A second tap (or the same button on a stale copy) only reports the state.
+    assert phone.tap(msg, "Create") == f"Already decided: Task {tid} is queued."
+    assert phone.tap(msg, "Don't create") == f"Already decided: Task {tid} is queued."
+    assert len(_tasks(tg_db)) == 1
+    assert [c["kind"] for c in planner.calls()] == ["estimate"]
+    assert tg_db.approvals(tid) == [] and _hands_on(tg_cfg, tg_db) == []
+
+
+def test_dont_create_queues_nothing_and_a_later_tap_reports_it(phone, tg_db):
+    phone.send("add Rewrite the docs")
+    [msg] = phone.with_buttons()
+    assert phone.tap(msg, "Don't create") == "Not queued."
+    assert phone.text_of(msg).endswith("Create this Task?\n\nNot queued.")
+    assert _tasks(tg_db) == []
+    assert tg_db.conn.execute("SELECT COUNT(*) FROM planning_usage").fetchone()[0] == 1
+    assert phone.tap(msg, "Create") == (
+        "Already decided: not queued (you tapped Don't create).")
+    assert _tasks(tg_db) == []
+
+
+def test_a_long_task_gets_its_plan_and_one_tap_approval(phone, api, tg_cfg, tg_db,  # noqa: F811
+                                                        planner):
+    planner.setenv("FAKE_MINUTES", "45")
+    replies = phone.send("add Write a long research report on vector DBs")
+    assert "Over 30 minutes: a plan.md will be written for your approval." in replies[-1]
+    [confirm] = phone.with_buttons()
+    assert phone.tap(confirm, "Create") == "Created."
+    [row] = _tasks(tg_db)
+    tid = row["id"]
+    assert row["state"] == "awaiting_approval"
+    assert phone.text_of(confirm).endswith(
+        f"Task {tid} is awaiting approval; writing its plan.")
+    [_, plan_msg] = phone.with_buttons()
+    assert api.sent[plan_msg][1] == (f"Plan for Task {tid} (estimated 45 min):\n\n"
+                                     "# Plan\n\n## Goal\nDo it.\n\n## Steps\n1. Step one")
+    assert [lab for lab, _ in api.buttons[plan_msg][0]] == ["Approve", "Deny"]
+
+    assert phone.tap(plan_msg, "Approve") == "Approved."
+    assert tg_db.task_state(tid) == TaskState.QUEUED
+    [approval] = tg_db.approvals(tid)
+    assert (approval["decision"], approval["via"]) == ("approved", "telegram add")
+    assert phone.text_of(plan_msg).endswith(f"\n\nTask {tid} approved and queued.\n"
+                                            + control.daemon_note(tg_cfg))
+    # Double and stale taps change nothing and say what happened.
+    assert phone.tap(plan_msg, "Approve") == (
+        f"Already decided: Task {tid} is queued (plan approved via telegram add).")
+    assert phone.tap(plan_msg, "Deny").startswith("Already decided:")
+    assert tg_db.task_state(tid) == TaskState.QUEUED and len(tg_db.approvals(tid)) == 1
+    # Approving the plan while adding the Task is asking for the work, as at
+    # `orch add`: not an intervention.
+    assert _hands_on(tg_cfg, tg_db) == []
+    assert [c["kind"] for c in planner.calls()] == ["estimate", "plan"]
+
+
+def test_deny_in_the_add_flow_cancels_the_task(phone, tg_cfg, tg_db, planner):  # noqa: F811
+    planner.setenv("FAKE_MINUTES", "60")
+    phone.send("add Big job")
+    phone.tap(phone.with_buttons()[0], "Create")
+    [tid] = [r["id"] for r in _tasks(tg_db)]
+    assert phone.tap(phone.with_buttons()[1], "Deny") == "Denied."
+    assert tg_db.task_state(tid) == TaskState.CANCELLED
+    assert [(a["decision"], a["via"]) for a in tg_db.approvals(tid)] == [("denied",
+                                                                          "telegram add")]
+    assert _hands_on(tg_cfg, tg_db) == []
+
+
+def test_a_failed_plan_call_still_offers_the_buttons(phone, api, tg_db, planner):
+    planner.setenv("FAKE_MINUTES", "60")
+    phone.send("add Big job")
+    planner.setenv("FAKE_PLAN_FAIL", "plan")
+    phone.tap(phone.with_buttons()[0], "Create")
+    [tid] = [r["id"] for r in _tasks(tg_db)]
+    [_, msg] = phone.with_buttons()
+    assert api.sent[msg][1].startswith("Could not write a plan: plan call on claude failed")
+    assert api.sent[msg][1].endswith(f"Approve Task {tid} without a plan, or deny it.")
+    assert phone.tap(msg, "Approve") == "Approved."
+    assert tg_db.task_state(tid) == TaskState.QUEUED
+
+
+def test_a_draft_survives_a_daemon_restart(phone, api, tg_cfg, tg_db):  # noqa: F811
+    phone.send("add Fix a typo")
+    [msg] = phone.with_buttons()
+    phone.notifier = Notifier(tg_cfg, tg_db, api)  # a restarted daemon
+    assert phone.tap(msg, "Create") == "Created."
+    assert len(_tasks(tg_db)) == 1
+
+
+@pytest.fixture
+def tpl_notifier(tmp_path, tg_cfg, api):  # noqa: F811
+    from nightshift.config import load_config
+    from nightshift.db import Database
+    from nightshift.host import FakeHost
+    import yaml
+
+    tdir = tmp_path / "tpl"
+    tdir.mkdir()
+    base = {"task_type": "general", "agent": "claude", "max_runtime_minutes": 90,
+            "long": False, "internet": "off", "prompt": "Do {{request}}"}
+    (tdir / "quick-job.yaml").write_text(yaml.safe_dump({**base, "estimated_minutes": 5}))
+    (tdir / "big-job.yaml").write_text(yaml.safe_dump({**base, "estimated_minutes": 60}))
+    data = yaml.safe_load((tg_cfg.config_dir / "config.yaml").read_text())
+    data["templates"] = {"dir": str(tdir)}
+    (tg_cfg.config_dir / "config.yaml").write_text(yaml.safe_dump(data))
+    cfg = load_config(tg_cfg.config_dir, host=FakeHost())
+    db = Database(cfg.db_path, tz=cfg.timezone)
+    n = Notifier(cfg, db, api)
+    n.adapter_provider = plan_provider
+    yield n
+    db.close()
+
+
+def test_template_adds_are_created_at_once(tpl_notifier, api, planner):
+    phone = Phone(tpl_notifier, api)
+    cfg, db = tpl_notifier.cfg, tpl_notifier.db
+    proposal, created = phone.send("add quick-job the weekly cleanup --deadline 2027-01-15 17:00")
+    [row] = _tasks(db)
+    tid = row["id"]
+    assert proposal == ("Template:  quick-job\nEstimate:  5 minutes (from the template)\n"
+                        "Task type: general")
+    assert row["state"] == "queued" and row["template"] == "quick-job"
+    assert row["prompt"] == "Do the weekly cleanup" and row["deadline"].startswith("2027-01-15T17:00")
+    assert created.startswith("Deadline:  2027-01-15T17:00") and f"Task {tid} queued." in created
+    assert phone.with_buttons() == [] and planner.calls() == []
+    assert db.transitions(tid)[0]["reason"].startswith(
+        "created by telegram add, template quick-job")
+
+    # --template works too; over 30 minutes the plan follows.
+    replies = phone.send('add "the big migration" --template big-job --priority background')
+    assert replies[-1].startswith("Plan for Task ")
+    [msg] = phone.with_buttons()
+    big = [r for r in _tasks(db) if r["template"] == "big-job"][0]
+    assert big["priority"] == "background" and big["state"] == "awaiting_approval"
+    assert big["title"] == "the big migration"
+    assert phone.tap(msg, "Approve") == "Approved."
+    assert db.approvals(big["id"])[-1]["via"] == "telegram add"
+    assert phone.reply("add quick-job") == "Usage: add <template> <request>"
+
+
+def test_alerts_for_awaiting_approval_tasks_carry_working_buttons(phone, notifier, api,  # noqa: F811
+                                                                  tg_cfg, tg_db):
+    tid = create_task(tg_cfg, tg_db, "Long research", estimated_minutes=45).spec.id
+    _running(tg_db, tid)
+    tg_db.transition(tid, TaskState.PAUSED_USAGE, "usage limit")
+    tg_db.transition(tid, TaskState.AWAITING_APPROVAL, "paused too long; needs re-approval")
+    notifier.tick()
+    [msg] = phone.with_buttons()
+    assert "needs re-approval" in api.sent[msg][1]
+    assert api.buttons[msg] == [[("Approve", f"approve:{tid}"), ("Deny", f"deny:{tid}")]]
+    assert phone.tap(msg, "Approve") == "Approved."
+    assert tg_db.task_state(tid) == TaskState.QUEUED
+    assert tg_db.approvals(tid)[-1]["via"] == "telegram"
+    # Unlike the add flow, approving from an alert is an intervention.
+    assert ("telegram", tid) in _hands_on(tg_cfg, tg_db)
+    assert phone.tap(msg, "Deny") == (
+        f"Already decided: Task {tid} is queued (plan approved via telegram).")
+    assert tg_db.task_state(tid) == TaskState.QUEUED
+    # A Task that is gone: the button says so.
+    api.buttons[msg] = [[("Approve", "approve:nope")]]
+    assert phone.tap(msg, "Approve") == "No such Task."
+
+
+def test_presses_from_other_users_are_ignored_and_logged(phone, notifier, api, tg_cfg,  # noqa: F811
+                                                         tg_db):
+    tid = create_task(tg_cfg, tg_db, "Plan", needs_approval=True).spec.id
+    api.sent.append((USER_ID, "x"))
+    api.buttons.append(remote.approval_buttons(tid))
+    assert phone.tap(0, "Approve", sender=999001) is None
+    assert phone.tap(0, "Deny", sender=999001) is None
+    assert tg_db.task_state(tid) == TaskState.AWAITING_APPROVAL and tg_db.approvals(tid) == []
+    assert api.edits == [] and len(api.sent) == 1
+    stranger = [m for m in notifier.logs if "999001" in m]
+    assert len(stranger) == 2 and all("ignored" in m for m in stranger)
+    # Unknown or malformed button data from you is answered, never acted on.
+    api.buttons[0] = [[("Odd", "explode:all")], [("Bad", "create:abc")]]
+    assert phone.tap(0, "Odd") == "Nightshift doesn't know this button."
+    assert phone.tap(0, "Bad") == "Nightshift doesn't know this button."
+    assert "Telegram: unknown button from you" in notifier.logs
+
+
+def test_comedy_plans_and_ideas_never_go_to_telegram(phone, api, tg_cfg, tg_db,  # noqa: F811
+                                                     planner):
+    planner.setenv("FAKE_MINUTES", "45")
+    planner.setenv("FAKE_TYPE", "comedy")
+    replies = phone.send("add Punch up the dentist bit")
+    assert replies[-1].splitlines() == [
+        "Estimate:  45 minutes", "Task type: comedy (proposed)",
+        "Over 30 minutes: a plan.md will be written for your approval.", "Create this Task?"]
+    phone.tap(phone.with_buttons()[0], "Create")
+    [row] = _tasks(tg_db)
+    tid = row["id"]
+    assert (row["state"], row["task_type"]) == ("awaiting_approval", "comedy")
+    assert (Path(row["folder"]) / "plan.md").exists()
+    [_, msg] = phone.with_buttons()
+    assert api.sent[msg][1] == (
+        f"Task {tid} has a plan.md (comedy: not sent to Telegram). Read it on the dashboard "
+        f"or with `orch show {tid}`, then approve or deny.")
+    assert phone.tap(msg, "Approve") == "Approved."
+    everything = [t for _, t in api.sent] + [t for *_, t in api.edits] + [
+        t for _, t in api.answers if t]
+    for text in everything:
+        for leaked in ("dentist", "bit", "# Plan", "Do it.", "Step one", "a small job"):
+            assert leaked not in text, (leaked, text)
+
+
+def test_bad_adds_get_a_clear_reply_and_no_planning_call(phone, tg_db, planner):
+    assert phone.reply("add") == remote.ADD_USAGE
+    assert phone.reply("add   --type coding") == remote.ADD_USAGE
+    assert phone.reply("add x --priority asap").startswith("Unknown priority 'asap'.")
+    assert phone.reply("add x --priority").startswith("--priority needs a value.")
+    assert phone.reply("add x --internet maybe").startswith("--internet takes on or off.")
+    assert phone.reply("add x --type poetry").startswith("Unknown Task type 'poetry'")
+    assert phone.reply("add x --at 1 --at 2").startswith("--at is given twice.")
+    assert phone.reply("add x --deadline someday").startswith("Not done: ")
+    assert phone.reply("add x --template nope").startswith("Not done: no template 'nope'")
+    assert planner.calls() == [] and _tasks(tg_db) == []
+    assert phone.with_buttons() == []
+
+
+def test_parse_add_reads_orch_add_options(tg_cfg):  # noqa: F811
+    req, opts = remote.parse_add(
+        tg_cfg, "Compare  vector DBs --deadline 2027-01-15 17:00 --at=23:00 "
+                "--agent “codex” --internet ON --type research")
+    assert req == "Compare vector DBs"
+    assert opts == {"deadline": "2027-01-15 17:00", "at": "23:00", "agent": "codex",
+                    "internet": "on", "type": "research"}
+    req, opts = remote.parse_add(tg_cfg, "Don't break --deadline '2027-01-15 09:30'\nline two")
+    assert req == "Don't break \nline two" and opts == {"deadline": "2027-01-15 09:30"}
+    req, opts = remote.parse_add(tg_cfg, "resume-tailor https://example.com/job/1")
+    assert (req, opts) == ("https://example.com/job/1", {"template": "resume-tailor"})
+
+
+def test_long_plans_are_trimmed_to_one_message():
+    plan = "\n".join(f"{i}. " + "step " * 30 for i in range(100))
+    out = remote.trim_plan(plan)
+    assert len(out) <= remote.PLAN_ROOM < remote.MAX_MESSAGE
+    assert out.endswith("trimmed; the whole plan.md is in the Task folder.")
+    assert remote.trim_plan("# Plan\n") == "# Plan"
+
+
+def test_a_draft_round_trips_through_json(tg_cfg, planner):  # noqa: F811
+    draft = control.propose(tg_cfg, "Fix it", at=now(tg_cfg.timezone), task_type="coding",
+                            priority="urgent", adapter_provider=plan_provider).draft
+    back = control.Draft.from_json(draft.to_json())
+    assert back == draft and back.proposal.usage[0].output_tokens == 50

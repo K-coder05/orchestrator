@@ -15,6 +15,8 @@ message from ``telegram.user_id`` to :func:`run`, which answers through
 | ``resume <id>``         | queue a paused Task now                           |
 | ``retry <id>``          | retry a failed or partial Task                    |
 | ``priority <id> <P>``   | set its Priority (urgent, normal, background)     |
+| ``add <prompt>``        | a free-form Task (estimate, then Create button)   |
+| ``add <template> <req>``| a Task from a template                            |
 | ``help``                | these commands                                    |
 
 A leading ``/`` (and a ``@botname`` suffix) is optional; case doesn't
@@ -22,10 +24,24 @@ matter. Every change goes through ``nightshift.control`` with ``via:
 telegram``, so it is checked, recorded and counted for the clean-week check
 exactly as the same ``orch`` command would be.
 
-Comedy Tasks show their id and state only, never their title (§1.6). The
-control layer's messages are built from ids, states and fixed reasons, so
-they carry no Task content either. The caller redacts secrets from every
-reply.
+``add`` is the intake of ``orch add`` (§2.4) over inline buttons, with
+``via: telegram add``: a free-form Task's estimate and Task type wait for
+**Create** / **Don't create** (the draft is kept in ``telegram_drafts``);
+a template Task is created at once. A Task over the plan threshold then
+gets its ``plan.md`` (trimmed to one message) with **Approve** / **Deny**.
+Like the y/n of ``orch add``, that decision is part of asking for the work,
+not an intervention. Alerts for a Task awaiting approval carry Approve /
+Deny with ``via: telegram``, as ``approve <id>`` does.
+
+A button press (:func:`press`) is answered and its message edited to show
+the decision. Every decision is made once: a second tap, or a tap on a
+stale button, only reports the current state.
+
+Comedy Tasks show their id and state only, never their title (§1.6), and
+their plan is never sent: the message points to the dashboard or ``orch
+show``. The control layer's messages are built from ids, states and fixed
+reasons, so they carry no Task content either. The caller redacts secrets
+from every reply.
 """
 
 from __future__ import annotations
@@ -34,11 +50,13 @@ import re
 from collections.abc import Callable
 from datetime import datetime
 
-from . import alerts, control, daemon, queries, views
+from . import alerts, control, daemon, planning, queries, templates, views
 from . import priority as prio
 from .config import Config
 from .db import Database
 from .states import TERMINAL, TaskState
+from .telegram import Buttons
+from .timeutil import iso
 
 #: Telegram refuses messages longer than this.
 MAX_MESSAGE = 4096
@@ -59,7 +77,10 @@ pause <id> - pause a Task until you resume it
 resume <id> - queue a paused Task now
 retry <id> - retry a failed or partial Task
 priority <id> <urgent|normal|background> - set its Priority
+add <prompt> - a new Task: estimate and Task type, then tap Create
+add <template> <request> - a new Task from a template
 help - this list
+add takes orch add's options: --type T --agent A --priority P --deadline D --at T --internet on|off
 A leading / is optional."""
 
 #: Commands that take a Task id, and what else they take.
@@ -73,7 +94,11 @@ USAGE = {
     "priority": "priority <id> <urgent|normal|background>",
 }
 
-Reply = Callable[[str], None]
+ADD_USAGE = ("Usage: add <prompt>, or add <template> <request>; options --type T, --agent A, "
+             "--priority urgent|normal|background, --deadline D, --at T, --internet on|off")
+
+#: Reply(text, buttons=None): one message to you, optionally with inline buttons.
+Reply = Callable[..., None]
 
 
 def parse(text: str) -> tuple[str, list[str]]:
@@ -86,15 +111,22 @@ def parse(text: str) -> tuple[str, list[str]]:
 
 
 def run(cfg: Config, db: Database, text: str, *, at: datetime, reply: Reply,
-        cancel_wait: float | None = None, pause_wait: float | None = None) -> str:
+        cancel_wait: float | None = None, pause_wait: float | None = None,
+        adapter_provider: planning.AdapterProvider | None = None) -> str:
     """Carry out one command and answer it through ``reply`` (once, or twice
-    for a cancel or pause the daemon carries out). Returns the command word
-    for the log, or ``unknown``; never the message itself.
+    for a cancel or pause the daemon carries out, or an ``add`` with a
+    planning call). Returns the command word for the log, or ``unknown``;
+    never the message itself.
 
     ``cancel_wait`` and ``pause_wait`` bound the wait for the daemon (default
-    ``control``'s own bounds)."""
+    ``control``'s own bounds); ``adapter_provider`` makes ``add``'s planning
+    calls (default the configured agent)."""
     verb, args = parse(text)
-    if verb in ("help", "start"):
+    if verb == "add":
+        rest = text.strip().split(None, 1)
+        add(cfg, db, rest[1] if len(rest) > 1 else "", at=at, reply=reply,
+            adapter_provider=adapter_provider)
+    elif verb in ("help", "start"):
         reply(HELP)
     elif verb == "status":
         reply(status_text(cfg, db))
@@ -222,3 +254,254 @@ def clip(text: str) -> str:
     tail = "\n… more not shown; orch list has them all."
     cut = text[: MAX_MESSAGE - len(tail)].rsplit("\n", 1)[0]
     return cut + tail
+
+
+# --------------------------------------------------------------------------
+# add (§5 item 1, §2.4): intake over inline buttons
+# --------------------------------------------------------------------------
+
+#: ``add``'s options, as ``orch add``'s. A value may be quoted, and a
+#: deadline or start time may be ``YYYY-MM-DD HH:MM`` unquoted.
+_ADD_OPTIONS = ("template", "type", "agent", "priority", "deadline", "at", "internet")
+_OPTION = re.compile(
+    r"(?<!\S)--(%s)(?:=|\s+)(\"[^\"]*\"|'[^']*'|\u201c[^\u201d]*\u201d|"
+    r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?![^\s])|\S+)" % "|".join(_ADD_OPTIONS))
+_QUOTES = {('"', '"'), ("'", "'"), ("\u201c", "\u201d")}
+_BARE_OPTION = re.compile(r"(?<!\S)--(%s)(?=\s|=|$)" % "|".join(_ADD_OPTIONS))
+
+#: Callback data of the buttons (``<action>:<key>``; at most 64 bytes).
+CREATE, DECLINE = "create", "decline"  # key: the telegram_drafts id
+PLAN_APPROVE, PLAN_DENY = "plan-approve", "plan-deny"  # key: Task id; the add flow
+APPROVE, DENY = "approve", "deny"  # key: Task id; an alert
+
+#: Room a plan leaves for the lines around it in one message.
+PLAN_ROOM = MAX_MESSAGE - 400
+
+
+class AddError(ValueError):
+    """An ``add`` that can't be read: its message is the reply."""
+
+
+def parse_add(cfg: Config, text: str) -> tuple[str, dict[str, str]]:
+    """The request and options of ``add <text>``. ``template`` is set from
+    ``--template`` or a first word naming a template."""
+    opts: dict[str, str] = {}
+
+    def take(m: re.Match) -> str:
+        name, value = m.group(1), m.group(2)
+        if name in opts:
+            raise AddError(f"--{name} is given twice. {ADD_USAGE}")
+        if value[:1] in "\"'\u201c" and len(value) >= 2:
+            value = value[1:-1]
+        opts[name] = value.strip()
+        return ""
+
+    rest = _OPTION.sub(take, text)
+    if (bare := _BARE_OPTION.search(rest)) is not None:
+        raise AddError(f"--{bare.group(1)} needs a value. {ADD_USAGE}")
+    request = re.sub(r"[ \t]{2,}", " ", rest).strip()
+    if len(request) >= 2 and (request[0], request[-1]) in _QUOTES:
+        request = request[1:-1].strip()  # add "the whole request" --type T
+    if "template" not in opts:
+        first, _, after = request.partition(" ")
+        if first in templates.available(cfg):
+            opts["template"], request = first, after.strip()
+    if not request:
+        raise AddError("Usage: add <template> <request>" if "template" in opts else ADD_USAGE)
+    if "priority" in opts:
+        opts["priority"] = opts["priority"].lower()
+        if opts["priority"] not in prio.PRIORITIES:
+            raise AddError(f"Unknown priority {opts['priority']!r}. {ADD_USAGE}")
+    if "internet" in opts:
+        opts["internet"] = opts["internet"].lower()
+        if opts["internet"] not in ("on", "off"):
+            raise AddError(f"--internet takes on or off. {ADD_USAGE}")
+    if "type" in opts and cfg.task_types and opts["type"] not in cfg.task_types:
+        raise AddError(f"Unknown Task type {opts['type']!r}; Task types: "
+                       + ", ".join(cfg.task_types))
+    return request, opts
+
+
+def add(cfg: Config, db: Database, text: str, *, at: datetime, reply: Reply,
+        adapter_provider: planning.AdapterProvider | None = None) -> None:
+    """``add``: propose the Task through ``control``. A free-form one asks
+    Create / Don't create; a template one is created at once (as ``orch
+    add --template`` asks nothing)."""
+    try:
+        request, opts = parse_add(cfg, text)
+    except AddError as exc:
+        reply(str(exc))
+        return
+    res = control.propose(
+        cfg, request, at=at, template=opts.get("template"), task_type=opts.get("type"),
+        agent=opts.get("agent"), priority=opts.get("priority"), deadline=opts.get("deadline"),
+        run_at=opts.get("at"), internet=opts.get("internet"), adapter_provider=adapter_provider,
+        progress=reply)
+    if not res.ok:
+        reply(result_text(res))
+        return
+    draft = res.draft
+    lines = draft_lines(cfg, draft)
+    if draft.template is not None:
+        reply("\n".join(lines))
+        _created(cfg, db, control.create(cfg, db, draft, via=control.VIA_TELEGRAM_ADD),
+                 reply=reply, adapter_provider=adapter_provider)
+        return
+    key = db.insert_telegram_draft(draft.to_json(), at=iso(at))
+    reply("\n".join([*lines, "Create this Task?"]),
+          buttons=[[("Create", f"{CREATE}:{key}"), ("Don't create", f"{DECLINE}:{key}")]])
+
+
+def draft_lines(cfg: Config, draft: control.Draft) -> list[str]:
+    """``control.describe``, less what may carry a comedy Task's content
+    (the planner's reason, the template's inputs)."""
+    lines = control.describe(cfg, draft)
+    if _status_only(draft.task_type):
+        lines = [ln for ln in lines if not ln.startswith(("Reason:", "Input:"))]
+    return lines
+
+
+def approval_buttons(task_id: str, *, via_add: bool = False) -> Buttons:
+    yes, no = (PLAN_APPROVE, PLAN_DENY) if via_add else (APPROVE, DENY)
+    return [[("Approve", f"{yes}:{task_id}"), ("Deny", f"{no}:{task_id}")]]
+
+
+def _created(cfg: Config, db: Database, res: control.Result, *, reply: Reply,
+             adapter_provider: planning.AdapterProvider | None) -> None:
+    """After ``control.create``: say so and, over the plan threshold, send
+    the plan with Approve / Deny."""
+    reply(created_text(res))
+    if res.ok and res.to_state == TaskState.AWAITING_APPROVAL:
+        send_plan(cfg, db, res.task_id, reply=reply, adapter_provider=adapter_provider)
+
+
+def created_text(res: control.Result) -> str:
+    """A new Task, by id and state only (its folder name carries its title)."""
+    if not res.ok:
+        return result_text(res)
+    head = (f"Task {res.task_id} is awaiting approval; writing its plan."
+            if res.to_state == TaskState.AWAITING_APPROVAL else f"Task {res.task_id} queued.")
+    return result_text(control.Result(res.action, "\n".join([*res.details, head]),
+                                      note=res.note))
+
+
+def send_plan(cfg: Config, db: Database, task_id: str, *, reply: Reply,
+              adapter_provider: planning.AdapterProvider | None = None) -> None:
+    """Write the Task's plan.md and send it with Approve / Deny (a comedy
+    Task's plan stays on the machine)."""
+    planned = control.plan(cfg, db, task_id, adapter_provider=adapter_provider)
+    buttons = approval_buttons(task_id, via_add=True)
+    if not planned.ok and planned.refusal != control.NO_PLAN:
+        reply(result_text(planned))
+        return
+    if not planned.ok:
+        reply(f"{planned.message}\nApprove Task {task_id} without a plan, or deny it.",
+              buttons=buttons)
+        return
+    row = db.get_task(task_id)
+    if _status_only(row["task_type"]):
+        reply(f"Task {task_id} has a plan.md ({row['task_type']}: not sent to Telegram). "
+              f"Read it on the dashboard or with `orch show {task_id}`, then approve or deny.",
+              buttons=buttons)
+        return
+    reply(f"Plan for Task {task_id} (estimated {row['estimated_minutes']} min):\n\n"
+          f"{trim_plan(planned.plan or '')}", buttons=buttons)
+
+
+def trim_plan(text: str, room: int = PLAN_ROOM) -> str:
+    """``text`` cut at a line to fit ``room`` characters."""
+    text = text.strip()
+    if len(text) <= room:
+        return text
+    tail = "\n… trimmed; the whole plan.md is in the Task folder."
+    return text[: room - len(tail)].rsplit("\n", 1)[0] + tail
+
+
+# --------------------------------------------------------------------------
+# Button presses
+# --------------------------------------------------------------------------
+
+
+def press(cfg: Config, db: Database, data: str, *, original: str, at: datetime,
+          answer: Callable[[str], None], edit: Callable[[str], None], reply: Reply,
+          adapter_provider: planning.AdapterProvider | None = None) -> str:
+    """Act on one button press (its callback ``data``): ``answer`` the press
+    with a short toast, ``edit`` the pressed message (``original`` its text)
+    to show the decision, ``reply`` with anything that follows (a new
+    Task's plan). Returns the action for the log, or ``unknown``."""
+    action, _, key = data.partition(":")
+
+    def decided(toast: str, line: str) -> None:
+        answer(toast)
+        edit(f"{original}\n\n{line}" if original else line)
+
+    if action in (CREATE, DECLINE) and key.isdigit():
+        _draft_press(cfg, db, int(key), action == CREATE, at=at, decided=decided, reply=reply,
+                     adapter_provider=adapter_provider)
+    elif action in (PLAN_APPROVE, PLAN_DENY, APPROVE, DENY) and key:
+        via = control.VIA_TELEGRAM_ADD if action in (PLAN_APPROVE, PLAN_DENY) else (
+            control.VIA_TELEGRAM)
+        _decision_press(cfg, db, key, action in (PLAN_APPROVE, APPROVE), via=via,
+                        decided=decided)
+    else:
+        answer("Nightshift doesn't know this button.")
+        return "unknown"
+    return action
+
+
+def _draft_press(cfg: Config, db: Database, key: int, create_it: bool, *, at: datetime,
+                 decided: Callable[[str, str], None], reply: Reply,
+                 adapter_provider: planning.AdapterProvider | None) -> None:
+    row = db.telegram_draft(key)
+    if row is None:
+        decided("This proposal is gone.", "This proposal is gone; send add again.")
+        return
+    if not db.decide_telegram_draft(key, "created" if create_it else "declined", at=iso(at)):
+        state = draft_state(db, db.telegram_draft(key))
+        decided(f"Already decided: {state}", f"Already decided: {state}")
+        return
+    draft = control.Draft.from_json(row["draft"])
+    if not create_it:
+        decided("Not queued.", control.decline(db, draft).message)
+        return
+    res = control.create(cfg, db, draft, via=control.VIA_TELEGRAM_ADD)
+    db.finish_telegram_draft(key, decision="created" if res.ok else "failed",
+                             task_id=res.task_id if res.ok else None)
+    if not res.ok:
+        decided("Not created.", result_text(res))
+        return
+    decided("Created.", created_text(res))
+    if res.to_state == TaskState.AWAITING_APPROVAL:
+        send_plan(cfg, db, res.task_id, reply=reply, adapter_provider=adapter_provider)
+
+
+def draft_state(db: Database, row) -> str:
+    """What a decided draft came to, by Task id and state."""
+    if row["decision"] == "declined":
+        return "not queued (you tapped Don't create)."
+    if row["decision"] == "failed":
+        return "creating the Task failed; send add again."
+    if row["task_id"] is None:
+        return "created."
+    return f"Task {row['task_id']} is {db.task_state(row['task_id'])}."
+
+
+def _decision_press(cfg: Config, db: Database, task_id: str, approve_it: bool, *, via: str,
+                    decided: Callable[[str, str], None]) -> None:
+    res = (control.approve if approve_it else control.deny)(cfg, db, task_id, via=via)
+    if res.ok:
+        decided("Approved." if approve_it else "Denied.", result_text(res))
+    elif res.refusal == control.UNKNOWN_TASK:
+        decided("No such Task.", result_text(res))
+    else:  # decided already (another tap, message or surface), or moved on
+        state = decision_state(db, task_id)
+        decided(f"Already decided: {state}", f"Already decided: {state}")
+
+
+def decision_state(db: Database, task_id: str) -> str:
+    """A Task's state now and its last plan decision."""
+    text = f"Task {task_id} is {db.task_state(task_id)}"
+    last = db.approvals(task_id)
+    if last:
+        text += f" (plan {last[-1]['decision']} via {last[-1]['via']})"
+    return text + "."

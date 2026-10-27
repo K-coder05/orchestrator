@@ -19,6 +19,9 @@ afterwards: a Telegram outage only leaves alerts pending (retried until
 Comedy Tasks get status lines only: never the title, the Result, the
 reason or the request, which may carry script or idea content (§1.6).
 
+An alert for a Task awaiting approval (re-approval) carries Approve / Deny
+inline buttons; their presses come back through the long poll.
+
 The same loop makes and sends the 8am digest (``nightshift.digest``); the
 long poll answers your commands (``nightshift.remote``).
 """
@@ -35,7 +38,7 @@ from . import digest, report, spend
 from .config import Config
 from .db import Database
 from .states import TaskState
-from .telegram import BotAPI, HttpBotAPI, TelegramError
+from .telegram import BotAPI, Buttons, HttpBotAPI, TelegramError
 from .timeutil import iso, now, parse_iso
 
 #: Task types whose alerts are status lines only (unreleased material).
@@ -117,6 +120,14 @@ def alert_text(task, kind: str, reason: str) -> str:
     else:
         detail = f"Paused too long; approve it again with orch approve {tid}"
     return "\n".join(filter(None, [head, detail, f"Details: orch report {tid}"]))
+
+
+def _alert_buttons(alert) -> Buttons | None:
+    """Approve / Deny on an alert for a Task awaiting approval."""
+    if alert["kind"] != "reapproval":
+        return None
+    from . import remote  # control -> daemon -> alerts: imported on use
+    return remote.approval_buttons(alert["task_id"])
 
 
 class Notifier:
@@ -208,7 +219,7 @@ class Notifier:
                          f"({a['tries']} tries, last error: {a['last_error']})")
                 continue
             try:
-                self.api.send_message(self.user_id, a["text"])
+                self.api.send_message(self.user_id, a["text"], buttons=_alert_buttons(a))
             except TelegramError as exc:
                 err = self.cfg.secrets.redact(str(exc))
                 self.db.mark_alert(a["id"], error=err)
@@ -220,9 +231,10 @@ class Notifier:
     def poll_updates(self) -> bool:
         """One long poll for incoming updates. A text message from
         ``telegram.user_id`` is a command (``nightshift.remote``), answered
-        to that user; any other update from them is ignored. One from another
-        user is logged with its sender ID (never its content) and never
-        answered. False if Telegram failed."""
+        to that user, and a ``callback_query`` from them is an inline button
+        press; any other update from them is ignored. One from another user
+        is logged with its sender ID (never its content) and never answered.
+        False if Telegram failed."""
         offset = self.db.get_meta(OFFSET_KEY)
         timeout = self.cfg.telegram_setting("poll_timeout_seconds")
         try:
@@ -240,6 +252,8 @@ class Notifier:
             if sender != self.user_id:
                 self.log(f"Telegram: ignored an update from user {sender}, who is not "
                          "telegram.user_id")
+            elif isinstance(u.get("callback_query"), dict):
+                self.button(u["callback_query"])
             elif not isinstance(u.get("message"), dict):
                 self.log("Telegram: ignored an update from you that is not a new message")
             else:
@@ -250,26 +264,73 @@ class Notifier:
     #: ``control``'s own); tests shorten them.
     cancel_wait: float | None = None
     pause_wait: float | None = None
+    #: The planning calls of ``add`` (None: the configured agent); tests fake it.
+    adapter_provider: Any = None
+
+    def _reply(self, msg: str, buttons: Buttons | None = None) -> None:
+        try:
+            self.api.send_message(self.user_id, self.cfg.secrets.redact(msg), buttons=buttons)
+        except TelegramError as exc:
+            self.log(f"Telegram reply not sent: {exc}")
 
     def command(self, text: str) -> None:
         """Run one command from you and answer it. Its text is never logged."""
         from . import remote  # control -> daemon -> alerts: imported on use
 
-        def reply(msg: str) -> None:
-            try:
-                self.api.send_message(self.user_id, self.cfg.secrets.redact(msg))
-            except TelegramError as exc:
-                self.log(f"Telegram reply not sent: {exc}")
-
         try:
-            verb = remote.run(self.cfg, self.db, text, at=self.clock(), reply=reply,
-                              cancel_wait=self.cancel_wait, pause_wait=self.pause_wait)
+            verb = remote.run(self.cfg, self.db, text, at=self.clock(), reply=self._reply,
+                              cancel_wait=self.cancel_wait, pause_wait=self.pause_wait,
+                              adapter_provider=self.adapter_provider)
         except Exception as exc:  # a bug in one command must not end the poll
             self.log(f"Telegram command error: {type(exc).__name__}: {exc}")
-            reply(f"Nightshift hit an error running that command ({type(exc).__name__}); "
-                  "see the daemon log.")
+            self._reply(f"Nightshift hit an error running that command "
+                        f"({type(exc).__name__}); see the daemon log.")
             return
         self.log(f"Telegram: {verb} command from you")
+
+    def button(self, query: dict[str, Any]) -> None:
+        """Act on one inline button press from you: answer the press (its
+        spinner stops, with a short toast) and edit the pressed message to
+        show the decision, which also takes its buttons away."""
+        from . import remote
+
+        message = query.get("message") if isinstance(query.get("message"), dict) else {}
+        chat_id = (message.get("chat") or {}).get("id")
+        message_id = message.get("message_id")
+        original = message.get("text") or ""
+        answered = False
+
+        def answer(text: str | None = None) -> None:
+            nonlocal answered
+            if answered:
+                return
+            answered = True
+            try:
+                self.api.answer_callback_query(str(query.get("id")),
+                                               self.cfg.secrets.redact(text) if text else None)
+            except TelegramError as exc:
+                self.log(f"Telegram button answer not sent: {exc}")
+
+        def edit(text: str) -> None:
+            text = self.cfg.secrets.redact(text)
+            if chat_id is None or message_id is None or not original:
+                self._reply(text)  # too old to edit: say it in a new message
+                return
+            try:
+                self.api.edit_message_text(chat_id, message_id, text)
+            except TelegramError as exc:
+                self.log(f"Telegram message edit not sent: {exc}")
+
+        try:
+            verb = remote.press(self.cfg, self.db, str(query.get("data") or ""),
+                                original=original, at=self.clock(), answer=answer, edit=edit,
+                                reply=self._reply, adapter_provider=self.adapter_provider)
+        except Exception as exc:  # a bug in one button must not end the poll
+            self.log(f"Telegram button error: {type(exc).__name__}: {exc}")
+            answer(f"Nightshift hit an error ({type(exc).__name__}); see the daemon log.")
+            return
+        answer()
+        self.log(f"Telegram: {verb} button from you")
 
     def tick(self) -> bool:
         """Collect alerts and a due digest, then deliver; False if Telegram failed."""

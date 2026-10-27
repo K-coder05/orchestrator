@@ -25,18 +25,34 @@ TOKEN = "123456:secret-bot-token-abcdef"
 
 
 class FakeBotAPI:
-    """Stands in for the Telegram Bot API: records sends, serves updates."""
+    """Stands in for the Telegram Bot API: records sends (with their inline
+    buttons, by message id), edits and callback answers; serves updates."""
 
     def __init__(self):
         self.sent: list[tuple[int, str]] = []
+        #: The inline buttons of each sent message, aligned with ``sent``.
+        self.buttons: list[list[list[tuple[str, str]]] | None] = []
+        self.edits: list[tuple[int, int, str]] = []
+        self.answers: list[tuple[str, str | None]] = []
         self.updates: list[dict] = []
         self.down = False
         self.offsets: list[int | None] = []
 
-    def send_message(self, chat_id: int, text: str) -> None:
+    def send_message(self, chat_id: int, text: str, buttons=None) -> None:
         if self.down:
             raise TelegramError("sendMessage: connection refused")
         self.sent.append((chat_id, text))
+        self.buttons.append(buttons)
+
+    def edit_message_text(self, chat_id: int, message_id: int, text: str) -> None:
+        if self.down:
+            raise TelegramError("editMessageText: connection refused")
+        self.edits.append((chat_id, message_id, text))
+
+    def answer_callback_query(self, query_id: str, text: str | None = None) -> None:
+        if self.down:
+            raise TelegramError("answerCallbackQuery: connection refused")
+        self.answers.append((query_id, text))
 
     def get_updates(self, offset: int | None, timeout: float) -> list[dict]:
         if self.down:
@@ -245,7 +261,7 @@ class HangingBotAPI(FakeBotAPI):
         super().__init__()
         self.release = threading.Event()
 
-    def send_message(self, chat_id, text):
+    def send_message(self, chat_id, text, buttons=None):
         self.release.wait()
         raise TelegramError("sendMessage: timed out")
 
