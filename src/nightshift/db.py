@@ -411,13 +411,30 @@ MIGRATIONS: list[str] = [
         task_id     TEXT REFERENCES tasks(id)
     );
     """,
+    # 16: decisions on an agent's "needs you" request (§1.6, §2.10).
+    """
+    -- What an approvals row decides: a Task's plan (awaiting_approval) or
+    -- an agent's request (needs_you.json). A request row keeps the
+    -- request's kind, the SHA-256 of needs_you.json as it was decided, the
+    -- copy kept in the Task's logs (relative to its folder) and the Attempt
+    -- that raised it. Approved or denied, the Task is requeued.
+    ALTER TABLE approvals ADD COLUMN subject TEXT NOT NULL DEFAULT 'plan'
+        CHECK (subject IN ('plan', 'request'));
+    ALTER TABLE approvals ADD COLUMN request_kind TEXT;
+    ALTER TABLE approvals ADD COLUMN request_sha256 TEXT;
+    ALTER TABLE approvals ADD COLUMN request_file TEXT;
+    ALTER TABLE approvals ADD COLUMN run_id INTEGER REFERENCES runs(id);
+    -- The request decision the Task's next Attempt is told (approvals.id);
+    -- cleared when that Attempt starts.
+    ALTER TABLE tasks ADD COLUMN request_decision_id INTEGER REFERENCES approvals(id);
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
 TRANSITION_FIELDS = frozenset({
     "retries_used", "retry_at", "cancel_requested_at", "approved", "approved_at",
     "simulated_limit_at", "pause_kind", "pause_limit_type", "pause_reset_at", "resume_at",
-    "resume_pending", "pause_requested_at", "agent",
+    "resume_pending", "pause_requested_at", "agent", "request_decision_id",
 })
 
 TASK_COLUMNS = (
@@ -746,6 +763,55 @@ class Database:
                 (task_id, str(current), str(to_state), at, reason),
             )
         return at
+
+    def decide_request(
+        self,
+        task_id: str,
+        *,
+        approved: bool,
+        via: str,
+        reason: str,
+        run_id: int,
+        kind: str,
+        request_sha256: str,
+        request_file: str,
+    ) -> int:
+        """Record a decision on an agent's request and requeue the Task, all
+        in one transaction: the Task must still be in ``needs_you`` on that
+        request (its last Attempt is ``run_id``), else :class:`StateChanged`.
+        The next Attempt continues the work (``resume_pending``) and is told
+        the decision (``request_decision_id``). Returns the approvals id."""
+        with self.tx() as c:
+            row = c.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            current = TaskState(row["state"])
+            last = c.execute("SELECT MAX(id) FROM runs WHERE task_id = ?", (task_id,)).fetchone()[0]
+            if current != TaskState.NEEDS_YOU or last != run_id:
+                raise StateChanged(f"Task {task_id} is {current}; its request was already decided")
+            check_transition(current, TaskState.QUEUED)
+            at = self._now()
+            cur = c.execute(
+                "INSERT INTO approvals (task_id, decision, at, via, subject, request_kind, "
+                "request_sha256, request_file, run_id) VALUES (?, ?, ?, ?, 'request', ?, ?, ?, ?)",
+                (task_id, "approved" if approved else "denied", at, via, kind, request_sha256,
+                 request_file, run_id),
+            )
+            decision_id = int(cur.lastrowid)
+            c.execute(
+                "UPDATE tasks SET state = ?, state_changed_at = ?, resume_pending = 1, "
+                "request_decision_id = ? WHERE id = ?",
+                (str(TaskState.QUEUED), at, decision_id, task_id),
+            )
+            c.execute(
+                "INSERT INTO transitions (task_id, from_state, to_state, at, reason, run_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, str(current), str(TaskState.QUEUED), at, reason, run_id),
+            )
+        return decision_id
+
+    def approval(self, approval_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
 
     def approvals(self, task_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(

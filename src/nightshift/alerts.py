@@ -20,7 +20,8 @@ Comedy Tasks get status lines only: never the title, the Result, the
 reason or the request, which may carry script or idea content (§1.6).
 
 An alert for a Task awaiting approval (re-approval) carries Approve / Deny
-inline buttons; their presses come back through the long poll.
+inline buttons; their presses come back through the long poll. A needs-you
+alert not yet delivered when its request is resolved is dropped, never sent.
 
 The same loop makes and sends the 8am digest (``nightshift.digest``); the
 long poll answers your commands (``nightshift.remote``).
@@ -34,7 +35,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import digest, report, spend
+from . import digest, needsyou, report, spend
 from .config import Config
 from .db import Database
 from .states import TaskState
@@ -88,12 +89,14 @@ def result_line(folder: Path) -> str | None:
 
 
 def needs_you_line(folder: Path) -> str | None:
-    """The first entry of the report's Needs you section."""
+    """The first open entry of the report's Needs you section (a resolved
+    request is not open)."""
     path = folder / "report.md"
     if not path.exists():
         return None
     _, sections = report.parse_sections(path.read_text())
-    lines = [ln.strip().lstrip("- ").replace("**", "") for ln in sections.get(2, "").splitlines()]
+    lines = [ln.strip().lstrip("- ").replace("**", "") for ln in sections.get(2, "").splitlines()
+             if not ln.startswith(report.RESOLVED_PREFIX)]
     first = next((ln for ln in lines if ln and ln != "Nothing."), None)
     return one_line(first) if first else None
 
@@ -217,6 +220,12 @@ class Notifier:
                 self.db.mark_alert(a["id"], dropped_at=iso(self.clock()))
                 self.log(f"Telegram alert for Task {a['task_id']} dropped: never delivered "
                          f"({a['tries']} tries, last error: {a['last_error']})")
+                continue
+            if a["kind"] == "needs_you" and needsyou.resolved_since(
+                    self.db, a["task_id"], a["transition_id"]):
+                self.db.mark_alert(a["id"], dropped_at=iso(self.clock()))
+                self.log(f"Telegram alert for Task {a['task_id']} dropped: its request was "
+                         "resolved before it was sent")
                 continue
             try:
                 self.api.send_message(self.user_id, a["text"], buttons=_alert_buttons(a))

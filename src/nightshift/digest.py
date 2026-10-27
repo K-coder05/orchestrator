@@ -11,7 +11,9 @@ one row per date (unique), so it is never made twice, also across restarts;
 a laptop asleep through several 8ams makes one digest on wake, for the
 latest. Made, then sent from the same outbox loop as alerts.
 
-Comedy Tasks get status lines only (§1.6), as in alerts.
+Comedy Tasks get status lines only (§1.6), as in alerts. A Task that
+needed you but whose request is resolved by the time the digest is made is
+left out of its Needs you section.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from . import alerts
+from . import alerts, needsyou
 from .config import Config
 from .db import Database
 from .states import TaskState
@@ -101,8 +103,9 @@ def digest_text(db: Database, transitions: list[Any], *, since: datetime,
     for t in transitions:
         title = next((name for name, match in SECTIONS
                       if match(t["from_state"], t["to_state"])), None)
-        if title is None:
-            continue
+        if title is None or (t["to_state"] == S.NEEDS_YOU
+                             and needsyou.resolved_since(db, t["task_id"], t["id"])):
+            continue  # a request resolved since needs nobody
         task = tasks.get(t["task_id"]) or tasks.setdefault(t["task_id"],
                                                            db.get_task(t["task_id"]))
         sections[title].append(event_line(task, t["from_state"], t["to_state"], t["reason"],

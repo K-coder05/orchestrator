@@ -109,7 +109,8 @@ def task_groups(
 @dataclass(frozen=True)
 class NeedsYouRequest:
     """One open "needs you" request: something waiting on you before its
-    Task can go on. View only until Phase 3's approve/deny buttons."""
+    Task can go on. A resolved request is no longer listed: its Task was
+    requeued and its ``needs_you.json`` moved to the logs."""
 
     task_id: str
     title: str
@@ -224,6 +225,9 @@ class ApprovalView:
     at: str
     decision: str
     via: str
+    #: What was decided: "plan", or "request" (an agent's needs-you request).
+    subject: str = "plan"
+    request_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -287,7 +291,8 @@ def task_detail(cfg: Config, db: Database, task_id: str, now: datetime) -> TaskD
                         end_reason=a["end_reason"])
             for a in db.attempts(task_id)
         ],
-        approvals=[ApprovalView(at=a["at"], decision=a["decision"], via=a["via"])
+        approvals=[ApprovalView(at=a["at"], decision=a["decision"], via=a["via"],
+                                subject=a["subject"], request_kind=a["request_kind"])
                    for a in db.approvals(task_id)],
         failovers=[
             FailoverView(at=f["at"], from_agent=f["from_agent"], to_agent=f["to_agent"],

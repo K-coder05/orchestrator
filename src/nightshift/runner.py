@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from . import failover, failures, pauses, report, spend, templates, usage
+from . import failover, failures, needsyou, pauses, report, spend, templates, usage
 from .adapters import get_adapter, load_api_key
 from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
 from .config import Config
@@ -407,6 +407,7 @@ def run_attempt(
     post_hooks: Sequence[PostHook] = (),
     max_runtime_seconds: float | None = None,
     continue_fresh: bool = False,
+    request_decision: int | None = None,
 ) -> AttemptResult:
     """Run one Attempt of a queued Task, then finalize its report.
 
@@ -424,7 +425,11 @@ def run_attempt(
     The next Attempt of a paused Task resumes its agent session when it is
     young enough, else starts fresh from ``plan.md`` + ``progress.md``; a
     resume that fails before any Step falls back to a fresh session at once
-    (``continue_fresh``).
+    (``continue_fresh``, carrying ``request_decision`` along).
+
+    After a resolved "needs you" request (``nightshift.needsyou``) the next
+    Attempt continues the same way, and its prompt states the decision and
+    the original request.
     """
     clock = clock or (lambda: now(cfg.timezone))
     control = control or AttemptControl()
@@ -460,8 +465,16 @@ def run_attempt(
     # The Task moved here from another agent (failover, §2.8): a fresh session
     # that picks up the other agent's work from plan.md + progress.md.
     switched_from = earlier[-1]["agent"] if earlier and earlier[-1]["agent"] != agent_name else None
+    # A decided "needs you" request: the next Attempt is told (once).
+    decision_id = row["request_decision_id"] if request_decision is None else request_decision
+    decision = needsyou.decision_note(db, decision_id, folder)
     if switched_from:
         prompt = failover.failover_prompt(row["prompt"], switched_from, agent_name)
+        if decision:
+            prompt += f"\n\n{decision}"
+    elif decision:
+        prompt = needsyou.fresh_prompt(row["prompt"], decision,
+                                       choice.why if choice is not None else "the resume failed")
     else:
         prompt = pauses.fresh_prompt(row["prompt"]) if continuing else row["prompt"]
     task = TaskContext(
@@ -484,7 +497,9 @@ def run_attempt(
         adapter.prior_usage = raws[-1] if raws else None
     if resume_session:
         command = adapter.resume_command(
-            resume_session, pauses.RESUME_PROMPT, task=task, permissions=permissions
+            resume_session,
+            needsyou.resume_prompt(decision) if decision else pauses.RESUME_PROMPT,
+            task=task, permissions=permissions,
         )
         how = f"resuming {choice.why}"
     else:
@@ -504,8 +519,11 @@ def run_attempt(
     progress_before = _mtime(folder / "progress.md")
     run_id = db.start_attempt(task_id, agent_name, stored_argv, str(stream_log))
     started = f"Attempt {attempt_no} started on {agent_name}" + (f", {how}" if how else "")
+    if decision:
+        verdict = db.approval(decision_id)["decision"]
+        started += f", told its needs-you request was {verdict}"
     db.transition(task_id, TaskState.RUNNING, started, run_id=run_id,
-                  set_fields={"resume_pending": 0})
+                  set_fields={"resume_pending": 0, "request_decision_id": None})
     _log(folder, f"{iso(now(cfg.timezone))} {started}: {json.dumps(stored_argv)}", redact)
 
     # Fault injection: one simulated limit per Task, after N Steps of an Attempt.
@@ -754,6 +772,7 @@ def run_attempt(
                 cfg, db, task_id, adapter_provider=adapter_provider, on_event=on_event,
                 control=control, clock=clock, post_hooks=post_hooks,
                 max_runtime_seconds=max_runtime_seconds, continue_fresh=True,
+                request_decision=decision_id,
             )
         failed_attempt = (f"Attempt {attempt_no} crashed: agent exited with code {exit_code}"
                           + (f": {err}" if err else ""))

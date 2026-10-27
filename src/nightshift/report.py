@@ -165,13 +165,21 @@ def _decisions_list(folder: Path) -> str | None:
     return "\n".join(items) or None
 
 
-def _needs_you_text(folder: Path) -> str | None:
-    path = folder / "needs_you.json"
+#: The agent's "needs you" request in the Task folder (§2.10).
+REQUEST_FILE = "needs_you.json"
+#: Resolved requests, kept in the Task's logs (``nightshift.needsyou``).
+RESOLVED_GLOB = "attempt-*.needs_you.json"
+#: How a resolved request's entry in section 2 starts: not an open request.
+RESOLVED_PREFIX = "- Resolved "
+
+
+def request_text(path: Path) -> str | None:
+    """The Needs you entry of an agent's request file, or None if there is none."""
     if not path.exists():
         return None
     try:
         d = json.loads(path.read_text())
-    except json.JSONDecodeError:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return "- The agent wrote `needs_you.json`, but it is not valid JSON. Check the Task folder."
     if not isinstance(d, dict):
         return "- The agent wrote `needs_you.json`; check the Task folder."
@@ -179,6 +187,43 @@ def _needs_you_text(folder: Path) -> str | None:
     if d.get("proposed_action"):
         out += f"\n  Proposed action: {d['proposed_action']}"
     return out
+
+
+def needs_you_section(folder: Path, body: str, needs_you: list[str] | None = None,
+                      resolved: list[str] | None = None) -> str:
+    """Section 2: Nightshift's own entries (``needs_you``), then the open
+    request in ``needs_you.json``, then what the agent wrote there, then the
+    resolved requests (``resolved``). What Nightshift wrote here before (an
+    earlier finalize, a request since resolved) is never repeated."""
+    needs_you, resolved = needs_you or [], resolved or []
+    open_request = request_text(folder / REQUEST_FILE)
+    own = [*needs_you, *filter(None, [open_request])]
+    known = {*needs_you, *resolved, "Nothing."}
+    for path in [folder / REQUEST_FILE, *sorted((folder / "logs").glob(RESOLVED_GLOB))]:
+        known.update((request_text(path) or "").splitlines())
+    agent = "" if _is_empty(body) else "\n".join(
+        ln for ln in body.splitlines() if ln not in known).strip()
+    return "\n".join(filter(None, [*own, agent, *resolved])) or "Nothing."
+
+
+def refresh_needs_you(folder: Path, *, needs_you: list[str] | None = None,
+                      resolved: list[str] | None = None, redact=lambda s: s) -> None:
+    """Rewrite only section 2 of an existing ``report.md`` (a request was
+    resolved; the rest of the report waits for the next finalize)."""
+    path = folder / "report.md"
+    if not path.exists():
+        return
+    lines = path.read_text().splitlines()
+    start = next((i for i, ln in enumerate(lines)
+                  if (m := _HEADING_RE.match(ln)) and m.group(1) == "2"), None)
+    if start is None:
+        return
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+               len(lines))
+    body = "\n".join(lines[start + 1:end]).strip()
+    section = needs_you_section(folder, body, needs_you, resolved)
+    lines[start + 1:end] = ["", section, ""]
+    path.write_text(redact("\n".join(lines) + "\n"))
 
 
 RESULT_MEANING = {
@@ -202,11 +247,13 @@ def finalize(
     needs_you: list[str] | None = None,
     spent: Mapping[str, float] | None = None,
     paid_credits: list[str] | None = None,
+    resolved: list[str] | None = None,
 ) -> str:
     """Rewrite ``report.md`` from the agent's draft plus Nightshift's data.
 
     ``needs_you`` are entries Nightshift itself adds to section 2 (e.g. a
-    deadline-driven failover); they lead the section. ``spent`` and
+    deadline-driven failover); they lead the section, and ``resolved``
+    (decided "needs you" requests) close it. ``spent`` and
     ``paid_credits`` go to section 8 (:func:`usage_section`)."""
     path = folder / "report.md"
     draft = path.read_text() if path.exists() else ""
@@ -224,15 +271,7 @@ def finalize(
         verdict += f" {result_detail}"
     body[1] = verdict + (f"\n\nAgent: {agent_line}" if agent_line else "")
 
-    needs = "\n".join([*(needs_you or []), *filter(None, [_needs_you_text(folder)])]) or None
-    if needs and not _is_empty(body[2]):
-        # A re-finalize must not add Nightshift's own entries twice.
-        kept = [ln for ln in body[2].splitlines() if ln not in (needs_you or []) and ln != "Nothing."]
-        body[2] = "\n".join(kept).strip()
-    if needs:
-        body[2] = needs if _is_empty(body[2]) else f"{needs}\n{body[2]}"
-    elif _is_empty(body[2]):
-        body[2] = "Nothing."
+    body[2] = needs_you_section(folder, body[2], needs_you, resolved)
 
     if _is_empty(body[6]):
         body[6] = _decisions_list(folder) or "None recorded."

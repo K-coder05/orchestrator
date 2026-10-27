@@ -198,7 +198,8 @@ def set_priority(ctx, task_id, level):
 @click.argument("task_id")
 @click.pass_context
 def approve(ctx, task_id):
-    """Approve a Task awaiting approval (its plan.md) and queue it."""
+    """Approve a Task awaiting approval (its plan.md) and queue it, or approve
+    the "needs you" request a Task waits on and requeue it."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
         _show(control.approve(cfg, db, task_id, via="orch approve"))
@@ -210,7 +211,8 @@ def approve(ctx, task_id):
 @click.argument("task_id")
 @click.pass_context
 def deny(ctx, task_id):
-    """Deny a Task awaiting approval; it is cancelled."""
+    """Deny a Task awaiting approval (it is cancelled), or deny the "needs
+    you" request a Task waits on (it is requeued to carry on without it)."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
         _show(control.deny(cfg, db, task_id, via="orch deny"))

@@ -63,11 +63,13 @@ def finalize(cfg: Config, db: Database, row: Mapping[str, Any], state: TaskState
 
 def report_extras(cfg: Config, db: Database, task_id: str) -> dict[str, Any]:
     """What Nightshift adds to a Task's report from its own records: Needs
-    you entries, and for section 8 the dollars spent per paid agent and the
+    you entries (resolved requests too), and for section 8 the dollars spent per paid agent and the
     paid-credit decisions (§1.5)."""
-    from . import paid  # paid imports this module
+    from . import needsyou, paid  # both import this module
 
+    row = db.get_task(task_id)
     return {"needs_you": needs_you_extra(cfg, db, task_id),
+            "resolved": needsyou.report_lines(db, task_id, Path(row["folder"])) if row else [],
             "spent": db.task_spend_by_agent(task_id),
             "paid_credits": paid.report_lines(db, task_id)}
 

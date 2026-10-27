@@ -21,12 +21,17 @@ return at once (``CANCEL_REQUESTED``/``PAUSE_REQUESTED``), and
 :func:`wait_for_cancel`/:func:`wait_for_pause` wait for it within a bound
 (``timeout=0`` only looks).
 
+Approve and deny decide a Task awaiting approval (its plan; a denied plan
+cancels the Task) or the agent's "needs you" request a Task in ``needs_you``
+waits on (``nightshift.needsyou``; approved or denied, the Task is requeued).
+
 Intake is split so a caller without a terminal can drive it step by step:
 :func:`propose` (the estimate and Task type; a planning call for a free-form
 Task), then :func:`create` or :func:`decline`, then for a Task over the plan
 threshold :func:`plan` (``plan.md``) and :func:`approve` or :func:`deny`.
 
-Every function that needs the time takes it from the caller.
+Every function that needs the time takes it from the caller (approve and
+deny date only their log line, like a plan decision).
 """
 
 from __future__ import annotations
@@ -39,14 +44,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import daemon, failures, pauses, planning, templates
+from . import daemon, failures, needsyou, pauses, planning, templates
 from . import priority as prio
 from .adapters.base import Usage
 from .config import Config, ConfigError
 from .db import Database, StateChanged
 from .runner import create_task
 from .states import TERMINAL, TaskState
-from .timeutil import iso
+from .timeutil import iso, now
 from .workspace import TaskSpec, read_task_yaml, write_task_yaml
 
 #: Surfaces other than ``orch <command>``.
@@ -172,17 +177,19 @@ def _lookup(db: Database, task_id: str) -> tuple[Any, Result | None]:
 
 
 # --------------------------------------------------------------------------
-# Approve / deny (§2.4)
+# Approve / deny (§2.4, §1.6)
 # --------------------------------------------------------------------------
 
 
 def approve(cfg: Config, db: Database, task_id: str, *, via: str) -> Result:
-    """Approve a Task awaiting approval (its plan.md) and queue it."""
+    """Approve a Task awaiting approval (its plan.md) and queue it, or approve
+    the "needs you" request a Task in ``needs_you`` waits on and requeue it."""
     return _decide(cfg, db, task_id, True, via)
 
 
 def deny(cfg: Config, db: Database, task_id: str, *, via: str) -> Result:
-    """Deny a Task awaiting approval; it is cancelled."""
+    """Deny a Task awaiting approval (it is cancelled), or deny the "needs
+    you" request a Task waits on (it is requeued, to carry on without it)."""
     return _decide(cfg, db, task_id, False, via)
 
 
@@ -191,6 +198,8 @@ def _decide(cfg: Config, db: Database, task_id: str, approve_it: bool, via: str)
     if bad:
         return bad
     state = TaskState(row["state"])
+    if state == TaskState.NEEDS_YOU:
+        return _decide_request(cfg, db, row, approve_it, via)
     if state != TaskState.AWAITING_APPROVAL:
         return refused(WRONG_STATE, f"Task {task_id} is {state}, not awaiting approval",
                        task_id, state)
@@ -206,6 +215,25 @@ def _decide(cfg: Config, db: Database, task_id: str, approve_it: bool, via: str)
                       TaskState.QUEUED, note=daemon_note(cfg))
     return Result(DENIED, f"Task {task_id} denied and cancelled.", task_id, state,
                   TaskState.CANCELLED)
+
+
+def _decide_request(cfg: Config, db: Database, row: Any, approve_it: bool, via: str) -> Result:
+    """Resolve the agent's request; approved or denied, the Task is requeued."""
+    task_id, state = row["id"], TaskState.NEEDS_YOU
+    try:
+        needsyou.resolve(cfg, db, task_id, approved=approve_it, via=via, at=now(cfg.timezone))
+    except needsyou.NotARequest:
+        reason = db.transitions(task_id)[-1]["reason"]
+        return refused(WRONG_STATE, f"Task {task_id} needs you, but not on an agent's request "
+                                    f"({reason}); approve and deny don't apply",
+                       task_id, state)
+    except StateChanged as exc:  # decided or moved meanwhile
+        return refused(STATE_CHANGED, str(exc), task_id, state)
+    if approve_it:
+        msg = f"Task {task_id}: request approved; queued, its next Attempt goes ahead."
+        return Result(APPROVED, msg, task_id, state, TaskState.QUEUED, note=daemon_note(cfg))
+    msg = f"Task {task_id}: request denied; queued, its next Attempt carries on without it."
+    return Result(DENIED, msg, task_id, state, TaskState.QUEUED, note=daemon_note(cfg))
 
 
 # --------------------------------------------------------------------------

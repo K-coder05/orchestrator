@@ -1991,3 +1991,51 @@ lasting consequences go in `docs/adr/` instead.
 - **Comedy.** A comedy Task's plan is never sent: the message says to read
   it on the dashboard or with `orch show <id>`. The proposal message leaves
   out the planner's reason and a template's inputs for comedy Tasks.
+
+## Phase 3, issue #35: resolving "needs you" requests (approve or deny, both requeue)
+
+- **`orch approve|deny <id>` decide whichever the Task waits on**: its plan
+  (`awaiting_approval`, as before; a denied plan still cancels) or the
+  agent's request (`needs_you`). One pair of commands, so Telegram's
+  `approve`/`deny` (and later the dashboard) get it through
+  `nightshift.control` with no change. The resolve logic is
+  `nightshift.needsyou`.
+- **What counts as a request.** A Task in `needs_you` whose last Attempt
+  ended `needs_you` (the agent wrote `needs_you.json` and stopped) and whose
+  file is still there. Any other `needs_you` (the per-Task spend cap, later
+  stuck detection) is refused with `wrong_state` and keeps its handling
+  (`orch cancel`). A broken `needs_you.json` is still a request (kind
+  `request`); its bytes are hashed as they are.
+- **Records.** Migration 16 adds `approvals.subject` (`plan` | `request`),
+  `request_kind`, `request_sha256` (of the file's bytes), `request_file`
+  (the kept copy) and `run_id` (the Attempt that raised it), and
+  `tasks.request_decision_id`. The decision, the requeue (with
+  `resume_pending`) and its transition are one transaction that also checks
+  the Task is still on that same request, so a second tap or surface is
+  refused (`state_changed`/`wrong_state`). The transition reason names the
+  surface (`(orch deny)`, `(telegram)`, ...), so the clean-week check counts
+  it; it leaves out the request's kind, which is the agent's text.
+- **The request file moves to `logs/attempt-<n>.needs_you.json`** (n = the
+  Attempt that raised it), copied before the decision and removed after.
+  With it gone, the inbox and `status` no longer list the request, and a
+  `needs_you.json` a later Attempt writes is a fresh request.
+- **The next Attempt is told once.** Its prompt states the decision (approved:
+  go ahead within the Task's permissions; denied: don't, carry on without it
+  or raise a different request) and the original kind, summary, details and
+  proposed action. Same session when §2.6 allows (the told text is the
+  resume prompt), else fresh from `plan.md` + `progress.md` with the same
+  text appended; a failed resume carries the decision into its fresh
+  fallback, and a failover appends it to the failover prompt.
+  `request_decision_id` is cleared when that Attempt starts; later Attempts
+  rely on the agent's `progress.md`, like any other decision it made.
+- **Report.** Section 2 lists each resolved request as one line starting
+  `- Resolved `, after anything still open, and is rewritten at once when
+  the request is decided (only that section; the rest waits for the next
+  finalize). An earlier rendering of a request since resolved, and
+  Nightshift's own entries, are never repeated on a re-finalize.
+- **Telegram.** The needs-you alert line reads the first entry that is not
+  `- Resolved `. A needs-you alert still undelivered when its request is
+  resolved is dropped, and the 8am digest leaves resolved requests out of
+  its Needs you section. No Approve / Deny buttons on needs-you alerts yet:
+  the commands work; buttons were not asked for here.
+- **SPEC §7** records the deny semantics as resolved.

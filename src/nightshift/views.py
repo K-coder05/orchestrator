@@ -105,6 +105,8 @@ def format_show(d: queries.TaskDetail) -> str:
     if row["resume_pending"] and open_:
         out += ["", "Next Attempt continues paused work (same session if under "
                 f"{d.resume_session_max_hours:g}h old)"]
+    if row["request_decision_id"] and open_ and d.approvals:
+        out.append(f"Next Attempt is told its needs-you request was {d.approvals[-1].decision}")
     if row["pause_requested_at"] and d.state == TaskState.RUNNING:
         out += ["", f"Pause requested at {row['pause_requested_at']}"]
     if row["cancel_requested_at"] and open_:
@@ -135,7 +137,9 @@ def format_show(d: queries.TaskDetail) -> str:
     if d.approvals:
         out += ["", "Approvals:"]
         for a in d.approvals:
-            out.append(f"  {_short_time(a.at)}  {a.decision} via {a.via}")
+            what = (f"{a.request_kind or 'request'} request " if a.subject == "request"
+                    else "plan ")
+            out.append(f"  {_short_time(a.at)}  {what}{a.decision} via {a.via}")
 
     if d.failovers:
         out += ["", "Failovers:"]

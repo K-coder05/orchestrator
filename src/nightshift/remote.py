@@ -8,8 +8,8 @@ message from ``telegram.user_id`` to :func:`run`, which answers through
 |-------------------------|---------------------------------------------------|
 | ``status``              | daemon up or down, running Task, queue, needs you |
 | ``list [state ...]``    | Tasks grouped by status, optionally some states   |
-| ``approve <id>``        | approve a Task awaiting approval                  |
-| ``deny <id>``           | deny it (cancelled)                               |
+| ``approve <id>``        | approve a plan, or a needs-you request (requeued) |
+| ``deny <id>``           | deny it (a plan: cancelled; a request: requeued)  |
 | ``cancel <id>``         | cancel an unfinished Task                         |
 | ``pause <id>``          | pause it until resumed                            |
 | ``resume <id>``         | queue a paused Task now                           |
@@ -70,8 +70,8 @@ TITLE_CHARS = 50
 HELP = """Nightshift commands:
 status - daemon, running Task, queue, needs you
 list [state ...] - Tasks by status (e.g. list queued failed)
-approve <id> - approve a Task awaiting approval
-deny <id> - deny it (it is cancelled)
+approve <id> - approve a Task's plan, or its needs-you request
+deny <id> - deny it (a plan: cancelled; a request: requeued without it)
 cancel <id> - cancel an unfinished Task
 pause <id> - pause a Task until you resume it
 resume <id> - queue a paused Task now
@@ -499,9 +499,9 @@ def _decision_press(cfg: Config, db: Database, task_id: str, approve_it: bool, *
 
 
 def decision_state(db: Database, task_id: str) -> str:
-    """A Task's state now and its last plan decision."""
+    """A Task's state now and its last plan or request decision."""
     text = f"Task {task_id} is {db.task_state(task_id)}"
     last = db.approvals(task_id)
     if last:
-        text += f" (plan {last[-1]['decision']} via {last[-1]['via']})"
+        text += f" ({last[-1]['subject']} {last[-1]['decision']} via {last[-1]['via']})"
     return text + "."
