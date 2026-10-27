@@ -1,15 +1,18 @@
 """The background daemon (§3.1 item 5): queue runner, launchd plist, lock.
 
 ``launchd`` keeps the daemon alive (KeepAlive). Inside it the queue runner
-takes queued Tasks one at a time, holding the machine awake through the host
-seam only while a Task is ``running`` (§1.1). Before every pick the
+keeps a set of running Attempts, each on its own thread with its own control
+handle and DB connection, up to ``daemon.max_running`` at once (1 until the
+per-agent lanes of §5 item 5 exist). It holds the machine awake through the
+host seam while any Task is ``running`` and releases it once none is (§1.1). Before every pick the
 scheduler applies each Schedule's Catch-up and Overlap rules
 (``nightshift.schedules``); it also does so right at start and right after
 the machine wakes from sleep (§2.5).
 
-Exactly one Task at a time is guaranteed twice over: the runner is a single
-serial loop, and only the process holding the daemon lock (an exclusive
-``flock`` on ``<data>/daemon.lock``) may run Tasks at all.
+At most ``max_running`` Tasks at a time is guaranteed twice over: the runner
+starts an Attempt only while fewer are running, and only the process holding
+the daemon lock (an exclusive ``flock`` on ``<data>/daemon.lock``) may run
+Tasks at all.
 """
 
 from __future__ import annotations
@@ -68,6 +71,11 @@ def poll_seconds(cfg: Config) -> float:
     return float((cfg.data.get("daemon") or {}).get("poll_seconds", 5))
 
 
+def running_cap(cfg: Config) -> int:
+    """How many Attempts the queue runner may run at once."""
+    return int((cfg.data.get("daemon") or {}).get("max_running", 1))
+
+
 # --------------------------------------------------------------------------
 # Lock
 # --------------------------------------------------------------------------
@@ -119,6 +127,17 @@ def read_state(cfg: Config) -> dict[str, Any] | None:
         return json.loads(state_path(cfg).read_text())
     except (OSError, ValueError):
         return None
+
+
+def running_tasks(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """The running Tasks a ``daemon.json`` lists, oldest first: each a dict
+    with ``id`` (and ``agent`` and ``started_at`` when known). A file from a
+    daemon older than the list names at most one, as ``current_task``."""
+    listed = state.get("running_tasks")
+    if isinstance(listed, list):
+        return [t for t in listed if isinstance(t, dict) and t.get("id")]
+    current = state.get("current_task")
+    return [{"id": current}] if current else []
 
 
 # --------------------------------------------------------------------------
@@ -257,11 +276,27 @@ def format_access_problems(problems: list[AccessProblem], python: str | None = N
 # --------------------------------------------------------------------------
 
 
-class QueueRunner:
-    """Runs queued Tasks one at a time.
+@dataclass
+class RunningAttempt:
+    """One Attempt the queue runner has running: its Task, control handle
+    and thread."""
 
-    ``run_attempt_fn`` is injectable so tests can drive the runner with a
-    fake Attempt; production uses :func:`nightshift.runner.run_attempt`.
+    task_id: str
+    agent: str
+    started_at: str
+    control: AttemptControl
+    thread: threading.Thread | None = None
+
+
+class QueueRunner:
+    """Runs queued Tasks, at most ``max_running`` at a time.
+
+    Each Attempt runs on its own thread with its own control handle and DB
+    connection (SQLite connections stay in their thread); the runner's own
+    thread picks Tasks and waits. ``run_attempt_fn`` is injectable so tests
+    can drive the runner with a fake Attempt; production uses
+    :func:`nightshift.runner.run_attempt`. ``max_running`` overrides
+    ``daemon.max_running`` (tests).
     """
 
     def __init__(
@@ -277,6 +312,7 @@ class QueueRunner:
         post_hooks_for: Callable[[Config, Any], Any] | None = None,
         prober: Callable[[str], Any] | None = None,
         alerts: AlertService | None = None,
+        max_running: int | None = None,
     ):
         self.cfg = cfg
         self.db = db
@@ -294,8 +330,14 @@ class QueueRunner:
             self.cfg, self.db, agent, adapter_provider=self.adapter_provider, clock=self.clock))
         # Telegram alerts (§2.12); kicked after each Attempt so they go out at once.
         self.alerts = alerts
-        self.current: str | None = None
-        self.control: AttemptControl | None = None
+        self.max_running = max_running if max_running is not None else running_cap(cfg)
+        #: The running Attempts by Task id, in the order they started.
+        self.running: dict[str, RunningAttempt] = {}
+        # Guards `running`, the awake hold and the state file; `_changed` is
+        # notified whenever an Attempt ends.
+        self._lock = threading.RLock()
+        self._changed = threading.Condition(self._lock)
+        self._ended = 0  # Attempts ended so far
         self._wake_mark: tuple[datetime, float] | None = None
         self.started_at = iso(now(cfg.timezone))
         self._stop = threading.Event()
@@ -304,19 +346,40 @@ class QueueRunner:
     def log(self, msg: str) -> None:
         self._log(self.cfg.secrets.redact(f"{iso(now(self.cfg.timezone))} {msg}"))
 
+    @property
+    def current(self) -> str | None:
+        """The oldest running Task (the only one at a cap of 1), or None."""
+        first = self._oldest()
+        return first.task_id if first else None
+
+    @property
+    def control(self) -> AttemptControl | None:
+        """The control handle of the oldest running Attempt, or None."""
+        first = self._oldest()
+        return first.control if first else None
+
+    def _oldest(self) -> RunningAttempt | None:
+        return next(iter(list(self.running.values())), None)
+
     def write_state(self) -> None:
-        state = {
-            "pid": os.getpid(),
-            "started_at": self.started_at,
-            "updated_at": iso(now(self.cfg.timezone)),
-            "current_task": self.current,
-            "awake_held": self.host.awake_held(),
-        }
-        path = state_path(self.cfg)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2) + "\n")
-        tmp.replace(path)
+        with self._lock:
+            running = list(self.running.values())
+            state = {
+                "pid": os.getpid(),
+                "started_at": self.started_at,
+                "updated_at": iso(now(self.cfg.timezone)),
+                "max_running": self.max_running,
+                "running_tasks": [{"id": r.task_id, "agent": r.agent, "started_at": r.started_at}
+                                  for r in running],
+                # The oldest running Task, as daemons before the list wrote it.
+                "current_task": running[0].task_id if running else None,
+                "awake_held": self.host.awake_held(),
+            }
+            path = state_path(self.cfg)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=2) + "\n")
+            tmp.replace(path)
 
     # -- control ----------------------------------------------------------------
     @property
@@ -324,10 +387,11 @@ class QueueRunner:
         return self._stop.is_set()
 
     def stop(self) -> None:
-        """Stop after (or by interrupting) the current Attempt. Signal-safe."""
+        """Stop by interrupting every running Attempt (each Task goes back
+        to ``queued``). Signal-safe: it takes no lock."""
         self._stop.set()
-        if self.control is not None:
-            self.control.request_stop()
+        for r in list(self.running.values()):
+            r.control.request_stop()
 
     # -- the loop -------------------------------------------------------------
     def recover(self) -> list[str]:
@@ -396,9 +460,10 @@ class QueueRunner:
         self.apply_schedules(schedules.TRIGGER_WAKE)
         return True
 
-    def run_next(self) -> str | None:
-        """Run one Attempt of the next queued Task; None if the queue is empty."""
-        if self.stopping:
+    def start_next(self) -> str | None:
+        """Start an Attempt of the next queued Task on its own thread; None
+        if no slot is free, the runner is stopping or nothing may start."""
+        if self.stopping or len(self.running) >= self.max_running:
             return None
         self.apply_schedules()
         self.promote_retries()
@@ -418,51 +483,107 @@ class QueueRunner:
         # Proactive thresholds (§1.5) hold back new Tasks only; nothing fails
         # over, since the agent is not out yet.
         thresholds = usage.threshold_holds(self.cfg, self.db, self.clock())
-        row = pick_next(self.cfg, self.db.tasks_in_state(TaskState.QUEUED), self.clock(),
+        # A Task just started stays `queued` until its Attempt thread moves it
+        # to `running`; never pick it a second time.
+        queued = [r for r in self.db.tasks_in_state(TaskState.QUEUED) if r["id"] not in self.running]
+        row = pick_next(self.cfg, queued, self.clock(),
                         held_agents=thresholds.all | held,
                         held_background=thresholds.background)
         if row is None:
             return None
         task_id = row["id"]
-        self.current = task_id
-        self.control = AttemptControl()
-        # Held only while this Task runs; released in `finally` whatever happens.
-        self.host.hold_awake()
-        self.write_state()
+        slot = RunningAttempt(task_id, row["agent"], iso(now(self.cfg.timezone)), AttemptControl())
+        with self._lock:
+            self.running[task_id] = slot
+            if self.stopping:
+                # stop() came since the check above and may have missed this
+                # slot: start nothing (the Task stays queued).
+                del self.running[task_id]
+                return None
+            # Held while any Task runs; released when the last one ends.
+            self.host.hold_awake()
+            self.write_state()
         eff = evaluate(self.cfg, row, self.clock()).effective
         prio = row["priority"] if eff == row["priority"] else f"{row['priority']}, effective {eff}"
         self.log(f"Task {task_id} starting ({prio}, {row['agent']}): {row['title']}")
+        slot.thread = threading.Thread(target=self._attempt, args=(slot, dict(row)),
+                                       name=f"attempt-{task_id}", daemon=True)
+        slot.thread.start()
+        return task_id
+
+    def _attempt(self, slot: RunningAttempt, row: dict[str, Any]) -> None:
+        """One Attempt, on its own thread with its own DB connection."""
+        task_id = slot.task_id
+        db: Database | None = None
         try:
+            db = Database(self.db.path, tz=self.db.tz)
             result = self.run_attempt_fn(
                 self.cfg,
-                self.db,
+                db,
                 task_id,
                 adapter_provider=self.adapter_provider,
-                control=self.control,
+                control=slot.control,
                 clock=self.clock,
                 post_hooks=self.post_hooks_for(self.cfg, row),
             )
             self.log(f"Task {task_id} -> {result.state}")
         except Exception as exc:  # never let one Task kill the daemon
             self.log(f"Task {task_id} crashed Nightshift: {type(exc).__name__}: {exc}")
-            fail_unstartable(self.cfg, self.db, task_id, f"{type(exc).__name__}: {exc}")
+            try:
+                db = db or Database(self.db.path, tz=self.db.tz)
+                fail_unstartable(self.cfg, db, task_id, f"{type(exc).__name__}: {exc}")
+            except Exception as again:
+                self.log(f"Task {task_id} could not be failed: {type(again).__name__}: {again}")
         finally:
-            self.host.release_awake()
-            self.current = None
-            self.control = None
-            self.write_state()
+            if db is not None:
+                db.close()
+            with self._lock:
+                self.running.pop(task_id, None)
+                if not self.running:
+                    self.host.release_awake()
+                self.write_state()
+                self._ended += 1
+                self._changed.notify_all()
             if self.alerts is not None:
                 self.alerts.kick()
+
+    def wait(self, task_id: str, timeout: float | None = None) -> None:
+        """Wait until ``task_id``'s Attempt ends (at once if it isn't running)."""
+        with self._changed:
+            self._changed.wait_for(lambda: task_id not in self.running, timeout)
+
+    def _wait_for_an_end(self, since: int) -> None:
+        """Wait until an Attempt has ended after the ``since``-th."""
+        with self._changed:
+            self._changed.wait_for(lambda: self._ended != since)
+
+    def wait_all(self) -> None:
+        """Wait until no Attempt is running."""
+        with self._changed:
+            self._changed.wait_for(lambda: not self.running)
+
+    def run_next(self) -> str | None:
+        """Run one Attempt of the next queued Task to its end; None if
+        nothing may start."""
+        task_id = self.start_next()
+        if task_id is not None:
+            self.wait(task_id)
         return task_id
 
     def drain(self) -> list[str]:
-        """Run queued Tasks until the queue is empty or a stop is requested."""
+        """Run queued Tasks until the queue is empty and nothing runs, or a
+        stop is requested (then wait for the running Attempts to end)."""
         ran: list[str] = []
-        while not self.stopping:
-            tid = self.run_next()
-            if tid is None:
+        while True:
+            since = self._ended
+            while not self.stopping:
+                tid = self.start_next()
+                if tid is None:
+                    break
+                ran.append(tid)
+            if not self.running:
                 break
-            ran.append(tid)
+            self._wait_for_an_end(since)
         return ran
 
     def serve(self, *, poll: float | None = None, exit_when_idle: bool = False) -> None:
@@ -481,6 +602,9 @@ class QueueRunner:
                     break
                 self._stop.wait(poll)
         finally:
+            if self.running:  # an error in the loop: don't leave Attempts behind
+                self.stop()
+                self.wait_all()
             self.host.release_awake()
             self.log("daemon stopped")
             try:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import plistlib
 import threading
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from click.testing import CliRunner
 
 from nightshift import cli, daemon
 from nightshift.daemon import DaemonLock, QueueRunner
+from nightshift.db import Database
 from nightshift.host import FakeHost
 from nightshift.runner import create_task
 from nightshift.states import TaskState
@@ -298,3 +300,251 @@ def test_daemon_run_exit_when_idle(config_dir, fake_host):
     assert r.exit_code == 0, r.output
     assert "daemon started" in r.output and "daemon stopped" in r.output
     assert fake_host.awake_log == []
+
+
+# --------------------------------------------------------------------------
+# A set of running Attempts (#44): driven at a cap of 2
+# --------------------------------------------------------------------------
+
+
+class GatedAttempts:
+    """Fake Attempts that run until the test releases them, each on the
+    runner's Attempt thread with that thread's own DB connection."""
+
+    def __init__(self, host: FakeHost):
+        self.host = host
+        self.gates: dict[str, threading.Event] = {}
+        self.started: list[str] = []
+        self.dbs: set[int] = set()
+        self.cond = threading.Condition()
+
+    def gate(self, task_id: str) -> threading.Event:
+        with self.cond:
+            return self.gates.setdefault(task_id, threading.Event())
+
+    def __call__(self, cfg, db, task_id, *, control=None, **_kw):
+        db.transition(task_id, TaskState.RUNNING, "Attempt 1 started")
+        with self.cond:
+            self.started.append(task_id)
+            self.dbs.add(id(db))
+            self.cond.notify_all()
+        stopped = not self.gate(task_id).wait(10) or control.stop_requested
+        state = TaskState.QUEUED if stopped else TaskState.DONE
+        db.transition(task_id, state, "fake stopped" if stopped else "fake finished")
+        return _Result(state)
+
+    def wait_started(self, n: int) -> None:
+        with self.cond:
+            assert self.cond.wait_for(lambda: len(self.started) >= n, 10), self.started
+
+
+def _ids(state):
+    return [t["id"] for t in daemon.running_tasks(state)]
+
+
+class _Daemon(threading.Thread):
+    """The queue runner on its own thread with its own DB connection, as
+    in production (SQLite connections stay in their thread)."""
+
+    def __init__(self, cfg, host, *, serve=False, **kw):
+        super().__init__()
+        self.cfg, self.host, self.serve, self.kw = cfg, host, serve, kw
+        self.ready = threading.Event()
+        self.ran: list[str] = []
+        self.runner: QueueRunner | None = None
+
+    def run(self):
+        ddb = Database(self.cfg.db_path, tz=self.cfg.timezone)
+        try:
+            self.runner = QueueRunner(self.cfg, ddb, self.host, max_running=2, **self.kw)
+            self.ready.set()
+            if self.serve:
+                self.runner.serve(poll=0.01)
+            else:
+                self.ran = self.runner.drain()
+        finally:
+            self.ready.set()
+            ddb.close()
+
+    def __enter__(self):
+        self.start()
+        assert self.ready.wait(10) and self.runner is not None
+        return self.runner
+
+    def __exit__(self, *exc):
+        if exc[0] is not None and self.runner is not None:
+            self.runner.stop()
+        self.join(60)
+        assert not self.is_alive()
+
+
+def test_cap_two_runs_two_at_once_holds_awake_until_none_runs_and_lists_both(cfg, db):
+    host = FakeHost()
+    a = create_task(cfg, db, "a").spec.id
+    b = create_task(cfg, db, "b").spec.id
+    c = create_task(cfg, db, "c").spec.id
+    fake = GatedAttempts(host)
+    d = _Daemon(cfg, host, run_attempt_fn=fake)
+    try:
+        runner = d.__enter__()
+        fake.wait_started(2)
+        assert fake.started == [a, b] and runner.current == a
+        assert host.awake_held()
+        state = daemon.read_state(cfg)
+        assert _ids(state) == [a, b] and state["current_task"] == a
+        assert state["max_running"] == 2 and state["awake_held"] is True
+        assert [t_["agent"] for t_ in state["running_tasks"]] == ["claude", "claude"]
+        assert db.task_state(c) == TaskState.QUEUED  # no free slot
+
+        fake.gate(a).set()  # a ends: c takes its slot; the Mac stays awake
+        fake.wait_started(3)
+        assert host.awake_log == ["hold"]
+        assert _ids(daemon.read_state(cfg)) == [b, c]
+    finally:
+        for g in (a, b, c):
+            fake.gate(g).set()
+        d.__exit__(None, None, None)
+    assert d.ran == [a, b, c]
+    assert all(db.task_state(x) == TaskState.DONE for x in (a, b, c))
+    assert host.awake_log == ["hold", "release"] and not host.awake_held()
+    after = daemon.read_state(cfg)
+    assert after["running_tasks"] == [] and after["current_task"] is None
+    assert after["awake_held"] is False
+    assert len(fake.dbs) >= 2  # each Attempt thread had its own connection
+    assert runner.running == {} and runner.control is None
+
+
+def test_cap_two_a_crash_in_one_attempt_leaves_the_other_running(cfg, db):
+    host = FakeHost()
+    bad = create_task(cfg, db, "bad").spec.id
+    good = create_task(cfg, db, "good").spec.id
+    fake = GatedAttempts(host)
+
+    def attempt(cfg_, db_, task_id, **kw):
+        if task_id == bad:
+            fake.wait_started(1)
+            raise RuntimeError("boom")
+        return fake(cfg_, db_, task_id, **kw)
+
+    d = _Daemon(cfg, host, run_attempt_fn=attempt)
+    try:
+        runner = d.__enter__()
+        fake.wait_started(1)
+        for _ in range(500):
+            if db.task_state(bad) == TaskState.FAILED:
+                break
+            threading.Event().wait(0.01)
+        assert db.task_state(bad) == TaskState.FAILED
+        assert runner.current == good and host.awake_held()
+    finally:
+        fake.gate(good).set()
+        d.__exit__(None, None, None)
+    assert db.task_state(good) == TaskState.DONE
+    assert host.awake_log == ["hold", "release"]
+
+
+def _wait_running(runner, n):
+    for _ in range(1000):
+        live = list(runner.running.values())
+        if len(live) >= n and all(r.control.proc is not None for r in live):
+            return
+        threading.Event().wait(0.01)
+    raise AssertionError("Attempts did not start")
+
+
+def test_cap_two_stop_requeues_every_running_task(cfg, db, env):  # noqa: F811
+    env.setenv("FAKE_SLEEP", "30")
+    host = FakeHost()
+    a = create_task(cfg, db, "slow a").spec.id
+    b = create_task(cfg, db, "slow b").spec.id
+    runner = QueueRunner(cfg, db, host, adapter_provider=fake_provider, max_running=2)
+    seen = {}
+
+    def stop_when_both_run():
+        try:
+            _wait_running(runner, 2)
+            seen.update(daemon.read_state(cfg))
+        finally:
+            runner.stop()
+
+    t = threading.Thread(target=stop_when_both_run)
+    t.start()
+    runner.serve(poll=0.01)
+    t.join()
+    assert _ids(seen) == [a, b] and seen["awake_held"] is True
+    for tid in (a, b):
+        assert db.task_state(tid) == TaskState.QUEUED
+        [attempt] = db.attempts(tid)
+        assert attempt["outcome"] == "interrupted" and attempt["ended_at"]
+        assert "requeued" in db.transitions(tid)[-1]["reason"]
+    assert host.awake_log == ["hold", "release"] and not host.awake_held()
+    assert not daemon.state_path(cfg).exists()
+
+
+def test_cap_two_cancel_and_pause_reach_the_right_attempt(cfg, db, env, monkeypatch):  # noqa: F811
+    from datetime import datetime
+
+    from nightshift import control
+
+    env.setenv("FAKE_SLEEP", "30")
+    monkeypatch.setattr(daemon, "daemon_running", lambda cfg: True)
+    host = FakeHost()
+    a = create_task(cfg, db, "slow a").spec.id
+    b = create_task(cfg, db, "slow b").spec.id
+    d = _Daemon(cfg, host, adapter_provider=fake_provider)
+    try:
+        runner = d.__enter__()
+        _wait_running(runner, 2)
+        at = datetime.now()
+        assert control.cancel(cfg, db, b, via="test", at=at).action == control.CANCEL_REQUESTED
+        assert control.wait_for_cancel(cfg, db, b, timeout=20).action == control.CANCELLED
+        assert db.task_state(a) == TaskState.RUNNING and runner.current == a
+        assert _ids(daemon.read_state(cfg)) == [a] and host.awake_held()
+        assert control.pause(cfg, db, a, via="test", at=at).action == control.PAUSE_REQUESTED
+        assert control.wait_for_pause(cfg, db, a, timeout=20).action == control.PAUSED
+    finally:
+        runner.stop()
+        d.__exit__(None, None, None)
+    assert db.task_state(b) == TaskState.CANCELLED
+    assert db.get_task(a)["pause_kind"] == "by_hand"
+    assert host.awake_log == ["hold", "release"]
+
+
+def test_recover_settles_several_orphaned_running_tasks(cfg, db):
+    orphans = []
+    for n in range(2):
+        tid = create_task(cfg, db, f"orphan {n}").spec.id
+        run = db.start_attempt(tid, "claude", ["claude"], "logs/attempt-1.claude.jsonl")
+        db.transition(tid, TaskState.RUNNING, "Attempt 1 started", run_id=run)
+        orphans.append(tid)
+    host = FakeHost()
+    runner = QueueRunner(cfg, db, host, run_attempt_fn=GatedAttempts(host), max_running=2)
+    assert sorted(runner.recover()) == sorted(orphans)
+    for tid in orphans:
+        assert db.task_state(tid) == TaskState.RETRY_WAIT
+        assert db.attempts(tid)[0]["outcome"] == "failed"
+    assert db.tasks_in_state(TaskState.RUNNING) == []
+    assert host.awake_log == []
+
+
+def test_shipped_cap_is_one(cfg, db):
+    assert cfg.data["daemon"]["max_running"] == 1
+    assert QueueRunner(cfg, db, FakeHost()).max_running == 1
+
+
+def test_daemon_status_lists_every_running_task(config_dir, fake_host, cfg, monkeypatch):
+    monkeypatch.setattr(daemon, "daemon_running", lambda cfg: True)
+    path = daemon.state_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "pid": 1, "started_at": "s", "awake_held": True, "current_task": "t1",
+        "running_tasks": [{"id": "t1", "agent": "claude", "started_at": "x"},
+                          {"id": "t2", "agent": "gemini", "started_at": "y"}]}))
+    out = _orch(config_dir, "daemon", "status").output
+    assert "running       t1 (claude, since x)" in out
+    assert "running       t2 (gemini, since y)" in out
+    # A state file from a daemon before the list.
+    path.write_text(json.dumps({"pid": 1, "started_at": "s", "current_task": "t9"}))
+    assert "running       t9" in _orch(config_dir, "daemon", "status").output
+    path.write_text(json.dumps({"pid": 1, "started_at": "s", "current_task": None}))
+    assert "running       none" in _orch(config_dir, "daemon", "status").output

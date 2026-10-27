@@ -561,6 +561,13 @@ def _validate(data: dict[str, Any]) -> None:
     poll = (data.get("daemon") or {}).get("poll_seconds", 5)
     if isinstance(poll, bool) or not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("daemon.poll_seconds must be a positive number")
+    cap = (data.get("daemon") or {}).get("max_running", 1)
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+        raise ConfigError("daemon.max_running must be a positive whole number")
+    if cap > 1:
+        raise ConfigError("daemon.max_running must be 1 for now: running Attempts in parallel "
+                          "needs the per-agent lanes (one Claude/Codex Task, one Gemini Task), "
+                          "which aren't built yet")
     dash = data.get("dashboard") or {}
     if not isinstance(dash, dict):
         raise ConfigError("config section 'dashboard' must be a mapping")

@@ -730,8 +730,13 @@ def daemon_status(ctx):
     click.echo(f"daemon    {'running' if running else 'not running'}"
                + (f" (pid {state['pid']}, since {state['started_at']})" if state else ""))
     if state:
-        current = state.get("current_task")
-        click.echo(f"  current Task  {current or 'none'}")
+        running = daemon.running_tasks(state)
+        if not running:
+            click.echo("  running       none")
+        for t in running:
+            since = f", since {t['started_at']}" if t.get("started_at") else ""
+            agent = f" ({t['agent']}{since})" if t.get("agent") else ""
+            click.echo(f"  running       {t['id']}{agent}")
         click.echo(f"  awake held    {'yes (caffeinate)' if state.get('awake_held') else 'no'}")
     db = Database(cfg.db_path, tz=cfg.timezone)
     try:

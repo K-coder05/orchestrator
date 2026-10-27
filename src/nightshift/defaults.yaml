@@ -235,6 +235,10 @@ daemon:
   label: com.nightshift.daemon
   # How often the idle daemon checks for newly queued Tasks.
   poll_seconds: 5
+  # How many Attempts may run at once. Only 1 for now: running two needs
+  # the per-agent lanes of SPEC §5 item 5 (one Claude/Codex Task and one
+  # Gemini Task), which aren't built yet.
+  max_running: 1
 
 dashboard:
   # Read-only web dashboard (§4 item 8), served by its own launchd agent

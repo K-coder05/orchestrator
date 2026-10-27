@@ -2775,3 +2775,69 @@ lasting consequences go in `docs/adr/` instead.
 - **Not done here:** parallel agents (#44, #45). The real-CLI test of the
   stall guard (`test_the_stall_guard_ends_the_hang`) now expects a stuck
   Attempt; it is opt-in and wasn't re-run.
+
+## Phase 3, issue #44: the queue runner tracks a set of running Attempts (cap 1)
+
+A prefactor for #45 (two agents in parallel). Nothing changes at the
+shipped cap of 1.
+
+- **`QueueRunner.running`**: the running Attempts by Task id, in start
+  order. Each is a `RunningAttempt` (Task, agent, start time, its own
+  `AttemptControl`, its own thread). `start_next()` starts the next Task's
+  Attempt on a new thread while fewer than `max_running` run;
+  `run_next()` is `start_next()` plus waiting for that Attempt (as before);
+  `drain()` fills free slots, waits for an Attempt to end, and repeats until
+  nothing is queued and nothing runs. With the cap reached, `start_next()`
+  returns before the pre-pick work (Schedules, retries, pauses, spend caps,
+  failover, paid-credit rule, thresholds), so at cap 1 that work runs
+  exactly as often as before: once per pick. `current` and `control` remain
+  as properties naming the oldest running Attempt (the only one at cap 1).
+- **Each Attempt thread opens its own DB connection** (SQLite connections
+  stay in their thread, as the watchdog and spend watcher already do); the
+  runner's own connection is used only for picking. This holds at cap 1 too:
+  one code path, not a serial one plus a parallel one.
+- **A Task just started stays `queued`** until its Attempt thread moves it
+  to `running`, so the pick skips Tasks already in `running`. The cap-2
+  tests caught the same Task being started twice without it.
+- **Awake hold:** taken when an Attempt starts (idempotent in both hosts),
+  released when the last running Attempt ends, under one lock with the set
+  and the state file. At cap 1 the hold/release log is unchanged.
+- **`daemon.json`** gains `running_tasks` (each `id`, `agent`,
+  `started_at`, oldest first) and `max_running`. `current_task` stays, as
+  the oldest running Task, so a reader of the old format keeps working.
+  `daemon.running_tasks(state)` reads either format. `orch daemon status`
+  prints one `running` line per Task (agent and start time), or `running
+  none`; this replaces the `current Task` line.
+- **Stop:** `stop()` asks every running Attempt to stop (no lock, so it is
+  still signal-safe), and `drain()` waits for them all; each Task is
+  requeued as before. If `stop()` lands between the free-slot check and
+  registering a new Attempt, the new one is dropped before it starts. If
+  the serve loop raises with Attempts running, they're stopped and waited
+  for before the awake hold is released.
+- **Cancel and pause** already reach the right Attempt: `orch cancel` and
+  `orch pause` set columns on that Task's row, and each Attempt's watchdog
+  reads its own Task's row. Tested with two running.
+- **Crash recovery** (`fail_orphaned`) already settled every Task left
+  `running`; now tested with two.
+- **The cap: `daemon.max_running`, 1 in the shipped config.** Config
+  validation rejects anything but 1 for now: above 1 the runner would run
+  two Claude Tasks at once, which §5 item 5 forbids, and lanes are #45's
+  job. #45 relaxes the check. Tests pass `QueueRunner(max_running=2)`.
+- **Other places that assume one running Task**, left for #45 (its
+  acceptance criteria name them): the dashboard live tail (`LiveTail`,
+  `/live`) follows the oldest running Task; tonight's queue preview
+  (`tonight._running`) counts only the oldest. The dashboard's `running`
+  group and Telegram `status` already list every running Task from the DB.
+  The dashboard doesn't read `daemon.json`; its source of truth is the
+  Tasks table, which already lists them all. Spend caps and the
+  paid-credit rule with two Attempts recording spend at once are also
+  #45's (each spend watcher already has its own connection).
+- **Tests** (`tests/test_daemon.py`, `max_running=2`, the runner on its
+  own thread with its own connection as in production): two gated fake
+  Attempts at once with a third waiting, the state file listing both, then
+  the next Task taking the freed slot with the Mac held awake throughout
+  (one hold, one release); a crash in one Attempt leaving the other
+  running; a daemon stop requeueing two real fake-agent Attempts; cancel of
+  one and pause of the other; recovery of two orphans; `orch daemon status`
+  with two Tasks and with an old-format file; the shipped cap and config
+  validation (`tests/test_config.py`). Existing tests are unchanged.
