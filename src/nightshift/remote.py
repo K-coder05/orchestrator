@@ -13,7 +13,7 @@ message from ``telegram.user_id`` to :func:`run`, which answers through
 | ``cancel <id>``         | cancel an unfinished Task                         |
 | ``pause <id>``          | pause it until resumed                            |
 | ``resume <id>``         | queue a paused Task now                           |
-| ``retry <id>``          | retry a failed or partial Task                    |
+| ``retry <id>``          | retry a failed, partial or stuck Task             |
 | ``priority <id> <P>``   | set its Priority (urgent, normal, background)     |
 | ``add <prompt>``        | a free-form Task (estimate, then Create button)   |
 | ``add <template> <req>``| a Task from a template                            |
@@ -75,7 +75,7 @@ deny <id> - deny it (a plan: cancelled; a request: requeued without it)
 cancel <id> - cancel an unfinished Task
 pause <id> - pause a Task until you resume it
 resume <id> - queue a paused Task now
-retry <id> - retry a failed or partial Task
+retry <id> - retry a failed, partial or stuck Task
 priority <id> <urgent|normal|background> - set its Priority
 add <prompt> - a new Task: estimate and Task type, then tap Create
 add <template> <request> - a new Task from a template

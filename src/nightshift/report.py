@@ -118,9 +118,10 @@ def summarize_usage(attempts: list, usage_rows: list) -> list[AgentUsage]:
 
 
 def usage_section(rows: list[AgentUsage], spent: Mapping[str, float] | None = None,
-                  paid_credits: list[str] | None = None) -> str:
+                  paid_credits: list[str] | None = None, stuck: list[str] | None = None) -> str:
     """The usage table; ``spent``: dollars per paid agent (§1.5);
-    ``paid_credits``: the paid-credit decisions, listed under it."""
+    ``paid_credits``: the paid-credit decisions, listed under it; ``stuck``:
+    the stuck Attempts and why (§2.7), listed last."""
     spent = spent or {}
     if not rows:
         return "No Attempts were recorded."
@@ -141,6 +142,8 @@ def usage_section(rows: list[AgentUsage], spent: Mapping[str, float] | None = No
     lines += ["", f"Total time: {format_duration(total)}."]
     if paid_credits:
         lines += ["", "Paid credits (subscription first, §1.5):", *paid_credits]
+    if stuck:
+        lines += ["", "Stuck Attempts (stopped by Nightshift's stuck detection, §2.7):", *stuck]
     return "\n".join(lines)
 
 
@@ -248,13 +251,14 @@ def finalize(
     spent: Mapping[str, float] | None = None,
     paid_credits: list[str] | None = None,
     resolved: list[str] | None = None,
+    stuck: list[str] | None = None,
 ) -> str:
     """Rewrite ``report.md`` from the agent's draft plus Nightshift's data.
 
     ``needs_you`` are entries Nightshift itself adds to section 2 (e.g. a
     deadline-driven failover); they lead the section, and ``resolved``
     (decided "needs you" requests) close it. ``spent`` and
-    ``paid_credits`` go to section 8 (:func:`usage_section`)."""
+    ``paid_credits`` and ``stuck`` go to section 8 (:func:`usage_section`)."""
     path = folder / "report.md"
     draft = path.read_text() if path.exists() else ""
     head, sections = parse_sections(draft)
@@ -280,7 +284,7 @@ def finalize(
         if _is_empty(body[i]):
             body[i] = "_(the agent did not fill this in)_"
 
-    body[8] = usage_section(summarize_usage(attempts, usage_rows), spent, paid_credits)
+    body[8] = usage_section(summarize_usage(attempts, usage_rows), spent, paid_credits, stuck)
     body[9] = logs_section(folder)
 
     parts = [head, ""]

@@ -15,7 +15,7 @@ FAKE_GEMINI_RESULT (the result word in report.md). The stall guard:
 FAKE_GEMINI_HANG=1 (after the shell command's tool_use, wait forever with
 no command running: 0.65.0's headless sandbox-expansion hang),
 FAKE_GEMINI_BUSY=<s> (that command runs <s> seconds as a child process,
-silently), FAKE_GEMINI_ORPHAN=<file> (that command is left running when
+silently, started once the runner has handled the first line), FAKE_GEMINI_ORPHAN=<file> (that command is left running when
 the agent exits; its pid goes to <file>), FAKE_GEMINI_QUIET=<s> (<s> seconds of silence before the first
 Step, like the CLI's own model retries). On the paid path (an
 API key) every model call is also written to the telemetry file:
@@ -134,6 +134,20 @@ def api_call():
         f.write(json.dumps(request, indent=2) + "\n" + json.dumps(record, indent=2) + "\n")
 
 
+def wait_for_runner():
+    """Until the runner has handled the agent's first line: it writes the line
+    to its stream log only after taking the agent's own processes, so a
+    command started now is never mistaken for one of them (on the real CLI a
+    model call always comes in between)."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        logs = sorted(Path("logs").glob("attempt-*.jsonl"),
+                      key=lambda p: int(p.name.split("-")[1].split(".")[0]))
+        if logs and logs[-1].stat().st_size:
+            return
+        time.sleep(0.02)
+
+
 delay = float(os.environ.get("FAKE_GEMINI_STEP_DELAY") or 0)
 exit_code = int(os.environ.get("FAKE_GEMINI_EXIT") or 0)
 lines = (Path(__file__).parent / "gemini_stream.jsonl").read_text().splitlines()
@@ -153,6 +167,7 @@ for line in lines[:-1]:  # the result line is written below
                                      stderr=subprocess.DEVNULL)
             Path(os.environ["FAKE_GEMINI_ORPHAN"]).write_text(str(child.pid))
         if os.environ.get("FAKE_GEMINI_BUSY"):
+            wait_for_runner()
             subprocess.run(["/bin/sleep", os.environ["FAKE_GEMINI_BUSY"]], check=True)
     if delay:
         time.sleep(delay)

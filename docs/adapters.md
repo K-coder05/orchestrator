@@ -780,16 +780,19 @@ succeeds (`...; true`) don't hang.
 
 **The stall guard** (`agents.gemini.stall_minutes`, default 5; `null` turns
 it off) ends such an Attempt: when a Step is in flight (a `tool_use`
-without its `tool_result`), the agent has written nothing for that long, and
-no process runs under the agent other than its own (taken at its first
-line: the CLI and its relaunched `node` child), the runner stops it as a
-**Failed Attempt** ("stalled ... (stall guard)"), charged to the retry
-budget. Silence without a Step in flight (the CLI retrying the model, seen
-for 3.5 minutes on HTTP 503s) and a long silent command (a process runs
-under the CLI) are never stalls. Seen on the real CLI: the hang ended by
-the guard, a silent `sleep 12` left alone
-(`test_the_stall_guard_ends_the_hang`). The guard is generic
-(`AgentAdapter.stall_seconds`); only Gemini sets it.
+without its `tool_result`), the agent has written nothing and changed no
+file for that long, and no process runs under the agent other than its own
+(taken at its first line: the CLI and its relaunched `node` child), the
+runner stops it as **stuck** ("... (stall guard)"). Since #43 the guard is
+the silence trigger of stuck detection (§2.7, `nightshift.stuck`) with a
+shorter threshold for this case: the Task continues once, told that it went
+silent and which call it was on, and needs you if it hangs again (#17 made
+it a Failed Attempt). Silence without a Step in flight (the CLI retrying
+the model, seen for 3.5 minutes on HTTP 503s) only counts after
+`stuck.silence_minutes` (15), and a long silent command (a process runs
+under the CLI) never does. Seen on the real CLI: the hang ended by the
+guard, a silent `sleep 12` left alone (`test_the_stall_guard_ends_the_hang`).
+The threshold is generic (`AgentAdapter.stall_seconds`); only Gemini sets it.
 
 The whole-CLI sandbox (`--sandbox`, `tools.sandbox`, `GEMINI_SANDBOX`) is
 off: it would put the CLI's own network access and the shell's in one box.
@@ -1031,7 +1034,8 @@ demand" (`planning.timeout_seconds` is 180): pin `agents.gemini.model` /
     the session; a planning call and a probe worked.
 13. **Stall guard** on the real CLI (scripted): the sandbox-expansion hang
     ended as a Failed Attempt within seconds; a 12 s silent command was not
-    a stall.
+    a stall. (Since #43 the same hang ends as a stuck Attempt; not re-run on
+    the real CLI yet.)
 
 2026-10-23, **real Claude -> Gemini failover** (issue #19), real Claude Code
 2.1.309 (haiku) and gemini-cli 0.65.0 (`gemini-3.5-flash-lite`, API key),

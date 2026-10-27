@@ -81,10 +81,10 @@ agents:
     # workspace or policies (--yolo, --approval-mode, --sandbox, --policy,
     # --include-directories, -e, ...) are refused.
     extra_args: []
-    # An Attempt with a Step in flight, no command running and no output for
-    # this long is stopped as stalled (a Failed Attempt): gemini-cli 0.65.0
-    # waits forever for a "sandbox expansion" answer after a denied command
-    # fails. null turns the guard off.
+    # The stall guard: an Attempt with a Step in flight, no command running
+    # and no output or file change for this long is stuck (§2.7, sooner than
+    # stuck.silence_minutes): gemini-cli 0.65.0 waits forever for a "sandbox
+    # expansion" answer after a denied command fails. null turns it off.
     stall_minutes: 5
   # The paid Gemini API path (AI Studio credits, §1.5): the same Gemini CLI,
   # signed in with an API key instead of the plan. Runs Tasks given
@@ -116,6 +116,18 @@ retries:
   max_retries: 2
   # Minutes in retry_wait before each retry (the last value repeats).
   wait_minutes: [10, 30]
+
+stuck:
+  # Stuck detection (§2.7). A stuck Attempt is stopped and retried once with
+  # a note about what it was stuck on; stuck again, the Task needs you. Not
+  # a Failed Attempt: the retry budget above is not charged.
+  # Stuck after this many minutes with no output from the agent and no file
+  # change in the Task folder (a command running for a Step in flight
+  # doesn't count as silence). null turns this trigger off.
+  silence_minutes: 15
+  # Stuck after the same tool call (same tool, same input) this many times
+  # in a row (2 or more). null turns this trigger off.
+  repeat_calls: 3
 
 usage:
   # Usage-limit pauses and resume (§2.6).

@@ -434,13 +434,22 @@ MIGRATIONS: list[str] = [
     -- Attempt and heads the agent protocol (§1.6); NULL: not a course Task.
     ALTER TABLE tasks ADD COLUMN course TEXT;
     """,
+    # 18: stuck detection (nightshift.stuck, §2.7).
+    """
+    -- Stuck Attempts since the Task was created or last retried by hand: the
+    -- first is retried once, the second moves the Task to needs_you.
+    ALTER TABLE tasks ADD COLUMN stuck_count INTEGER NOT NULL DEFAULT 0;
+    -- What the next Attempt is told about the stuck one; cleared when it starts.
+    ALTER TABLE tasks ADD COLUMN stuck_note TEXT;
+    """,
 ]
 
 #: Task columns ``transition(set_fields=...)`` may change with the state.
 TRANSITION_FIELDS = frozenset({
     "retries_used", "retry_at", "cancel_requested_at", "approved", "approved_at",
     "simulated_limit_at", "pause_kind", "pause_limit_type", "pause_reset_at", "resume_at",
-    "resume_pending", "pause_requested_at", "agent", "request_decision_id",
+    "resume_pending", "pause_requested_at", "agent", "request_decision_id", "stuck_count",
+    "stuck_note",
 })
 
 TASK_COLUMNS = (

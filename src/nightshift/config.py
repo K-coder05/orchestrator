@@ -259,6 +259,20 @@ class Config:
     def retry_wait_minutes(self) -> list[float]:
         return [float(m) for m in (self.data.get("retries") or {}).get("wait_minutes", [10, 30])]
 
+    @property
+    def stuck_silence_seconds(self) -> float | None:
+        """``stuck.silence_minutes`` in seconds (§2.7); None: no silence trigger."""
+        stuck = self.data.get("stuck") or {}
+        minutes = stuck.get("silence_minutes", 15)
+        return float(minutes) * 60 if minutes else None
+
+    @property
+    def stuck_repeat_calls(self) -> int | None:
+        """``stuck.repeat_calls`` (§2.7); None: no repeat trigger."""
+        stuck = self.data.get("stuck") or {}
+        calls = stuck.get("repeat_calls", 3)
+        return int(calls) if calls else None
+
     USAGE_DEFAULTS = {
         "resume_session_max_hours": 24,
         "reapproval_after_hours": 72,
@@ -403,6 +417,22 @@ def _validate(data: dict[str, Any]) -> None:
         or any(isinstance(w, bool) or not isinstance(w, (int, float)) or w < 0 for w in waits)
     ):
         raise ConfigError("retries.wait_minutes must be a non-empty list of minutes >= 0")
+    stuck = data.get("stuck") or {}
+    if not isinstance(stuck, dict):
+        raise ConfigError("config section 'stuck' must be a mapping")
+    unknown = sorted(set(stuck) - {"silence_minutes", "repeat_calls"})
+    if unknown:
+        raise ConfigError(f"unknown stuck setting(s): {', '.join(unknown)}")
+    silence = stuck.get("silence_minutes")
+    if silence is not None and (isinstance(silence, bool) or not isinstance(silence, (int, float))
+                                or silence <= 0):
+        raise ConfigError("stuck.silence_minutes must be a positive number of minutes "
+                          "(or null: no silence trigger)")
+    repeats = stuck.get("repeat_calls")
+    if repeats is not None and (isinstance(repeats, bool) or not isinstance(repeats, int)
+                                or repeats < 2):
+        raise ConfigError("stuck.repeat_calls must be an integer >= 2 "
+                          "(or null: no repeat trigger)")
     usage = data.get("usage") or {}
     if not isinstance(usage, dict):
         raise ConfigError("config section 'usage' must be a mapping")

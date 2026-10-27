@@ -230,8 +230,9 @@ def test_a_denied_command_that_fails_hangs_the_cli(setup):
 
 
 def test_the_stall_guard_ends_the_hang(setup):
-    """Through Nightshift the hang above is stopped by the stall guard (a
-    Failed Attempt), not the runtime cap; a long silent command is not."""
+    """Through Nightshift the hang above is stopped by the stall guard (the
+    silence trigger of stuck detection, §2.7), not the runtime cap; a long
+    silent command is not."""
     cfg, home, _ = setup
     db = Database(cfg.db_path, tz=cfg.timezone)
     cfg.data["agents"]["gemini"]["stall_minutes"] = 0.1  # 6 s
@@ -249,11 +250,12 @@ def test_the_stall_guard_ends_the_hang(setup):
                           max_runtime_seconds=120)
         assert time.monotonic() - start < 60
         [a] = db.attempts(hang.spec.id)
-        assert res.state == TaskState.RETRY_WAIT and "stalled" in a["end_reason"], a["end_reason"]
+        assert (res.state == TaskState.QUEUED and a["outcome"] == "stuck"
+                and "(stall guard)" in a["end_reason"]), a["end_reason"]
         res = run_attempt(cfg, db, busy.spec.id, adapter_provider=provider,
                           max_runtime_seconds=120)
         [b] = db.attempts(busy.spec.id)
-        assert "stalled" not in (b["end_reason"] or ""), b["end_reason"]
+        assert b["outcome"] != "stuck", b["end_reason"]
         assert '"output":"slept"' in Path(b["log_path"]).read_text()
     finally:
         db.close()

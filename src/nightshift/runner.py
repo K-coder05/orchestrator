@@ -14,7 +14,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from . import failover, failures, needsyou, pauses, report, school, spend, templates, usage
+from . import (failover, failures, needsyou, pauses, report, school, spend, stuck, templates,
+               usage)
 from .adapters import get_adapter, load_api_key
 from .adapters.base import AgentAdapter, EventKind, RateLimit, TaskContext
 from .config import Config, ConfigError
@@ -149,7 +150,7 @@ STOP_USAGE_LIMIT = "usage_limit"  # a (possibly simulated) rate limit: the Task 
 STOP_PAUSE = "pause"  # orch pause: the Task pauses until orch resume
 STOP_SPEND_CAP = "spend_cap"  # the Task reached its per-Task spend cap: needs you
 STOP_SPEND_PAUSE = "spend_pause"  # the daily/monthly spend cap: the Task pauses
-STOP_STALLED = "stalled"  # the stall guard: a Failed Attempt
+STOP_STUCK = "stuck"  # stuck detection (§2.7): retried once, then needs you
 
 #: Seconds between SIGTERM and SIGKILL when an agent ignores a stop.
 KILL_GRACE_SECONDS = 15.0
@@ -199,6 +200,10 @@ class AttemptControl:
         #: The agent's own processes (its CLI and any relaunch of it), taken
         #: at its first line; any other process under it is a running command.
         self.own_pids: set[int] | None = None  # None: not taken yet
+        #: Why the Attempt got stuck (with a ``STOP_STUCK`` stop).
+        self.stuck_why: str | None = None
+        #: The last tool call seen, as ``stuck.call_text`` quotes it.
+        self.last_call: str | None = None
 
     def stop_after_step(self, reason: str, kind: str, limit: RateLimit | None = None) -> None:
         if self.pending is None:
@@ -220,6 +225,12 @@ class AttemptControl:
             return  # the CLI usually ends a session that hit a limit by itself
         if not self.inflight or overdue:
             self.request_stop(self.pending[0])
+
+    def stuck(self, why: str) -> None:
+        """Stop a stuck Attempt at once (§2.7), unless another stop came first."""
+        if not self.stop_requested:
+            self.stuck_why = why
+        self.request_stop(STOP_STUCK)
 
     def request_stop(self, reason: str = STOP_DAEMON) -> None:
         if not self.stop_requested:
@@ -260,15 +271,15 @@ class _Watchdog(threading.Thread):
     SQLite connections stay in their thread), and kills an agent that
     ignores SIGTERM for ``KILL_GRACE_SECONDS``.
 
-    With ``stall_seconds`` it is also the stall guard: a Step in flight, no
-    output for that long and no process under the agent but its own (no
-    command running) means the agent waits for something that never comes,
-    e.g. gemini-cli 0.65.0's headless "sandbox expansion" question. Model
-    retries (no Step in flight) and long commands (a process runs) are
-    never stalls."""
+    With ``silence`` it is also the silence trigger of stuck detection
+    (``nightshift.stuck``, §2.7): no output and no file change for too long
+    stops the Attempt as stuck. A Step in flight with a process under the
+    agent other than its own is a command running, which is never silence;
+    with no command running the agent's shorter stall threshold applies
+    (gemini-cli 0.65.0's headless "sandbox expansion" question)."""
 
     def __init__(self, control: AttemptControl, proc: subprocess.Popen, *, cap_seconds: float,
-                 db_path: Path, task_id: str, stall_seconds: float | None = None,
+                 db_path: Path, task_id: str, silence: stuck.SilenceWatch | None = None,
                  descendants: Callable[[int], set[int]] = descendant_pids):
         super().__init__(daemon=True)
         self.control = control
@@ -276,22 +287,26 @@ class _Watchdog(threading.Thread):
         self.cap_seconds = cap_seconds
         self.db_path = db_path
         self.task_id = task_id
-        self.stall_seconds = stall_seconds
+        self.silence = silence
         self.descendants = descendants
         self.started = time.monotonic()
         self.done = threading.Event()
-        limits = [cap_seconds] + ([stall_seconds] if stall_seconds else [])
+        limits = [cap_seconds]
+        if silence is not None:
+            limits += [t for t in (silence.threshold(False), silence.threshold(True)) if t]
         self.interval = min(1.0, max(0.05, min(limits) / 20))
 
-    def _stalled(self) -> bool:
+    def _busy(self) -> bool:
+        """A command runs under the agent: a process that isn't its own."""
+        own = self.control.own_pids
+        return own is not None and bool(self.descendants(self.proc.pid) - own)
+
+    def _stuck(self) -> str | None:
+        if self.silence is None:
+            return None
         c = self.control
-        if not self.stall_seconds:
-            return False
-        if not c.inflight or c.own_pids is None:
-            return False
-        if time.monotonic() - c.last_output < self.stall_seconds:
-            return False
-        return not (self.descendants(self.proc.pid) - c.own_pids)
+        return self.silence.check(last_output=c.last_output, inflight=bool(c.inflight),
+                                  busy=self._busy)
 
     def _requests(self, conn: sqlite3.Connection | None) -> tuple[bool, bool]:
         """(cancel requested, pause requested) by ``orch cancel``/``orch pause``."""
@@ -327,8 +342,9 @@ class _Watchdog(threading.Thread):
                 if time.monotonic() - self.started >= self.cap_seconds:
                     c.request_stop(STOP_RUNTIME_CAP)
                     continue
-                if self._stalled():
-                    c.request_stop(STOP_STALLED)
+                why = self._stuck()
+                if why is not None:
+                    c.stuck(why)
                     continue
                 cancel, pause = self._requests(conn)
                 if cancel:
@@ -411,6 +427,7 @@ def run_attempt(
     max_runtime_seconds: float | None = None,
     continue_fresh: bool = False,
     request_decision: int | None = None,
+    stuck_note: str | None = None,
 ) -> AttemptResult:
     """Run one Attempt of a queued Task, then finalize its report.
 
@@ -428,11 +445,15 @@ def run_attempt(
     The next Attempt of a paused Task resumes its agent session when it is
     young enough, else starts fresh from ``plan.md`` + ``progress.md``; a
     resume that fails before any Step falls back to a fresh session at once
-    (``continue_fresh``, carrying ``request_decision`` along).
+    (``continue_fresh``, carrying ``request_decision`` and ``stuck_note`` along).
 
     After a resolved "needs you" request (``nightshift.needsyou``) the next
     Attempt continues the same way, and its prompt states the decision and
     the original request.
+
+    An Attempt that gets stuck (``nightshift.stuck``, §2.7) is stopped at
+    once and is not a Failed Attempt: the Task continues once with a note
+    about what it was stuck on, and needs you if it gets stuck again.
     """
     clock = clock or (lambda: now(cfg.timezone))
     control = control or AttemptControl()
@@ -441,6 +462,7 @@ def run_attempt(
     control.inflight.clear()
     control.pending = control.pending_since = None
     control.own_pids = None
+    control.stuck_why = control.last_call = None
     row = db.get_task(task_id)
     if row is None:
         raise KeyError(task_id)
@@ -491,6 +513,10 @@ def run_attempt(
                                        choice.why if choice is not None else "the resume failed")
     else:
         prompt = pauses.fresh_prompt(row["prompt"]) if continuing else row["prompt"]
+    # The Attempt after a stuck one is told what it was stuck on (once, §2.7).
+    stuck_note = row["stuck_note"] if stuck_note is None else stuck_note
+    if stuck_note:
+        prompt += f"\n\n{stuck_note}"
     task = TaskContext(
         id=task_id,
         prompt=prompt,
@@ -510,11 +536,12 @@ def run_attempt(
                 if u["run_id"] in runs and u["raw"]]
         adapter.prior_usage = raws[-1] if raws else None
     if resume_session:
-        command = adapter.resume_command(
-            resume_session,
-            needsyou.resume_prompt(decision) if decision else pauses.RESUME_PROMPT,
-            task=task, permissions=permissions,
-        )
+        resume_text = needsyou.resume_prompt(decision) if decision else pauses.RESUME_PROMPT
+        if stuck_note:
+            resume_text = stuck.resume_prompt(
+                stuck_note, needsyou.resume_prompt(decision) if decision else needsyou.RESUME_TAIL)
+        command = adapter.resume_command(resume_session, resume_text, task=task,
+                                         permissions=permissions)
         how = f"resuming {choice.why}"
     else:
         command = adapter.build_command(task, folder, permissions)
@@ -536,13 +563,17 @@ def run_attempt(
     if decision:
         verdict = db.approval(decision_id)["decision"]
         started += f", told its needs-you request was {verdict}"
+    if stuck_note:
+        started += ", told what the last Attempt got stuck on"
     db.transition(task_id, TaskState.RUNNING, started, run_id=run_id,
-                  set_fields={"resume_pending": 0, "request_decision_id": None})
+                  set_fields={"resume_pending": 0, "request_decision_id": None,
+                              "stuck_note": None})
     _log(folder, f"{iso(now(cfg.timezone))} {started}: {json.dumps(stored_argv)}", redact)
 
     # Fault injection: one simulated limit per Task, after N Steps of an Attempt.
     simulate_after = row["simulate_rate_limit_after"] if not row["simulated_limit_at"] else None
     steps = 0
+    repeats = stuck.RepeatWatch(cfg.stuck_repeat_calls)
 
     env = os.environ.copy() | command.env
     exit_code: int | None = None
@@ -585,8 +616,12 @@ def run_attempt(
         cap = max_runtime_seconds if max_runtime_seconds is not None else (
             failures.runtime_cap_seconds(cfg, row))
         control.last_output = time.monotonic()
+        silence = None
+        if cfg.stuck_silence_seconds or adapter.stall_seconds:
+            silence = stuck.SilenceWatch(folder, silence_seconds=cfg.stuck_silence_seconds,
+                                         stall_seconds=adapter.stall_seconds)
         watchdog = _Watchdog(control, proc, cap_seconds=cap, db_path=db.path, task_id=task_id,
-                             stall_seconds=adapter.stall_seconds)
+                             silence=silence)
         watchdog.start()
     spend_watcher: _SpendWatcher | None = None
     if paid and proc is not None:
@@ -615,7 +650,7 @@ def run_attempt(
             with open(stream_log, "w") as out:
                 for line in proc.stdout:
                     control.last_output = time.monotonic()
-                    if adapter.stall_seconds and control.own_pids is None:
+                    if control.own_pids is None:
                         # The agent is up (its first line) and no Step runs
                         # yet: what runs under it now is its own (gemini
                         # relaunches itself as a child node process).
@@ -633,6 +668,11 @@ def run_attempt(
                         if ev.kind == EventKind.TOOL_CALL:
                             steps += 1
                             control.inflight.add(str(ev.data.get("id") or f"step-{steps}"))
+                            name, tool_input = ev.data.get("name"), ev.data.get("input")
+                            control.last_call = stuck.call_text(name, tool_input)
+                            why = repeats.see(name, tool_input)
+                            if why is not None:
+                                control.stuck(why)
                             if simulate_after and steps == simulate_after:
                                 control.stop_after_step(
                                     STOP_USAGE_LIMIT, pauses.KIND_SIMULATED,
@@ -766,10 +806,19 @@ def run_attempt(
         cap_min = (max_runtime_seconds / 60 if max_runtime_seconds is not None
                    else failures.runtime_cap_seconds(cfg, row) / 60)
         failed_attempt = f"Attempt {attempt_no} hit its runtime cap of {cap_min:g} min"
-    elif stop == STOP_STALLED:
-        stall_min = (adapter.stall_seconds or 0) / 60
-        failed_attempt = (f"Attempt {attempt_no} stalled: a Step was in flight with no command "
-                          f"running and no output for {stall_min:g} min (stall guard)")
+    elif stop == STOP_STUCK and not (exit_code == 0 and ok is not False):
+        # Stuck (§2.7): not a Failed Attempt. The session and progress.md
+        # are kept; the Task continues once with a note, then needs you.
+        why = control.stuck_why or "no reason recorded"
+        end_reason = redact(f"Attempt {attempt_no} stuck: {why}")
+        db.finish_attempt(run_id, exit_code=exit_code, outcome=stuck.OUTCOME,
+                          end_reason=end_reason, session_id=adapter.session_id())
+        _log(folder, f"{iso(now(cfg.timezone))} Attempt {attempt_no} ended: {end_reason}", redact)
+        state = stuck.after_stuck(cfg, db, task_id, why=redact(why),
+                                  note_text=redact(stuck.note(why, control.last_call)),
+                                  attempt_no=attempt_no, at=clock(), run_id=run_id)
+        return AttemptResult(run_id=run_id, state=state, session_id=adapter.session_id(),
+                             exit_code=exit_code)
     elif interrupted:
         state, outcome = TaskState.CANCELLED, "cancelled"
         end_reason = "interrupted from the terminal (Ctrl-C)"
@@ -793,7 +842,7 @@ def run_attempt(
                 cfg, db, task_id, adapter_provider=adapter_provider, on_event=on_event,
                 control=control, clock=clock, post_hooks=post_hooks,
                 max_runtime_seconds=max_runtime_seconds, continue_fresh=True,
-                request_decision=decision_id,
+                request_decision=decision_id, stuck_note=stuck_note,
             )
         failed_attempt = (f"Attempt {attempt_no} crashed: agent exited with code {exit_code}"
                           + (f": {err}" if err else ""))

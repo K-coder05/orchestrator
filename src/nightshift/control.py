@@ -220,7 +220,7 @@ def available(row: Any) -> tuple[str, ...]:
         out.append(PAUSE)
     if state == TaskState.PAUSED_USAGE or pause_asked:
         out.append(RESUME)
-    if state in failures.RETRYABLE:
+    if failures.retryable(row):
         out.append(RETRY)
     out.append(PRIORITY)
     return tuple(out)

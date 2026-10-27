@@ -133,6 +133,14 @@ then 30, and is retried on the same agent; after 2 retries it is `failed`.
 `orch retry <id>` requeues a failed Task with a fresh budget (or ends a
 `retry_wait` early), and `orch cancel <id>` cancels any unfinished Task.
 
+An Attempt that goes 15 minutes with no output and no file changes in its
+Task folder (`stuck.silence_minutes`; a command still running for a tool
+call doesn't count), or makes the same tool call 3 times in a row
+(`stuck.repeat_calls`), is stuck: Nightshift stops it, keeps its session
+and `progress.md`, and runs the Task once more, telling the agent what it
+was stuck on. Stuck a second time, the Task needs you (Telegram, the inbox);
+`orch retry <id>` runs it again. Stuck Attempts don't use the retry budget.
+
 With `telegram.user_id` in config and the bot token in `.env` (or the
 Keychain) as `TELEGRAM_BOT_TOKEN`, the daemon sends you a Telegram message when
 a Task finishes (its one-line Result), fails, or needs you; usage pauses stay
@@ -151,9 +159,9 @@ API key (`agents.gemini.auth: gemini-api-key`): put the key in
 a key exported in your shell profile doesn't reach the daemon. The key's
 free-tier quota is Gemini's usage Window, so a quota error pauses the Task
 like any usage limit. An Attempt that stops producing output while a Step
-is in flight and no command runs is ended after `agents.gemini.stall_minutes`
-(5) as a Failed Attempt: gemini-cli 0.65.0 can hang after the sandbox
-blocks a command.
+is in flight and no command runs is stuck after `agents.gemini.stall_minutes`
+(5) instead of 15: gemini-cli 0.65.0 can hang after the sandbox blocks a
+command.
 
 `--agent gemini-api` runs a Task on paid AI Studio credits (the Gemini CLI
 with a billed project's API key from `.env` or the Keychain as

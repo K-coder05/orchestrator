@@ -65,21 +65,23 @@ def report_extras(cfg: Config, db: Database, task_id: str) -> dict[str, Any]:
     """What Nightshift adds to a Task's report from its own records: Needs
     you entries (resolved requests too), and for section 8 the dollars spent per paid agent and the
     paid-credit decisions (§1.5)."""
-    from . import needsyou, paid  # both import this module
+    from . import needsyou, paid, stuck  # all import this module
 
     row = db.get_task(task_id)
     return {"needs_you": needs_you_extra(cfg, db, task_id),
             "resolved": needsyou.report_lines(db, task_id, Path(row["folder"])) if row else [],
             "spent": db.task_spend_by_agent(task_id),
-            "paid_credits": paid.report_lines(db, task_id)}
+            "paid_credits": paid.report_lines(db, task_id),
+            "stuck": stuck.report_lines(db, task_id)}
 
 
 def needs_you_extra(cfg: Config, db: Database, task_id: str) -> list[str]:
     """Needs you entries Nightshift adds to the report itself (deadline-driven
-    failovers, §2.8; the per-Task spend cap, §1.5)."""
-    from . import failover, spend  # failover imports this module
+    failovers, §2.8; the per-Task spend cap, §1.5; stuck again, §2.7)."""
+    from . import failover, spend, stuck  # failover and stuck import this module
 
-    return spend.needs_you_lines(cfg, db, task_id) + failover.needs_you_lines(db, task_id)
+    return (spend.needs_you_lines(cfg, db, task_id) + failover.needs_you_lines(db, task_id)
+            + stuck.needs_you_lines(db, task_id))
 
 
 def _appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
@@ -215,6 +217,14 @@ def promote_due(cfg: Config, db: Database, now: datetime) -> list[str]:
 RETRYABLE = frozenset({TaskState.FAILED, TaskState.PARTIAL, TaskState.RETRY_WAIT})
 
 
+def retryable(row: Mapping[str, Any]) -> bool:
+    """Whether ``orch retry`` applies to the Task in ``row``: failed, partial,
+    waiting to retry, or in ``needs_you`` for getting stuck again (§2.7)."""
+    from . import stuck  # stuck imports this module
+
+    return TaskState(row["state"]) in RETRYABLE or stuck.waiting(row)
+
+
 class NotAllowed(Exception):
     """The Task's state doesn't allow this command."""
 
@@ -226,20 +236,28 @@ class StillChanging(NotAllowed, StateChanged):
 def retry_by_hand(cfg: Config, db: Database, task_id: str, *, at: datetime,
                   via: str = "orch retry") -> str:
     """Requeue a ``failed`` or ``partial`` Task with a fresh retry budget, or
-    end a ``retry_wait`` early (its budget is kept). Returns the reason."""
+    end a ``retry_wait`` early (its budget is kept). A Task in ``needs_you``
+    for getting stuck again is requeued to continue (its next Attempt is told
+    what it was stuck on), with fresh stuck and retry allowances. Returns the
+    reason."""
     row = db.get_task(task_id)
     if row is None:
         raise KeyError(task_id)
     state = TaskState(row["state"])
-    if state not in RETRYABLE:
+    if not retryable(row):
         raise NotAllowed(f"Task {task_id} is {state}; only failed, partial or retry_wait "
-                         "Tasks can be retried")
-    if state == TaskState.RETRY_WAIT:
+                         "Tasks, or ones that got stuck, can be retried")
+    if state == TaskState.NEEDS_YOU:
+        reason = (f"retried by hand after getting stuck ({via}); stuck count and retry "
+                  "budget reset")
+        fields: dict[str, Any] = {"retry_at": None, "retries_used": 0, "stuck_count": 0,
+                                  "resume_pending": 1}
+    elif state == TaskState.RETRY_WAIT:
         reason = f"retry {row['retries_used']} of {cfg.max_retries} started early ({via})"
-        fields: dict[str, Any] = {"retry_at": None}
+        fields = {"retry_at": None}
     else:
         reason = f"retried by hand from {state} ({via}); retry budget reset"
-        fields = {"retry_at": None, "retries_used": 0}
+        fields = {"retry_at": None, "retries_used": 0, "stuck_count": 0}
     db.transition(task_id, TaskState.QUEUED, reason, expect=state, set_fields=fields)
     log_line(Path(row["folder"]), f"{iso(at)} {reason}", cfg.secrets.redact)
     return reason

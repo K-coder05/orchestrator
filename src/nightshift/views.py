@@ -12,7 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import queries, spend
+from . import queries, spend, stuck
 from .adapters import get_adapter
 from .adapters.base import Event, EventKind
 from .config import Config
@@ -63,7 +63,8 @@ def format_list(tasks: list[queries.TaskSummary]) -> str:
 
 SHOW_FIELDS = (
     "title state priority task_type agent agent_override internet template deadline run_at "
-    "long estimated_minutes max_runtime_minutes retries_used retry_at simulate_rate_limit_after "
+    "long estimated_minutes max_runtime_minutes retries_used stuck_count retry_at "
+    "simulate_rate_limit_after "
     "simulated_limit_at pause_kind pause_limit_type pause_reset_at resume_at approved approved_at "
     "schedule_name created_at state_changed_at folder"
 ).split()
@@ -82,6 +83,10 @@ def format_show(d: queries.TaskDetail) -> str:
             if not value:
                 continue
             value = f"{value} of {d.max_retries}"
+        if f == "stuck_count":
+            if not value:
+                continue
+            value = f"{value} of {stuck.LIMIT} (stuck again: needs you)"
         if value is None:
             continue
         out.append(f"  {f.ljust(width)}  {value}")
@@ -105,6 +110,11 @@ def format_show(d: queries.TaskDetail) -> str:
     if row["resume_pending"] and open_:
         out += ["", "Next Attempt continues paused work (same session if under "
                 f"{d.resume_session_max_hours:g}h old)"]
+    if stuck.waiting(row):
+        out += ["", f"Waiting: stuck again after one retry; `orch retry {d.id}` runs it again, "
+                f"`orch cancel {d.id}` drops it"]
+    if row["stuck_note"] and open_:
+        out.append("Next Attempt is told what the last Attempt got stuck on")
     if row["request_decision_id"] and open_ and d.approvals:
         out.append(f"Next Attempt is told its needs-you request was {d.approvals[-1].decision}")
     if row["pause_requested_at"] and d.state == TaskState.RUNNING:
@@ -133,6 +143,11 @@ def format_show(d: queries.TaskDetail) -> str:
         out += [f"  {line}" for line in table.splitlines()]
     else:
         out.append("  none yet")
+
+    stuck_attempts = [a for a in d.attempts if a.outcome == stuck.OUTCOME]
+    if stuck_attempts:
+        out += ["", "Stuck:"]
+        out += [f"  {a.end_reason}" for a in stuck_attempts]
 
     if d.approvals:
         out += ["", "Approvals:"]

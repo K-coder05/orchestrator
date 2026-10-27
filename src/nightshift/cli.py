@@ -224,8 +224,9 @@ def deny(ctx, task_id):
 @click.argument("task_id")
 @click.pass_context
 def retry(ctx, task_id):
-    """Retry a failed or partial Task (fresh retry budget), or start a Task
-    in retry_wait now. It runs again on the same agent."""
+    """Retry a failed or partial Task (fresh retry budget), start a Task in
+    retry_wait now, or run a Task that got stuck again (needs_you) once
+    more. It runs again on the same agent."""
     cfg, db = _open(ctx.obj["config_dir"])
     try:
         _show(control.retry(cfg, db, task_id, via="orch retry", at=_clock(cfg)))

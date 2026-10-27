@@ -696,27 +696,41 @@ def _stall_task(cfg, db, minutes):
     return create_task(cfg, db, "Summarize lecture 3", agent="gemini", task_type="summary")
 
 
-def test_stall_guard_stops_a_hung_step_as_a_failed_attempt(cfg, db, genv):
+def test_stall_guard_stops_a_hung_step_as_stuck(cfg, db, genv):
+    # The stall guard is the silence trigger of stuck detection (§2.7) with
+    # Gemini's shorter threshold: stuck, not a Failed Attempt.
     genv.setenv("FAKE_GEMINI_HANG", "1")
     new = _stall_task(cfg, db, 0.02)  # 1.2 s
     start = time.monotonic()
     res = run_attempt(cfg, db, new.spec.id, adapter_provider=provider)
     assert time.monotonic() - start < 15  # not the runtime cap
-    assert res.state == TaskState.RETRY_WAIT  # a Failed Attempt: charged to the retry budget
+    assert res.state == TaskState.QUEUED  # continues once, with a note
     [a] = db.attempts(new.spec.id)
-    assert a["outcome"] == "failed" and a["session_id"] == SID
-    assert "stalled" in a["end_reason"] and "1.2 min" not in a["end_reason"]
-    assert "no output for 0.02 min (stall guard)" in a["end_reason"]
-    assert db.get_task(new.spec.id)["retries_used"] == 1
-    assert "stalled" in (new.folder / "logs" / "nightshift.log").read_text()
+    assert a["outcome"] == "stuck" and a["session_id"] == SID
+    assert ("no output and no file changes for 0.02 min (stall guard)" in a["end_reason"]
+            and "Step in flight and no command running" in a["end_reason"])
+    row = db.get_task(new.spec.id)
+    assert row["retries_used"] == 0 and row["stuck_count"] == 1 and row["resume_pending"] == 1
+    assert "`run_shell_command`" in row["stuck_note"]  # the call it hung on
+    assert "stuck" in (new.folder / "logs" / "nightshift.log").read_text()
 
 
 def test_stall_guard_lets_a_long_silent_command_run(cfg, db, genv):
-    genv.setenv("FAKE_GEMINI_BUSY", "3")  # a command under the agent, silent for 3 s
-    # A model call's latency between the first line and the first Step, as on
-    # the real CLI: the agent's own processes are taken at its first line.
-    genv.setenv("FAKE_GEMINI_QUIET", "0.5")
+    # A command under the agent, silent for 3 s. The fake starts it only once
+    # the runner has taken the agent's own processes (at its first line), as
+    # on the real CLI, where a model call always comes in between; with a
+    # fixed delay instead this raced under load.
+    genv.setenv("FAKE_GEMINI_BUSY", "3")
     new = _stall_task(cfg, db, 0.02)
+    res = run_attempt(cfg, db, new.spec.id, adapter_provider=provider)
+    assert res.state == TaskState.DONE, db.attempts(new.spec.id)[-1]["end_reason"]
+
+
+def test_a_long_silent_command_is_not_silence_either(cfg, db, genv):
+    # The same with no stall guard and a short general silence threshold.
+    genv.setenv("FAKE_GEMINI_BUSY", "3")
+    cfg.data["stuck"]["silence_minutes"] = 0.02
+    new = _stall_task(cfg, db, None)
     res = run_attempt(cfg, db, new.spec.id, adapter_provider=provider)
     assert res.state == TaskState.DONE, db.attempts(new.spec.id)[-1]["end_reason"]
 

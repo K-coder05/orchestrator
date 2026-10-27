@@ -2655,3 +2655,123 @@ lasting consequences go in `docs/adr/` instead.
   and ended with a Close to a known bit section naming one comic's routine
   (low overlap, with how to steer away); the report carried it and the
   comedy folder was untouched.
+
+## Phase 3, issue #43: stuck detection
+
+- **One module.** `nightshift.stuck` holds §2.7's stuck detection: the two
+  triggers (`RepeatWatch`, `SilenceWatch`, both taking their clock from the
+  caller so they are tested on a fake one), the note for the next Attempt,
+  and what happens after a stuck Attempt (`after_stuck`). The runner feeds
+  every tool call to the repeat trigger; the Attempt watchdog checks the
+  silence trigger about once a second.
+- **Config** (`stuck:` in `defaults.yaml` and `config.example.yaml`):
+  `silence_minutes: 15` and `repeat_calls: 3` (2 or more); `null` turns a
+  trigger off; unknown keys are refused. The one retry is fixed by §2.7,
+  not config.
+- **Repeats: the same tool call, same input, N times in a row.** A call is
+  the adapter's normalized `TOOL_CALL` (name and input), which every
+  adapter already emits: Claude's `tool_use` blocks, Codex's `item.started`
+  items (type plus command, patch, query, ...), Gemini's `tool_use`
+  messages. Inputs compare as JSON with sorted keys. Any other call in
+  between starts the count again; text between calls doesn't.
+- **Silence: no new output and no file change in the Task folder.** Output
+  is any line from the agent. A file change is a change of the folder's
+  entry count or newest mtime (directories too, so deletes and renames
+  count), `logs/` left out (Nightshift writes there, and the stream log
+  only mirrors output). The folder is scanned only once the quiet clock has
+  run out, not every tick: a change found then restarts the clock, so a
+  big folder costs one walk per quiet period.
+- **Long silent tool calls don't trigger it** (acceptance criterion 3). None
+  of the three CLIs sends a "still running" heartbeat; what they do report
+  is a tool call in flight (`tool_use` without its result, Codex's
+  `item.started` without `item.completed`). With a Step in flight and a
+  process under the agent other than its own (the stall guard's test, now
+  for every agent: the agent's own processes are taken at its first line),
+  a command is running and the quiet clock restarts; the processes are
+  listed only when the clock runs out. **The gap:** a command that hangs
+  forever (waiting on input, a server that never returns) is never stuck;
+  the runtime cap bounds it. A Step in flight with no command running (a
+  web fetch, or Gemini's sandbox hang) is silence like any other.
+- **A short confirmation.** Once the quiet clock runs out, silence must
+  still hold `min(10 s, threshold)` later. A command that has just ended
+  has its result line on the way; without this, a check landing between
+  the two read as silence (seen as a flake of
+  `test_stall_guard_lets_a_long_silent_command_run` under load).
+- **The stall guard (#17) is folded in, not kept beside it.** Both looked
+  for the same thing, an agent gone quiet; two mechanisms would have
+  stopped the same Attempt with two different outcomes depending on which
+  threshold came first. The guard is now the silence trigger with a shorter
+  threshold (`agents.gemini.stall_minutes`, 5) for the one case it knew
+  about: a Step in flight and no command running. Its outcome changes from
+  Failed Attempt to stuck, which suits it better: the retry is told which
+  call hung (the #17 safety note worried the retry would repeat the
+  command), and a second hang reaches me instead of burning the retry
+  budget. Its reason still ends in "(stall guard)".
+- **Stopped at once, not after the Step.** A usage pause waits for the Step
+  in flight; a stuck Attempt doesn't, since that Step is the silent one or
+  the repeat. "Save state" is what a pause keeps: the session id, the Task
+  folder and `progress.md` are untouched, and `resume_pending` is set. An
+  agent that finished cleanly (exit 0) before the stop reached it is not
+  stuck; a pending usage pause or `orch pause` wins over stuck, as it does
+  over the runtime cap.
+- **Recorded distinctly:** `runs.outcome = "stuck"`, `end_reason`
+  "Attempt N stuck: <why>" (the call and its input, cut to 200 characters,
+  or the silence and its threshold). New Task columns (migration 18):
+  `stuck_count` and `stuck_note`.
+- **First stuck: continue once with a note.** The Task goes straight back
+  to `queued` (no `retry_wait`: §2.7 sets no wait, and nothing suggests
+  waiting helps), like any continuation: the same session if §2.6 allows,
+  else fresh from `plan.md` + `progress.md` (a failed resume carries the
+  note to the fresh session). The note says what it was stuck on (the
+  repeated call, or the silence and its last tool call), not to repeat it,
+  and that `needs_you.json` is the way out if it is blocked. It is given
+  once: `stuck_note` is cleared when the next Attempt starts.
+- **Second stuck: `needs_you`.** The final `report.md` gets result
+  `needs_you` with why, and a Needs you entry ("**Stuck:** Attempt N got
+  stuck again after one retry ...") that the needs-you alert sends as its
+  line (no tool input in it: the alert goes to Telegram). The inbox lists it
+  as kind `stuck` with `orch retry <id>` as the action. Approve and deny
+  don't apply (no agent request); **`orch retry` does**, from the CLI,
+  Telegram and the dashboard (`failures.retryable`), requeueing it to
+  continue (told what it was stuck on) with the stuck count and retry
+  budget reset; `orch cancel` drops it. Without that, the only way out of
+  this `needs_you` would have been cancel.
+- **Counting:** stuck Attempts since the Task was created or last retried
+  by hand. Other outcomes in between (a pause, a Failed Attempt) don't
+  reset it: a Task that got stuck, crashed and got stuck again needs you.
+- **Stuck Attempts don't count toward the retry budget.** §2.7 and
+  CONTEXT.md define Failed Attempts as crash, runtime cap or failed
+  post-hook, and stuck detection has its own allowance (one retry, then
+  me). Charging both would let a stuck Task fail on a crash budget it
+  never used, or reach `failed` without ever reaching me. So stuck is a
+  separate outcome (CONTEXT.md: **Stuck Attempt**), like a usage pause.
+- **Report and `orch show`.** Section 8 of the report lists every stuck
+  Attempt and why ("Stuck Attempts (stopped by Nightshift's stuck
+  detection, §2.7)"). `orch show` shows `stuck_count`, a `Stuck:` section
+  with each full reason (the Attempts table cuts reasons at 80
+  characters), a Waiting line for a Task stuck again, and whether the next
+  Attempt is told about the last one.
+- **Tests.** `tests/test_stuck.py`: both triggers on a fake clock (the count,
+  key order, a call in between, output and file changes restarting the
+  quiet clock, deletes, `logs/` ignored, a long command never silence and
+  listed once per quiet period, the confirmation after a command ends, the
+  stall threshold only with a Step in flight, triggers off), config, and
+  through the runner with the fake Claude on a looping stream: stuck,
+  resumed with the note, stuck again, `needs_you` with the report, `orch
+  show`, the alert text, the inbox and `orch retry`; silence after the
+  stream; a normal run; triggers off leaving the runtime cap; the note
+  surviving a failed resume. `tests/test_gemini.py`'s stall guard tests
+  now expect stuck; a new one runs a silent command against the general
+  threshold.
+- **The flaky `test_stall_guard_lets_a_long_silent_command_run`.** Two
+  races: the agent's own processes are taken at its first line, and under
+  load the `ps` for that could run after the fake had started its command,
+  which then counted as the agent's own (the test's 0.5 s head start was
+  meant to cover this); and the moment between a command ending and its
+  result line being read (now covered by the confirmation). The fake now
+  starts the command only once the runner has written the first line to
+  its stream log, which it does right after taking the processes;
+  deterministic. Passed 5 times in a row with 12 busy loops on the CPU.
+- **Not done here:** parallel agents (#44, #45). The real-CLI test of the
+  stall guard (`test_the_stall_guard_ends_the_hang`) now expects a stuck
+  Attempt; it is opt-in and wasn't re-run.

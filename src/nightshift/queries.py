@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import priority, schedules, spend, usage
+from . import priority, schedules, spend, stuck, usage
 from .adapters import is_paid
 from .config import Config
 from .db import Database
@@ -164,6 +164,9 @@ def _request(cfg: Config, db: Database, row: sqlite3.Row) -> NeedsYouRequest:
         asked = _needs_you_file(Path(row["folder"]))
         if any(a["outcome"] == spend.OUTCOME_CAP for a in db.attempts(row["id"])) and not asked:
             kind, summary = "spend cap", spend.cap_reason(cfg, db, row["id"])
+        elif stuck.waiting(row) and not asked:
+            kind = "stuck"
+            action = f"orch retry {row['id']} runs it again (or orch cancel {row['id']})"
         elif asked is not None:
             kind = _text(asked.get("kind")) or "request"
             summary = _text(asked.get("summary")) or reason

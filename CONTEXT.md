@@ -55,6 +55,10 @@ A Schedule's rule for when it fires while its previous Occurrence is not yet fin
 An Attempt that ended in a crash, hit its runtime cap, or failed a post-hook. Only Failed Attempts count toward a Task's retry budget; Attempts ended by a usage pause do not.
 _Avoid_: Error, crash
 
+**Stuck Attempt**:
+An Attempt Nightshift stopped because it went silent (no output and no file changes in the Task folder for too long) or made the same tool call several times in a row. It is not a Failed Attempt: the Task continues once with a note about what it was stuck on, and needs you if it gets stuck again.
+_Avoid_: Hung, frozen
+
 ### Recruiting
 
 **Tracker**:
