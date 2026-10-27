@@ -66,6 +66,8 @@ def _rule_path(path: Path) -> str:
 
 class ClaudeAdapter(AgentAdapter):
     name = "claude"
+    #: The coding/writing lane, shared with Codex (§5 item 5).
+    lane = "claude"
 
     def __init__(self, settings: dict[str, Any] | None = None):
         settings = settings or {}

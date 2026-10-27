@@ -2,17 +2,20 @@
 
 ``launchd`` keeps the daemon alive (KeepAlive). Inside it the queue runner
 keeps a set of running Attempts, each on its own thread with its own control
-handle and DB connection, up to ``daemon.max_running`` at once (1 until the
-per-agent lanes of §5 item 5 exist). It holds the machine awake through the
-host seam while any Task is ``running`` and releases it once none is (§1.1). Before every pick the
-scheduler applies each Schedule's Catch-up and Overlap rules
-(``nightshift.schedules``); it also does so right at start and right after
-the machine wakes from sleep (§2.5).
+handle and DB connection: at most one per lane (§5 item 5: one coding/writing
+Task on Claude, or Codex when it has taken over for Claude, and one Gemini
+Task), and at most ``daemon.max_running`` in all. A Task's lane is its
+agent's (``adapters.lane_of``), read at every pick, so a Task that fails over
+to another agent is picked by that agent's lane. It holds the machine awake
+through the host seam while any Task is ``running`` and releases it once
+none is (§1.1). Before every pick the scheduler applies each Schedule's
+Catch-up and Overlap rules (``nightshift.schedules``); it also does so right
+at start and right after the machine wakes from sleep (§2.5).
 
-At most ``max_running`` Tasks at a time is guaranteed twice over: the runner
-starts an Attempt only while fewer are running, and only the process holding
-the daemon lock (an exclusive ``flock`` on ``<data>/daemon.lock``) may run
-Tasks at all.
+One Task per lane is guaranteed twice over: the runner starts an Attempt
+only in a lane with nothing running, and only the process holding the
+daemon lock (an exclusive ``flock`` on ``<data>/daemon.lock``) may run Tasks
+at all.
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ import nightshift
 
 from . import failover, failures, paid, pauses, schedules, spend, usage
 from .alerts import AlertService
-from .adapters import get_adapter
+from .adapters import get_adapter, lane_of
 from .config import Config
 from .db import Database
 from .host import Host
@@ -72,8 +75,9 @@ def poll_seconds(cfg: Config) -> float:
 
 
 def running_cap(cfg: Config) -> int:
-    """How many Attempts the queue runner may run at once."""
-    return int((cfg.data.get("daemon") or {}).get("max_running", 1))
+    """How many Attempts the queue runner may run at once, across all lanes
+    (one per lane at most either way)."""
+    return int((cfg.data.get("daemon") or {}).get("max_running", 2))
 
 
 # --------------------------------------------------------------------------
@@ -131,7 +135,7 @@ def read_state(cfg: Config) -> dict[str, Any] | None:
 
 def running_tasks(state: dict[str, Any]) -> list[dict[str, Any]]:
     """The running Tasks a ``daemon.json`` lists, oldest first: each a dict
-    with ``id`` (and ``agent`` and ``started_at`` when known). A file from a
+    with ``id`` (and ``agent``, ``lane`` and ``started_at`` when known). A file from a
     daemon older than the list names at most one, as ``current_task``."""
     listed = state.get("running_tasks")
     if isinstance(listed, list):
@@ -278,18 +282,19 @@ def format_access_problems(problems: list[AccessProblem], python: str | None = N
 
 @dataclass
 class RunningAttempt:
-    """One Attempt the queue runner has running: its Task, control handle
-    and thread."""
+    """One Attempt the queue runner has running: its Task, the lane it
+    holds, control handle and thread."""
 
     task_id: str
     agent: str
+    lane: str
     started_at: str
     control: AttemptControl
     thread: threading.Thread | None = None
 
 
 class QueueRunner:
-    """Runs queued Tasks, at most ``max_running`` at a time.
+    """Runs queued Tasks, one per lane and at most ``max_running`` at a time.
 
     Each Attempt runs on its own thread with its own control handle and DB
     connection (SQLite connections stay in their thread); the runner's own
@@ -348,7 +353,7 @@ class QueueRunner:
 
     @property
     def current(self) -> str | None:
-        """The oldest running Task (the only one at a cap of 1), or None."""
+        """The oldest running Task, or None."""
         first = self._oldest()
         return first.task_id if first else None
 
@@ -369,8 +374,8 @@ class QueueRunner:
                 "started_at": self.started_at,
                 "updated_at": iso(now(self.cfg.timezone)),
                 "max_running": self.max_running,
-                "running_tasks": [{"id": r.task_id, "agent": r.agent, "started_at": r.started_at}
-                                  for r in running],
+                "running_tasks": [{"id": r.task_id, "agent": r.agent, "lane": r.lane,
+                                   "started_at": r.started_at} for r in running],
                 # The oldest running Task, as daemons before the list wrote it.
                 "current_task": running[0].task_id if running else None,
                 "awake_held": self.host.awake_held(),
@@ -435,9 +440,12 @@ class QueueRunner:
             self.log(f"Task {tid} paused: {pause.reason if pause else 'spend cap reached'}")
 
     def apply_schedules(self, trigger: str = schedules.TRIGGER_POLL) -> list[schedules.Decision]:
-        """Apply every Schedule's Catch-up and Overlap rules now (§2.5)."""
+        """Apply every Schedule's Catch-up and Overlap rules now (§2.5).
+        With an Attempt running in the other lane, replacing its Task's
+        Occurrence asks that Attempt to stop, as for a separate daemon."""
         try:
-            done = schedules.apply_catch_up(self.cfg, self.db, self.clock(), trigger=trigger)
+            done = schedules.apply_catch_up(self.cfg, self.db, self.clock(), trigger=trigger,
+                                            daemon_up=bool(self.running))
         except Exception as exc:  # a broken Schedule must not stop the queue
             self.log(f"scheduler error ({trigger}): {type(exc).__name__}: {exc}")
             return []
@@ -460,9 +468,19 @@ class QueueRunner:
         self.apply_schedules(schedules.TRIGGER_WAKE)
         return True
 
+    def busy_lanes(self) -> set[str]:
+        """The lanes with an Attempt running."""
+        return {r.lane for r in list(self.running.values())}
+
     def start_next(self) -> str | None:
-        """Start an Attempt of the next queued Task on its own thread; None
-        if no slot is free, the runner is stopping or nothing may start."""
+        """Start an Attempt of the next queued Task in a free lane, on its
+        own thread; None if no slot is free, the runner is stopping or
+        nothing may start.
+
+        Returns once the Attempt has moved its Task to ``running`` (or
+        ended): the pre-pick work of the next call (failover, the
+        paid-credit rule, spend caps, the Overlap rule) changes ``queued``
+        Tasks and must never touch one an Attempt is about to run."""
         if self.stopping or len(self.running) >= self.max_running:
             return None
         self.apply_schedules()
@@ -483,16 +501,20 @@ class QueueRunner:
         # Proactive thresholds (§1.5) hold back new Tasks only; nothing fails
         # over, since the agent is not out yet.
         thresholds = usage.threshold_holds(self.cfg, self.db, self.clock())
-        # A Task just started stays `queued` until its Attempt thread moves it
-        # to `running`; never pick it a second time.
-        queued = [r for r in self.db.tasks_in_state(TaskState.QUEUED) if r["id"] not in self.running]
+        # Each free lane may start its next Task (§5 item 5): the queue order
+        # among the Tasks whose agent's lane has nothing running. The lane is
+        # read now, after any failover above moved a Task to another agent.
+        busy = self.busy_lanes()
+        queued = [r for r in self.db.tasks_in_state(TaskState.QUEUED)
+                  if r["id"] not in self.running and lane_of(r["agent"]) not in busy]
         row = pick_next(self.cfg, queued, self.clock(),
                         held_agents=thresholds.all | held,
                         held_background=thresholds.background)
         if row is None:
             return None
         task_id = row["id"]
-        slot = RunningAttempt(task_id, row["agent"], iso(now(self.cfg.timezone)), AttemptControl())
+        slot = RunningAttempt(task_id, row["agent"], lane_of(row["agent"]),
+                              iso(now(self.cfg.timezone)), AttemptControl())
         with self._lock:
             self.running[task_id] = slot
             if self.stopping:
@@ -505,10 +527,15 @@ class QueueRunner:
             self.write_state()
         eff = evaluate(self.cfg, row, self.clock()).effective
         prio = row["priority"] if eff == row["priority"] else f"{row['priority']}, effective {eff}"
-        self.log(f"Task {task_id} starting ({prio}, {row['agent']}): {row['title']}")
+        self.log(f"Task {task_id} starting ({prio}, {row['agent']}, {slot.lane} lane): "
+                 f"{row['title']}")
         slot.thread = threading.Thread(target=self._attempt, args=(slot, dict(row)),
                                        name=f"attempt-{task_id}", daemon=True)
         slot.thread.start()
+        # Until its Attempt moves it to `running`, the Task is still `queued`
+        # in the database: wait (moments) so no pick in between moves it to
+        # another agent, pauses it for spend or replaces it.
+        slot.control.started.wait()
         return task_id
 
     def _attempt(self, slot: RunningAttempt, row: dict[str, Any]) -> None:
@@ -535,6 +562,7 @@ class QueueRunner:
             except Exception as again:
                 self.log(f"Task {task_id} could not be failed: {type(again).__name__}: {again}")
         finally:
+            slot.control.started.set()
             if db is not None:
                 db.close()
             with self._lock:
@@ -552,10 +580,11 @@ class QueueRunner:
         with self._changed:
             self._changed.wait_for(lambda: task_id not in self.running, timeout)
 
-    def _wait_for_an_end(self, since: int) -> None:
-        """Wait until an Attempt has ended after the ``since``-th."""
+    def _wait_for_an_end(self, since: int, timeout: float | None = None) -> bool:
+        """Wait until an Attempt has ended after the ``since``-th (or
+        ``timeout`` seconds pass); whether one has."""
         with self._changed:
-            self._changed.wait_for(lambda: self._ended != since)
+            return self._changed.wait_for(lambda: self._ended != since, timeout)
 
     def wait_all(self) -> None:
         """Wait until no Attempt is running."""
@@ -570,9 +599,15 @@ class QueueRunner:
             self.wait(task_id)
         return task_id
 
-    def drain(self) -> list[str]:
+    def drain(self, *, poll: float | None = None) -> list[str]:
         """Run queued Tasks until the queue is empty and nothing runs, or a
-        stop is requested (then wait for the running Attempts to end)."""
+        stop is requested (then wait for the running Attempts to end).
+
+        While Attempts run, free lanes are filled again whenever one ends
+        and every ``poll`` seconds (``daemon.poll_seconds``): a Task queued
+        for the Gemini lane starts while a long Claude Task runs, not after
+        it. Each poll also checks for a wake from sleep."""
+        poll = poll_seconds(self.cfg) if poll is None else poll
         ran: list[str] = []
         while True:
             since = self._ended
@@ -583,7 +618,8 @@ class QueueRunner:
                 ran.append(tid)
             if not self.running:
                 break
-            self._wait_for_an_end(since)
+            if not self._wait_for_an_end(since, poll) and not self.stopping:
+                self.check_wake()
         return ran
 
     def serve(self, *, poll: float | None = None, exit_when_idle: bool = False) -> None:
@@ -597,7 +633,7 @@ class QueueRunner:
             self.check_wake()
             while not self.stopping:
                 self.check_wake()
-                self.drain()
+                self.drain(poll=poll)
                 if exit_when_idle or self.stopping:
                     break
                 self._stop.wait(poll)

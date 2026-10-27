@@ -734,8 +734,9 @@ def daemon_status(ctx):
         if not running:
             click.echo("  running       none")
         for t in running:
+            lane = f", {t['lane']} lane" if t.get("lane") else ""
             since = f", since {t['started_at']}" if t.get("started_at") else ""
-            agent = f" ({t['agent']}{since})" if t.get("agent") else ""
+            agent = f" ({t['agent']}{lane}{since})" if t.get("agent") else ""
             click.echo(f"  running       {t['id']}{agent}")
         click.echo(f"  awake held    {'yes (caffeinate)' if state.get('awake_held') else 'no'}")
     db = Database(cfg.db_path, tz=cfg.timezone)

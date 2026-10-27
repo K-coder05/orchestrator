@@ -17,7 +17,13 @@ from nightshift.host import FakeHost
 from nightshift.runner import create_task
 from nightshift.states import TaskState
 
+from test_gemini import fake_gemini, genv  # noqa: F401  (pytest fixture)
 from test_runner import env, fake_provider  # noqa: F401  (pytest fixture)
+
+
+def lane_provider(name, settings):
+    """The fake Claude, and the fake Gemini for the Gemini lane."""
+    return fake_gemini(settings) if name == "gemini" else fake_provider(name, settings)
 
 
 @dataclass
@@ -303,13 +309,15 @@ def test_daemon_run_exit_when_idle(config_dir, fake_host):
 
 
 # --------------------------------------------------------------------------
-# A set of running Attempts (#44): driven at a cap of 2
+# A set of running Attempts (#44): driven at a cap of 2, one Task in each
+# lane (#45)
 # --------------------------------------------------------------------------
 
 
 class GatedAttempts:
     """Fake Attempts that run until the test releases them, each on the
-    runner's Attempt thread with that thread's own DB connection."""
+    runner's Attempt thread with that thread's own DB connection. Like
+    run_attempt, each sets ``control.started`` once its Task is running."""
 
     def __init__(self, host: FakeHost):
         self.host = host
@@ -324,6 +332,7 @@ class GatedAttempts:
 
     def __call__(self, cfg, db, task_id, *, control=None, **_kw):
         db.transition(task_id, TaskState.RUNNING, "Attempt 1 started")
+        control.started.set()
         with self.cond:
             self.started.append(task_id)
             self.dbs.add(id(db))
@@ -346,9 +355,10 @@ class _Daemon(threading.Thread):
     """The queue runner on its own thread with its own DB connection, as
     in production (SQLite connections stay in their thread)."""
 
-    def __init__(self, cfg, host, *, serve=False, **kw):
+    def __init__(self, cfg, host, *, serve=False, max_running=2, **kw):
         super().__init__()
         self.cfg, self.host, self.serve, self.kw = cfg, host, serve, kw
+        self.max_running = max_running
         self.ready = threading.Event()
         self.ran: list[str] = []
         self.runner: QueueRunner | None = None
@@ -356,7 +366,8 @@ class _Daemon(threading.Thread):
     def run(self):
         ddb = Database(self.cfg.db_path, tz=self.cfg.timezone)
         try:
-            self.runner = QueueRunner(self.cfg, ddb, self.host, max_running=2, **self.kw)
+            self.runner = QueueRunner(self.cfg, ddb, self.host, max_running=self.max_running,
+                                      **self.kw)
             self.ready.set()
             if self.serve:
                 self.runner.serve(poll=0.01)
@@ -381,7 +392,7 @@ class _Daemon(threading.Thread):
 def test_cap_two_runs_two_at_once_holds_awake_until_none_runs_and_lists_both(cfg, db):
     host = FakeHost()
     a = create_task(cfg, db, "a").spec.id
-    b = create_task(cfg, db, "b").spec.id
+    b = create_task(cfg, db, "b", agent="gemini").spec.id
     c = create_task(cfg, db, "c").spec.id
     fake = GatedAttempts(host)
     d = _Daemon(cfg, host, run_attempt_fn=fake)
@@ -393,7 +404,8 @@ def test_cap_two_runs_two_at_once_holds_awake_until_none_runs_and_lists_both(cfg
         state = daemon.read_state(cfg)
         assert _ids(state) == [a, b] and state["current_task"] == a
         assert state["max_running"] == 2 and state["awake_held"] is True
-        assert [t_["agent"] for t_ in state["running_tasks"]] == ["claude", "claude"]
+        assert [t_["agent"] for t_ in state["running_tasks"]] == ["claude", "gemini"]
+        assert [t_["lane"] for t_ in state["running_tasks"]] == ["claude", "gemini"]
         assert db.task_state(c) == TaskState.QUEUED  # no free slot
 
         fake.gate(a).set()  # a ends: c takes its slot; the Mac stays awake
@@ -416,13 +428,12 @@ def test_cap_two_runs_two_at_once_holds_awake_until_none_runs_and_lists_both(cfg
 
 def test_cap_two_a_crash_in_one_attempt_leaves_the_other_running(cfg, db):
     host = FakeHost()
-    bad = create_task(cfg, db, "bad").spec.id
     good = create_task(cfg, db, "good").spec.id
+    bad = create_task(cfg, db, "bad", agent="gemini").spec.id
     fake = GatedAttempts(host)
 
     def attempt(cfg_, db_, task_id, **kw):
-        if task_id == bad:
-            fake.wait_started(1)
+        if task_id == bad:  # `good` is running by now
             raise RuntimeError("boom")
         return fake(cfg_, db_, task_id, **kw)
 
@@ -452,12 +463,13 @@ def _wait_running(runner, n):
     raise AssertionError("Attempts did not start")
 
 
-def test_cap_two_stop_requeues_every_running_task(cfg, db, env):  # noqa: F811
+def test_cap_two_stop_requeues_every_running_task(cfg, db, env, genv):  # noqa: F811
     env.setenv("FAKE_SLEEP", "30")
+    genv.setenv("FAKE_GEMINI_STEP_DELAY", "5")
     host = FakeHost()
     a = create_task(cfg, db, "slow a").spec.id
-    b = create_task(cfg, db, "slow b").spec.id
-    runner = QueueRunner(cfg, db, host, adapter_provider=fake_provider, max_running=2)
+    b = create_task(cfg, db, "slow b", agent="gemini").spec.id
+    runner = QueueRunner(cfg, db, host, adapter_provider=lane_provider, max_running=2)
     seen = {}
 
     def stop_when_both_run():
@@ -481,17 +493,19 @@ def test_cap_two_stop_requeues_every_running_task(cfg, db, env):  # noqa: F811
     assert not daemon.state_path(cfg).exists()
 
 
-def test_cap_two_cancel_and_pause_reach_the_right_attempt(cfg, db, env, monkeypatch):  # noqa: F811
+def test_cap_two_cancel_and_pause_reach_the_right_attempt(cfg, db, env, genv,  # noqa: F811
+                                                         monkeypatch):
     from datetime import datetime
 
     from nightshift import control
 
     env.setenv("FAKE_SLEEP", "30")
+    genv.setenv("FAKE_GEMINI_STEP_DELAY", "5")
     monkeypatch.setattr(daemon, "daemon_running", lambda cfg: True)
     host = FakeHost()
     a = create_task(cfg, db, "slow a").spec.id
-    b = create_task(cfg, db, "slow b").spec.id
-    d = _Daemon(cfg, host, adapter_provider=fake_provider)
+    b = create_task(cfg, db, "slow b", agent="gemini").spec.id
+    d = _Daemon(cfg, host, adapter_provider=lane_provider)
     try:
         runner = d.__enter__()
         _wait_running(runner, 2)
@@ -527,9 +541,9 @@ def test_recover_settles_several_orphaned_running_tasks(cfg, db):
     assert host.awake_log == []
 
 
-def test_shipped_cap_is_one(cfg, db):
-    assert cfg.data["daemon"]["max_running"] == 1
-    assert QueueRunner(cfg, db, FakeHost()).max_running == 1
+def test_shipped_cap_runs_both_lanes(cfg, db):
+    assert cfg.data["daemon"]["max_running"] == 2
+    assert QueueRunner(cfg, db, FakeHost()).max_running == 2
 
 
 def test_daemon_status_lists_every_running_task(config_dir, fake_host, cfg, monkeypatch):
@@ -538,11 +552,16 @@ def test_daemon_status_lists_every_running_task(config_dir, fake_host, cfg, monk
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         "pid": 1, "started_at": "s", "awake_held": True, "current_task": "t1",
-        "running_tasks": [{"id": "t1", "agent": "claude", "started_at": "x"},
-                          {"id": "t2", "agent": "gemini", "started_at": "y"}]}))
+        "running_tasks": [{"id": "t1", "agent": "codex", "lane": "claude", "started_at": "x"},
+                          {"id": "t2", "agent": "gemini", "lane": "gemini", "started_at": "y"}]}))
     out = _orch(config_dir, "daemon", "status").output
-    assert "running       t1 (claude, since x)" in out
-    assert "running       t2 (gemini, since y)" in out
+    assert "running       t1 (codex, claude lane, since x)" in out
+    assert "running       t2 (gemini, gemini lane, since y)" in out
+    # A state file from a daemon before lanes.
+    path.write_text(json.dumps({
+        "pid": 1, "started_at": "s", "current_task": "t1",
+        "running_tasks": [{"id": "t1", "agent": "claude", "started_at": "x"}]}))
+    assert "running       t1 (claude, since x)" in _orch(config_dir, "daemon", "status").output
     # A state file from a daemon before the list.
     path.write_text(json.dumps({"pid": 1, "started_at": "s", "current_task": "t9"}))
     assert "running       t9" in _orch(config_dir, "daemon", "status").output

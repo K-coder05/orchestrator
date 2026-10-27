@@ -158,6 +158,9 @@ def toml_document(overrides: dict[str, Any]) -> str:
 
 class CodexAdapter(AgentAdapter):
     name = "codex"
+    #: Codex takes over Claude's work (§2.8), so it runs in Claude's lane:
+    #: never beside a Claude Task (§5 item 5).
+    lane = "claude"
 
     def __init__(self, settings: dict[str, Any] | None = None):
         settings = settings or {}

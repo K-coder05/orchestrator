@@ -237,11 +237,11 @@ def add_schedule(cfg, db, name="rescrape", cron_rule="0 2 * * *", **kw):
 
 def test_a_schedule_firing_tonight_adds_its_occurrence(cfg, db):
     add_schedule(cfg, db)
-    first = task(cfg, db, "long first", minutes=180, long=True)
+    first = task(cfg, db, "long first", minutes=180, long=True, agent="gemini")
 
     p = tonight.preview(cfg, db, EVENING)
 
-    # It fires at 2am, while "long first" runs, and goes next.
+    # It fires at 2am, while "long first" runs in the Gemini lane, and goes next.
     assert ids(p) == [first, None]
     occ = p.entries[1]
     assert occ.title == "rescrape 2026-10-22" and occ.schedule == "rescrape"
@@ -332,3 +332,68 @@ def test_totals_per_agent_against_the_shortest_window_baseline(cfg, db):
     assert claude.cost_usd == pytest.approx(10.0) and claude.minutes == 100
     assert claude.window == "five_hour" and claude.percent_of_baseline == pytest.approx(50.0)
     assert totals["codex"].estimated == 0 and totals["codex"].percent_of_baseline is None
+
+
+# --------------------------------------------------------------------------
+# Two lanes (#45): the Claude lane and the Gemini lane run side by side
+# --------------------------------------------------------------------------
+
+
+def test_each_lane_runs_its_own_tasks_side_by_side(cfg, db):
+    c1 = task(cfg, db, "claude one", minutes=120, long=True)
+    c2 = task(cfg, db, "codex two", minutes=60, long=True, agent="codex", task_type="coding")
+    g1 = task(cfg, db, "gemini one", minutes=90, long=True, agent="gemini")
+    g2 = task(cfg, db, "gemini two", minutes=30, long=True, agent="gemini")
+
+    p = tonight.preview(cfg, db, EVENING)
+
+    # Codex shares Claude's lane: it waits for "claude one"; the Gemini
+    # Tasks don't wait for either.
+    by_id = {e.task_id: e for e in p.entries}
+    assert ids(p) == [c1, g1, g2, c2]
+    assert (by_id[c1].start, by_id[c1].end) == (la(2026, 10, 22, 0, 0), la(2026, 10, 22, 2, 0))
+    assert (by_id[g1].start, by_id[g1].end) == (la(2026, 10, 22, 0, 0), la(2026, 10, 22, 1, 30))
+    assert by_id[g2].start == la(2026, 10, 22, 1, 30)
+    assert by_id[c2].start == la(2026, 10, 22, 2, 0)
+    assert [e.lane for e in p.entries] == ["claude", "gemini", "gemini", "claude"]
+
+
+def test_both_running_tasks_hold_their_own_lanes(cfg, db):
+    at = la(2026, 10, 21, 23, 0)
+    started = la(2026, 10, 21, 22, 0)
+    running = {}
+    for agent, minutes in (("claude", 180), ("gemini", 150)):
+        tid = task(cfg, db, f"running {agent}", minutes=minutes, agent=agent)
+        db.transition(tid, TaskState.RUNNING, "picked")
+        run = db.start_attempt(tid, agent, ["x"], "log")
+        db.conn.execute("UPDATE runs SET started_at = ? WHERE id = ?", (iso(started), run))
+        db.conn.commit()
+        running[agent] = tid
+    nc = task(cfg, db, "next claude", minutes=30, long=True)
+    ng = task(cfg, db, "next gemini", minutes=30, long=True, agent="gemini")
+
+    p = tonight.preview(cfg, db, at)
+
+    by_id = {e.task_id: e for e in p.entries}
+    assert ids(p) == [running["claude"], running["gemini"], ng, nc]
+    assert all("running now" in by_id[t].notes for t in running.values())
+    assert by_id[running["claude"]].end == la(2026, 10, 22, 1, 0)
+    assert by_id[running["gemini"]].end == la(2026, 10, 22, 0, 30)
+    assert by_id[ng].start == la(2026, 10, 22, 0, 30)  # each waits for its own lane
+    assert by_id[nc].start == la(2026, 10, 22, 1, 0)
+
+
+def test_a_cap_of_one_runs_one_task_at_a_time(config_dir):
+    data = yaml.safe_load((config_dir / "config.yaml").read_text())
+    data["daemon"] = {"max_running": 1}
+    (config_dir / "config.yaml").write_text(yaml.safe_dump(data))
+    cfg = load_config(config_dir, host=FakeHost())
+    db = Database(cfg.db_path, tz=cfg.timezone)
+    try:
+        c = task(cfg, db, "claude", minutes=60, long=True)
+        g = task(cfg, db, "gemini", minutes=60, long=True, agent="gemini")
+        p = tonight.preview(cfg, db, EVENING)
+    finally:
+        db.close()
+    assert ids(p) == [c, g]
+    assert p.entries[1].start == la(2026, 10, 22, 1, 0)

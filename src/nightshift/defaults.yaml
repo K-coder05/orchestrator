@@ -233,12 +233,15 @@ tracker:
 daemon:
   # launchd LaunchAgent label; the plist is ~/Library/LaunchAgents/<label>.plist.
   label: com.nightshift.daemon
-  # How often the idle daemon checks for newly queued Tasks.
+  # How often the daemon checks for newly queued Tasks (when idle, and while
+  # one lane is busy and the other free).
   poll_seconds: 5
-  # How many Attempts may run at once. Only 1 for now: running two needs
-  # the per-agent lanes of SPEC §5 item 5 (one Claude/Codex Task and one
-  # Gemini Task), which aren't built yet.
-  max_running: 1
+  # How many Attempts may run at once, in all. Each lane runs one Task at
+  # a time whatever this is (SPEC §5 item 5): the Claude lane (Claude, or
+  # Codex when it has taken over for Claude) and the Gemini lane (Gemini
+  # and its paid API path). 2 runs both lanes at once; 1 runs one Task at
+  # a time.
+  max_running: 2
 
 dashboard:
   # Read-only web dashboard (§4 item 8), served by its own launchd agent

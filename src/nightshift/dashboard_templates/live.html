@@ -3,64 +3,109 @@
 {% block style %}
   nav { font-size: 14px; margin-bottom: 10px; }
   .meta { color: var(--muted); font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 4px 10px; }
-  #task .title { overflow-wrap: anywhere; }
-  #task .title a { color: inherit; text-decoration: none; }
+  .task .title { overflow-wrap: anywhere; }
+  .task .title a { color: inherit; text-decoration: none; }
+  .task.ended { opacity: 0.6; }
   #conn { color: var(--muted); font-size: 12.5px; }
   .idle { color: var(--muted); background: var(--panel); border-radius: 8px; padding: 10px 12px;
           border-left: 3px solid var(--queued); margin: 12px 0 0; }
-  #log { background: var(--panel); border-radius: 8px; padding: 8px 10px; margin-top: 12px;
+  #tasks { display: grid; gap: 16px; margin-top: 12px; }
+  @media (min-width: 900px) { #tasks { grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); } }
+  .task { min-width: 0; }
+  .log { background: var(--panel); border-radius: 8px; padding: 8px 10px; margin-top: 8px;
          font: 12px/1.5 ui-monospace, Menlo, monospace; overflow-x: auto;
-         max-height: 75vh; overflow-y: auto; border-left: 3px solid var(--running); }
-  #log div { white-space: pre-wrap; overflow-wrap: anywhere; }
-  #log:empty { display: none; }
+         max-height: 45vh; overflow-y: auto; border-left: 3px solid var(--running); }
+  .log div { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .log:empty { display: none; }
   [hidden] { display: none !important; }
 {% endblock %}
 {% block body %}
   <nav><a href="/">&larr; Nightshift</a></nav>
   <header>
     <h1>Live</h1>
-    <span id="conn">{% if task %}running{% else %}idle{% endif %}</span>
+    <span id="conn">{% if tasks %}running{% else %}idle{% endif %}</span>
   </header>
-  <section id="task"{% if not task %} hidden{% endif %}>
-    <div class="title"><a id="task-title" href="/tasks/{{ task.id if task else '' }}/report">{{ task.title if task else '' }}</a></div>
-    <div class="meta">
-      <code id="task-id">{{ task.id if task else '' }}</code>
-      <span id="task-kind">{% if task %}{{ task.task_type }} · {{ task.agent }}{% endif %}</span>
-    </div>
-  </section>
-  <p class="idle" id="idle"{% if task %} hidden{% endif %}>{{ idle_text }}</p>
-  <div id="log" aria-live="polite"></div>
+  <p class="idle" id="idle"{% if tasks %} hidden{% endif %}>{{ idle_text }}</p>
+  <div id="tasks">
+    {% for task in tasks %}
+    <section class="task" data-task="{{ task.id }}">
+      <div class="title"><a href="/tasks/{{ task.id }}/report">{{ task.title }}</a></div>
+      <div class="meta">
+        <code class="id">{{ task.id }}</code>
+        <span class="kind">{{ task.task_type }} · {{ task.agent }}</span>
+        <span class="status">running</span>
+      </div>
+      <div class="log" aria-live="polite"></div>
+    </section>
+    {% endfor %}
+  </div>
+  <template id="panel">
+    <section class="task">
+      <div class="title"><a href=""></a></div>
+      <div class="meta"><code class="id"></code><span class="kind"></span><span class="status"></span></div>
+      <div class="log" aria-live="polite"></div>
+    </section>
+  </template>
   <noscript><p class="idle">The live tail needs JavaScript; <code>orch logs -f &lt;id&gt;</code> shows the same lines.</p></noscript>
 <script>
 (() => {
-  // Lines go in with textContent only, never as HTML.
+  // One panel per running Task (one per lane). Lines go in with
+  // textContent only, never as HTML.
   const MAX_LINES = 2000;
   const $ = (id) => document.getElementById(id);
-  const log = $("log"), idle = $("idle"), task = $("task"), conn = $("conn");
-  const atBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+  const tasks = $("tasks"), idle = $("idle"), conn = $("conn");
+  const panelOf = (id) => [...tasks.children].find((p) => p.dataset.task === id);
   const src = new EventSource("/live/events");
   src.addEventListener("task", (e) => {
     const t = JSON.parse(e.data);
-    $("task-title").textContent = t.title;
-    $("task-title").href = "/tasks/" + encodeURIComponent(t.id) + "/report";
-    $("task-id").textContent = t.id;
-    $("task-kind").textContent = t.task_type + " · " + t.agent;
-    log.replaceChildren();
-    task.hidden = false; idle.hidden = true; conn.textContent = "running";
+    for (const p of [...tasks.children]) if (p.classList.contains("ended")) p.remove();
+    let p = panelOf(t.id);
+    if (!p) {
+      p = $("panel").content.firstElementChild.cloneNode(true);
+      p.dataset.task = t.id;
+      tasks.appendChild(p);
+    }
+    const a = p.querySelector(".title a");
+    a.textContent = t.title;
+    a.href = "/tasks/" + encodeURIComponent(t.id) + "/report";
+    p.querySelector(".id").textContent = t.id;
+    p.querySelector(".kind").textContent = t.task_type + " · " + t.agent;
+    p.querySelector(".status").textContent = "running";
+    p.querySelector(".log").replaceChildren();
+    p.classList.remove("ended");
+    idle.hidden = true; conn.textContent = "running";
   });
   src.addEventListener("line", (e) => {
-    const stick = atBottom();
+    const d = JSON.parse(e.data);
+    const p = panelOf(d.task);
+    if (!p) return;
+    const log = p.querySelector(".log");
+    const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
     const div = document.createElement("div");
-    div.textContent = e.data;
+    div.textContent = d.text;
     log.appendChild(div);
     while (log.childElementCount > MAX_LINES) log.firstElementChild.remove();
     if (stick) log.scrollTop = log.scrollHeight;
+  });
+  src.addEventListener("end", (e) => {
+    const p = panelOf(JSON.parse(e.data).task);
+    if (!p) return;
+    p.classList.add("ended");
+    p.querySelector(".status").textContent = "ended";
   });
   src.addEventListener("idle", (e) => {
     idle.textContent = e.data;
     idle.hidden = false; conn.textContent = "idle";
   });
-  src.addEventListener("open", () => { if (conn.textContent === "reconnecting") conn.textContent = "connected"; });
+  src.addEventListener("open", () => {
+    // A (re)connect starts the tail afresh: a `task` event follows for
+    // every Task still running; the others ended while we were away.
+    for (const p of [...tasks.children]) {
+      p.classList.add("ended");
+      p.querySelector(".status").textContent = "ended";
+    }
+    if (conn.textContent === "reconnecting") conn.textContent = "connected";
+  });
   src.onerror = () => { conn.textContent = "reconnecting"; };
 })();
 </script>

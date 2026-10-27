@@ -2841,3 +2841,114 @@ shipped cap of 1.
   one and pause of the other; recovery of two orphans; `orch daemon status`
   with two Tasks and with an old-format file; the shipped cap and config
   validation (`tests/test_config.py`). Existing tests are unchanged.
+
+## Phase 3, issue #45: two agents in parallel (the Claude lane and the Gemini lane)
+
+- **Lanes come from the adapters.** `AgentAdapter.lane` names the lane an
+  agent runs in: `claude` for Claude and Codex (Codex is what takes over
+  Claude's work, §2.8, so it never runs beside a Claude Task), `gemini` for
+  Gemini and its paid path `gemini-api`. An adapter without one gets a lane
+  of its own. `adapters.lane_of(agent)` reads it, so core code still names
+  no agent (§2.9). CONTEXT.md gains **Lane**.
+- **One Task per lane, at most `daemon.max_running` in all.** The runner
+  starts an Attempt only in a lane with nothing running. `max_running` now
+  ships as 2 (both lanes) and may be any positive whole number; 1 runs one
+  Task at a time across lanes. The "must be 1" check from #44 is gone: the
+  lane rule, not the cap, is what keeps two Claude/Codex Tasks apart.
+- **The pick, per lane.** Each pick does the usual pre-pick work
+  (Schedules, retries, pauses, spend caps, failover of held agents, the
+  paid-credit rule, thresholds), then `pick_next` over the queued Tasks
+  whose lane is free: Effective priority, `--at`, the long-Task window and
+  every hold apply as before, within a lane. A busy lane's urgent Task
+  doesn't block the other lane; background waits only for its own lane.
+- **A Task's lane is its agent's at the pick**, never stored. So every way
+  a Task changes agent moves it to the right lane with no extra code: a
+  queued Task failed over before it starts (`reassign_held`), a running one
+  that hits a limit and is requeued on Gemini (it waits for the Gemini lane
+  even if the Claude lane frees first), a retry that switches agent, and
+  the paid-credit rule (Gemini to `gemini-api`, the same lane). A running
+  Attempt keeps the lane it started in until it ends.
+- **The runner waits for a started Attempt to reach `running`** before its
+  next pick (`AttemptControl.started`, set by `run_attempt` right after the
+  move to `running`, and by the runner when the Attempt ends). Until then
+  the Task is still `queued`, and with two lanes the next pick's pre-pick
+  work would treat it as waiting: move it to another agent, pause it for
+  spend, or cancel it as a replaced Occurrence, under its own Attempt. The
+  wait is the few milliseconds before the agent starts. (#44 kept such a
+  Task out of the pick only; that wasn't enough once a second pick can
+  follow while it starts.) Fake Attempts in the tests set it too.
+- **The Overlap rule inside the daemon** now passes `daemon_up` when an
+  Attempt is running: replacing an Occurrence that runs in the other lane
+  asks its Attempt to stop, as `orch cancel` does, instead of cancelling
+  the Task under it. `apply_catch_up`'s "nothing runs while this is called"
+  no longer held.
+- **Free lanes are filled every poll, not only when an Attempt ends.**
+  `drain()` used to sleep until an Attempt ended; with lanes, a Gemini Task
+  queued during a two-hour Claude Task would have waited for it. It now
+  wakes every `daemon.poll_seconds` too (and checks for a wake from sleep
+  then). With every lane busy, a poll returns before any pre-pick work.
+- **Spend caps and the paid-credit rule with both lanes busy.** The only
+  paid path is `gemini-api`, in the Gemini lane, so at most one Attempt
+  records spend at a time; the Claude lane records usage meanwhile. Each
+  Attempt has its own connection (WAL, 10 s busy timeout), and every cap
+  is checked against the database after each recorded call, so the per-Task,
+  daily and monthly caps see every committed write whichever thread made
+  it (with two paid lanes, the overshoot would be at most one call per
+  Attempt). The paid-credit rule, failover and pausing for spend run only
+  on the runner's thread, at the pick.
+- **Usage thresholds and limit holds stay per agent.** Claude at 80% (or
+  out) holds new Claude Tasks only; the Gemini lane keeps going, and Codex
+  may run in the Claude lane when a coding Task fails over to it. A running
+  Task is never stopped by a threshold, as before.
+- **Per Attempt already:** stuck detection, the runtime cap, cancel, pause
+  and the spend watcher each run in their Attempt's own watchdog against
+  their own Task row; the awake hold is held while any Attempt runs (#44).
+- **The dashboard live tail follows every running Task.** `LiveTail` keeps
+  a reader per running Task (oldest first). Events: `task` (header) when a
+  Task starts, `line` now JSON `{"task", "text"}` so the page knows whose
+  line it is, a new `end` (`{"task"}`) after a stopped Task's last lines
+  and its `Task <id> is <state>.` line, and `idle` once nothing runs.
+  `/live` shows a panel per running Task (side by side on a wide screen,
+  stacked on a phone); an ended panel stays, dimmed, until the next Task
+  starts. A reconnect marks every panel ended and the fresh tail's `task`
+  events revive the running ones.
+- **Tonight's queue replays both lanes.** Each running Task holds its own
+  lane until its estimate runs out; whenever a lane is free its next Task
+  (queue order among that lane's Tasks) starts, at most `max_running` at
+  once. Failovers stay unpredicted. Each entry shows its lane.
+- **Status.** `daemon.json`'s `running_tasks` entries gain `lane`; `orch
+  daemon status` prints `running  <id> (<agent>, <lane> lane, since ...)`
+  (an older file without lanes still reads). Telegram `status` names the
+  agent on each `Running:` line (comedy Tasks still show only id and
+  state). The dashboard's `running` group already listed both.
+- **Tests.** `tests/test_lanes.py` (the runner on its own thread; fake
+  Attempts released by the test, each checking on start that its lane is
+  free): a Claude and a Gemini Task at once, Codex and a second Claude Task
+  waiting behind the first, the paid path in the Gemini lane; cap 1;
+  failover before start with both lanes busy (coding to Codex, research to
+  Gemini and picked by the Gemini lane) and mid-run (the fake Claude CLI's
+  simulated limit: requeued on Gemini, waits for the Gemini lane while the
+  Claude lane runs the next Task); the daily cap crossed by the real fake
+  `gemini-api` Attempt while the Claude lane writes usage rows in a loop
+  (the next paid Task paused without a call, the free Gemini Task runs,
+  every usage row kept); the paid-credit rule with the Claude lane busy;
+  Claude at 80% holding only the Claude lane; a Gemini Task queued while a
+  Claude Task runs starting on the next poll; and the wait for a started
+  Attempt (a clock that stops the runner's next pick shows none happens
+  while the Attempt starts; it fails without the wait). `test_schedules`:
+  the Overlap rule inside the daemon with the Occurrence running in a lane.
+  `test_tonight`, `test_dashboard`, `test_remote`, `test_daemon` and
+  `test_config`: the parts above. The #44 tests now put their second Task
+  in the Gemini lane. The concurrency tests passed 5 times in a row, and 3
+  more with 10 busy loops on the CPU.
+- **Real overlapping run (2026-10-27, 04:50 PDT).** `test_two_lanes_real`
+  (opt-in, `NIGHTSHIFT_REAL_AGENT=1`), throwaway config and agents root,
+  Claude on `haiku` (claude 2.1.311) and Gemini on `gemini-3.5-flash-lite`
+  (gemini 0.65.0, AI Studio key), cap 2. Three Tasks queued together: a
+  Claude haiku, a Gemini note, a second Claude line. The first Claude Task
+  and the Gemini Task both started at 04:50:03 (`claude lane`, `gemini
+  lane` in the log); Gemini finished at 04:50:17 while Claude still ran;
+  Claude finished at 04:50:24 and only then did the second Claude Task
+  start (04:50:24, done 04:50:39). All three `done`, one Attempt each,
+  37 s for the queue against about 50 s one at a time.
+- **Not done here:** GitHub (#46).

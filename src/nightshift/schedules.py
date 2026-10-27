@@ -436,9 +436,9 @@ def apply_catch_up(cfg: Config, db: Database, now: datetime, *, trigger: str = T
     one decision. Called by the daemon (the only process that runs this) on
     every start, wake and poll.
 
-    ``daemon_up``: whether a *separate* daemon may be running Tasks (only
-    matters for replacing a running Occurrence); inside the daemon nothing
-    runs while this is called.
+    ``daemon_up``: whether an Attempt may be running (only matters for
+    replacing a running Occurrence): a separate daemon's, or, inside the
+    daemon, one in another lane while this lane picks.
     """
     decisions: list[Decision] = []
     for row in db.schedules(enabled_only=True):

@@ -3,6 +3,7 @@ catch-up on start and wake, and `orch schedule`. All with a fake clock."""
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -736,3 +737,38 @@ def test_cli_schedule_edit(run_cli, cfg):
     res = run_cli("schedule", "edit", "nope", "--overlap", "skip", ok=False)
     assert res.exit_code == 1 and "no Schedule 'nope'" in res.output
     assert "rule       0 8 * * *" in run_cli("schedule", "list").output
+
+
+def test_overlap_replace_inside_the_daemon_requests_a_cancel_of_an_occurrence_running_in_a_lane(
+        cfg, db):
+    """With two lanes the Overlap rule can apply while an Occurrence runs in
+    the daemon itself (#45): it must ask that Attempt to stop, never cancel
+    the Task under it."""
+    from test_daemon import _Daemon
+    from test_lanes import LaneAttempts, _wait_state
+
+    add(cfg, db, la(2026, 10, 21, 7, 0), overlap="replace")
+    clock = Clock(la(2026, 10, 22, 6, 31))
+    fake = LaneAttempts()
+    d = _Daemon(cfg, FakeHost(), run_attempt_fn=fake, clock=clock, serve=True)
+    try:
+        runner = d.__enter__()
+        fake.wait_for("the first Occurrence", lambda: len(fake.started) == 1)
+        [(first, _)] = fake.started
+        clock.advance(days=1)  # the next fire, while the first still runs (its lane busy)
+        for _ in range(2000):
+            if db.cancel_requested(first):
+                break
+            threading.Event().wait(0.01)
+        assert db.cancel_requested(first) and db.task_state(first) == TaskState.RUNNING
+        [second] = [r["id"] for r in db.list_tasks() if r["id"] != first]
+        assert db.task_state(second) == TaskState.QUEUED
+        fake.gate(first).set()
+        fake.wait_for("the second Occurrence", lambda: len(fake.started) == 2)
+        fake.gate(second).set()
+        _wait_state(db, second, TaskState.DONE)
+    finally:
+        for t in list(fake.gates):
+            fake.gate(t).set()
+        runner.stop()
+        d.__exit__(None, None, None)

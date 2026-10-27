@@ -168,6 +168,8 @@ def link_system_bins(path: str, private_roots: list[Path], dest: Path) -> bool:
 
 class GeminiAdapter(AgentAdapter):
     name = "gemini"
+    #: The Gemini lane (§5 item 5), the paid API path's too.
+    lane = "gemini"
 
     def __init__(self, settings: dict[str, Any] | None = None):
         settings = settings or {}

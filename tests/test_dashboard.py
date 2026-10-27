@@ -320,6 +320,22 @@ def _running(cfg, db, title="Tailor resume for Acme"):
     return tid
 
 
+def _line(tid, text):
+    """A ``line`` event as LiveTail sends it."""
+    return ("line", json.dumps({"task": tid, "text": text}))
+
+
+def _texts(events, tid=None):
+    """The text of each ``line`` event (of Task ``tid`` only, if given)."""
+    out = []
+    for e, d in events:
+        if e == "line":
+            line = json.loads(d)
+            if tid is None or line["task"] == tid:
+                out.append(line["text"])
+    return out
+
+
 def _events(cfg, polls=1):
     app = dashboard.create_app(cfg, tailscale_ip=TAILSCALE_IP, clock=lambda: NOW,
                                live_interval=0, live_polls=polls)
@@ -345,8 +361,9 @@ def test_live_tail_matches_orch_logs_after_a_real_run(cfg, db, env):  # noqa: F8
     assert events[0][0] == "task"
     assert json.loads(events[0][1]) == {"id": tid, "title": "Write a haiku to output/haiku.txt",
                                         "task_type": "general", "agent": "claude"}
-    lines = [d for e, d in events[1:]]
     assert {e for e, _ in events[1:]} == {"line"}
+    assert _texts(events[1:], tid) == _texts(events)  # every line is this Task's
+    lines = _texts(events)
     assert lines == list(views.task_logs(cfg, db, tid))
     assert "== Attempt 1 (claude) ==" in lines and "[step] Write" in lines
 
@@ -356,14 +373,14 @@ def test_live_tail_streams_new_lines_as_they_happen(cfg, db):
     _log(db, tid, "Attempt 1 started")
     tail = dashboard.LiveTail(cfg)
 
-    assert tail.poll(db)[1:] == [("line", "[nightshift] Attempt 1 started")]
+    assert tail.poll(db)[1:] == [_line(tid, "[nightshift] Attempt 1 started")]
     assert tail.poll(db) == []
     _log(db, tid, "step one")
     with open(Path(db.get_task(tid)["folder"]) / "logs" / "nightshift.log", "a") as f:
         f.write("partial")
-    assert tail.poll(db) == [("line", "[nightshift] step one")]  # whole lines only
+    assert tail.poll(db) == [_line(tid, "[nightshift] step one")]  # whole lines only
     _log(db, tid, " now whole")
-    assert tail.poll(db) == [("line", "[nightshift] partial now whole")]
+    assert tail.poll(db) == [_line(tid, "[nightshift] partial now whole")]
 
 
 def test_live_tail_ends_like_orch_logs_f_then_goes_idle(cfg, db):
@@ -373,8 +390,9 @@ def test_live_tail_ends_like_orch_logs_f_then_goes_idle(cfg, db):
     _log(db, tid, "last words")
     db.transition(tid, TaskState.DONE, "finished")
 
-    assert tail.poll(db) == [("line", "[nightshift] last words"),
-                             ("line", f"Task {tid} is done."),
+    assert tail.poll(db) == [_line(tid, "[nightshift] last words"),
+                             _line(tid, f"Task {tid} is done."),
+                             ("end", json.dumps({"task": tid})),
                              ("idle", dashboard.IDLE_TEXT)]
     assert tail.poll(db) == []  # says idle once
 
@@ -389,9 +407,10 @@ def test_live_tail_moves_on_to_the_next_running_task(cfg, db):
 
     events = tail.poll(db)
 
-    assert events[0] == ("line", f"Task {first} is done.")
-    assert events[1][0] == "task" and json.loads(events[1][1])["id"] == second
-    assert events[2:] == [("line", "[nightshift] hello")]
+    assert events[0] == _line(first, f"Task {first} is done.")
+    assert events[1] == ("end", json.dumps({"task": first}))
+    assert events[2][0] == "task" and json.loads(events[2][1])["id"] == second
+    assert events[3:] == [_line(second, "[nightshift] hello")]
 
 
 def test_live_tail_is_idle_when_nothing_is_running(cfg, db):
@@ -399,7 +418,7 @@ def test_live_tail_is_idle_when_nothing_is_running(cfg, db):
     assert _events(cfg) == [("idle", "Nothing is running.")]
     html = _client(cfg).get("/live").text
     assert "Nothing is running." in html and 'id="idle" hidden' not in html
-    assert 'id="task" hidden' in html
+    assert 'data-task=' not in html
 
 
 def test_live_page_shows_the_running_task_and_streams_from_live_events(cfg, db):
@@ -417,9 +436,9 @@ def test_live_tail_sends_only_the_last_lines_on_connect(cfg, db):
     tid = _running(cfg, db)
     _log(db, tid, *[f"line {n}" for n in range(10)])
     events = dashboard.LiveTail(cfg, backlog=3).poll(db)
-    assert events[1:] == [("line", f"... 7 earlier lines: orch logs {tid}"),
-                          ("line", "[nightshift] line 7"), ("line", "[nightshift] line 8"),
-                          ("line", "[nightshift] line 9")]
+    assert events[1:] == [_line(tid, f"... 7 earlier lines: orch logs {tid}"),
+                          _line(tid, "[nightshift] line 7"), _line(tid, "[nightshift] line 8"),
+                          _line(tid, "[nightshift] line 9")]
 
 
 def test_live_tail_masks_secrets(cfg, db):
@@ -428,15 +447,56 @@ def test_live_tail_masks_secrets(cfg, db):
     _log(db, tid, "calling with tok-123456")
     events = _events(cfg)
     assert "tok-123456" not in str(events)
-    assert ("line", "[nightshift] calling with [REDACTED]") in events
+    assert _line(tid, "[nightshift] calling with [REDACTED]") in events
 
 
 def test_live_tail_shows_no_more_than_orch_logs_for_comedy(cfg, db):
     tid = create_task(cfg, db, "Punch up the bit", task_type="comedy").spec.id
     db.transition(tid, TaskState.RUNNING, "picked")
     _log(db, tid, "Attempt 1 started")
-    lines = [d for e, d in dashboard.LiveTail(cfg).poll(db) if e == "line"]
+    lines = _texts(dashboard.LiveTail(cfg).poll(db))
     assert lines == list(views.task_logs(cfg, db, tid))
+
+
+def test_live_tail_follows_both_running_tasks(cfg, db):
+    claude = _running(cfg, db, "Claude work")
+    gemini = create_task(cfg, db, "Gemini work", agent="gemini", task_type="research").spec.id
+    db.transition(gemini, TaskState.RUNNING, "picked")
+    _log(db, claude, "claude says")
+    _log(db, gemini, "gemini says")
+    tail = dashboard.LiveTail(cfg)
+
+    events = tail.poll(db)
+
+    headers = [json.loads(d) for e, d in events if e == "task"]
+    assert [(h["id"], h["agent"]) for h in headers] == [(claude, "claude"), (gemini, "gemini")]
+    assert _texts(events, claude) == ["[nightshift] claude says"]
+    assert _texts(events, gemini) == ["[nightshift] gemini says"]
+
+    # New lines from each, then one ends: the other goes on, no idle.
+    _log(db, gemini, "more gemini")
+    _log(db, claude, "last claude")
+    db.transition(claude, TaskState.DONE, "finished")
+    events = tail.poll(db)
+    assert events[:3] == [_line(claude, "[nightshift] last claude"),
+                          _line(claude, f"Task {claude} is done."),
+                          ("end", json.dumps({"task": claude}))]
+    assert events[3:] == [_line(gemini, "[nightshift] more gemini")]
+    assert tail.poll(db) == []
+
+    db.transition(gemini, TaskState.DONE, "finished")
+    assert tail.poll(db)[-2:] == [("end", json.dumps({"task": gemini})),
+                                  ("idle", dashboard.IDLE_TEXT)]
+
+
+def test_live_page_shows_a_panel_for_each_running_task(cfg, db):
+    claude = _running(cfg, db, "Claude work")
+    gemini = create_task(cfg, db, "Gemini work", agent="gemini", task_type="research").spec.id
+    db.transition(gemini, TaskState.RUNNING, "picked")
+    html = _client(cfg).get("/live").text
+    assert f'data-task="{claude}"' in html and f'data-task="{gemini}"' in html
+    assert "research · gemini" in html
+    assert [json.loads(d)["id"] for e, d in _events(cfg) if e == "task"] == [claude, gemini]
 
 
 def test_events_cannot_forge_another_event():

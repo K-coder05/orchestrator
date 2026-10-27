@@ -33,6 +33,12 @@ def paid_path(agent: str) -> str | None:
                 None)
 
 
+def lane_of(name: str) -> str:
+    """The queue runner lane agent ``name`` runs in (§5 item 5): its
+    adapter's ``lane``, else a lane of its own."""
+    return getattr(REGISTRY.get(name), "lane", None) or name
+
+
 def load_api_key(adapter: AgentAdapter, secrets: Any, *, required: bool = False) -> None:
     """Give ``adapter`` the API key it signs in with (the secret named by its
     ``api_key_secret``, if any); loading it registers it for redaction. With

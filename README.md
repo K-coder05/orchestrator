@@ -72,7 +72,8 @@ proposes a Task type, prints both and asks y/n (`--type T` overrides the type,
 `~/agents/tasks/YYYY-MM-DD_<slug>_<id>/`, queues the Task and returns. A Task
 estimated over 30 minutes gets a `plan.md` first; `orch add` prints it and asks
 for approval, and a no leaves it `awaiting_approval` for `orch approve` or
-`orch deny`. The daemon runs queued Tasks one at a time, holding the Mac awake
+`orch deny`. The daemon runs queued Tasks one at a time in each of two lanes
+(a Claude or Codex Task beside a Gemini Task), holding the Mac awake
 with `caffeinate` only while one runs, and leaves a finished `report.md` in the
 folder. `orch daemon status` shows whether it is up; `orch daemon run` runs it
 in a terminal instead of under launchd. `orch show <id>` lists a Task's

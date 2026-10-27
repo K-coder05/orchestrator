@@ -28,7 +28,7 @@ per dashboard process. Anything else changes nothing.
 Read routes: ``/`` (the "needs you" inbox, with each plan awaiting approval
 and Approve / Deny, then Tasks grouped by status, with their controls),
 ``/tasks/<id>/report`` (the Task's ``report.md`` rendered as Markdown, with
-its controls), ``/live`` (a live tail of the running Task's logs, streamed from
+its controls), ``/live`` (a live tail of every running Task's logs, streamed from
 ``/live/events`` as server-sent events), ``/schedules`` (tonight's queue
 preview, then the Schedule list) and ``/usage`` (the usage meter per agent
 and Window, with live reset countdowns, and the spend tracker against the
@@ -217,7 +217,7 @@ def render_markdown(text: str) -> Markup:
 # Live log tail
 # --------------------------------------------------------------------------
 
-#: Lines of the running Task's log sent when the tail starts on it; earlier
+#: Lines of a running Task's log sent when the tail starts on it; earlier
 #: ones are left to `orch logs`.
 BACKLOG = 200
 
@@ -225,59 +225,64 @@ IDLE_TEXT = "Nothing is running."
 
 
 class LiveTail:
-    """The running Task's log lines for ``/live``, one poll at a time.
+    """Every running Task's log lines for ``/live``, one poll at a time:
+    with one Task running in each lane (§5 item 5), both are tailed side by
+    side.
 
     Lines are exactly what ``orch logs -f`` prints (``views.LogReader``),
     then masked with every known secret value like other output. Each poll
-    returns ``(event, data)`` pairs: ``task`` when a Task starts running (or
-    on the first poll, with only its last ``BACKLOG`` lines after it),
-    ``line`` for each log line, and ``idle`` once nothing is running. When
-    the Task stops, its last lines and the ``Task <id> is <state>.`` line
-    that ends ``orch logs -f`` come before ``idle`` or the next ``task``.
-    The daemon runs one Task at a time; were there ever several, the oldest
-    is tailed."""
+    returns ``(event, data)`` pairs: ``task`` (the Task's header, JSON) when
+    a Task starts running (or on the first poll, with only its last
+    ``BACKLOG`` lines after it), ``line`` for each log line (JSON: ``task``,
+    its id, and ``text``), and ``idle`` once nothing is running. When a Task
+    stops, its last lines and the ``Task <id> is <state>.`` line that ends
+    ``orch logs -f`` come before ``end`` (JSON: ``task``), and that before
+    ``idle`` or any next ``task``. Tasks come oldest first."""
 
     def __init__(self, cfg: Config, *, backlog: int = BACKLOG):
         self.cfg = cfg
         self.backlog = backlog
-        self.reader: views.LogReader | None = None
+        #: A reader per Task being tailed, oldest first.
+        self.readers: dict[str, views.LogReader] = {}
         self.idle: bool | None = None  # None until the first poll
 
-    def _line(self, text: str) -> tuple[str, str]:
-        return ("line", self.cfg.secrets.redact(text))
+    def _line(self, task_id: str, text: str) -> tuple[str, str]:
+        return ("line", json.dumps({"task": task_id, "text": self.cfg.secrets.redact(text)}))
 
     def poll(self, db: Database) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
         running = db.tasks_in_state(TaskState.RUNNING)
-        current = running[0] if running else None
-        if self.reader is not None and (current is None or current["id"] != self.reader.task_id):
-            ended = self.reader
-            self.reader = None
+        ids = {r["id"] for r in running}
+        for tid in [t for t in self.readers if t not in ids]:
+            ended = self.readers.pop(tid)
             try:
                 lines = ended.read(db)
             except KeyError:  # deleted
                 lines = []
-            out += [self._line(line) for line in lines]
+            out += [self._line(tid, line) for line in lines]
             if ended.state is not None:
-                out.append(self._line(views.stopped_line(ended.task_id, ended.state)))
-        if current is None:
+                out.append(self._line(tid, views.stopped_line(tid, ended.state)))
+            out.append(("end", json.dumps({"task": tid})))
+        if not running:
             if self.idle is not True:
                 out.append(("idle", IDLE_TEXT))
             self.idle = True
             return out
         self.idle = False
-        if self.reader is None:
-            self.reader = views.LogReader(self.cfg, current["id"])
-            out.append(("task", json.dumps(_task_header(current))))
-            lines = self.reader.read(db)
-            if len(lines) > self.backlog:
-                skipped = len(lines) - self.backlog
-                out.append(self._line(
-                    f"... {skipped} earlier lines: orch logs {current['id']}"))
-                lines = lines[-self.backlog:]
-        else:
-            lines = self.reader.read(db)
-        out += [self._line(line) for line in lines]
+        for row in running:
+            tid = row["id"]
+            reader = self.readers.get(tid)
+            if reader is None:
+                reader = self.readers[tid] = views.LogReader(self.cfg, tid)
+                out.append(("task", json.dumps(_task_header(row))))
+                lines = reader.read(db)
+                if len(lines) > self.backlog:
+                    skipped = len(lines) - self.backlog
+                    out.append(self._line(tid, f"... {skipped} earlier lines: orch logs {tid}"))
+                    lines = lines[-self.backlog:]
+            else:
+                lines = reader.read(db)
+            out += [self._line(tid, line) for line in lines]
         return out
 
 
@@ -655,8 +660,8 @@ def create_app(
             running = db.tasks_in_state(TaskState.RUNNING)
         finally:
             db.close()
-        task = _task_header(running[0]) if running else None
-        return env.get_template("live.html").render(task=task, idle_text=IDLE_TEXT)
+        tasks = [_task_header(r) for r in running]
+        return env.get_template("live.html").render(tasks=tasks, idle_text=IDLE_TEXT)
 
     @app.get("/live/events")
     def live_events(request: Request) -> StreamingResponse:

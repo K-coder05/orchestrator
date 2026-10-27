@@ -75,6 +75,10 @@ def test_status_shows_daemon_running_task_queue_and_needs_you(chat, tg_cfg, tg_d
     monkeypatch.setattr(daemon, "daemon_running", lambda cfg: True)
     run = create_task(tg_cfg, tg_db, "Fix the flaky test", task_type="coding").spec.id
     _running(tg_db, run)
+    # One Task in each lane (#45): both are listed.
+    gem = create_task(tg_cfg, tg_db, "Summarize lecture 3", task_type="summary",
+                      agent="gemini").spec.id
+    _running(tg_db, gem)
     create_task(tg_cfg, tg_db, "Queued one")
     create_task(tg_cfg, tg_db, "Queued two")
     rw = create_task(tg_cfg, tg_db, "Waits to retry").spec.id
@@ -87,7 +91,8 @@ def test_status_shows_daemon_running_task_queue_and_needs_you(chat, tg_cfg, tg_d
     text = chat.reply("/status")
     assert text.splitlines() == [
         "Nightshift: daemon up",
-        f"Running: {run} coding: Fix the flaky test",
+        f"Running: {run} coding on claude: Fix the flaky test",
+        f"Running: {gem} summary on gemini: Summarize lecture 3",
         "Queue: 3 waiting to run (2 queued, 1 waiting to retry, 0 scheduled), 0 paused",
         "Needs you: 2 open",
     ]

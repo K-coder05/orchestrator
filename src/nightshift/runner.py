@@ -204,6 +204,11 @@ class AttemptControl:
         self.stuck_why: str | None = None
         #: The last tool call seen, as ``stuck.call_text`` quotes it.
         self.last_call: str | None = None
+        #: Set once the Attempt has moved its Task out of ``queued`` (to
+        #: ``running``); the queue runner sets it too when the Attempt ends.
+        #: Until then the Task is still ``queued`` in the database, and the
+        #: runner waits before its next pick changes queued Tasks.
+        self.started = threading.Event()
 
     def stop_after_step(self, reason: str, kind: str, limit: RateLimit | None = None) -> None:
         if self.pending is None:
@@ -568,6 +573,7 @@ def run_attempt(
     db.transition(task_id, TaskState.RUNNING, started, run_id=run_id,
                   set_fields={"resume_pending": 0, "request_decision_id": None,
                               "stuck_note": None})
+    control.started.set()
     _log(folder, f"{iso(now(cfg.timezone))} {started}: {json.dumps(stored_argv)}", redact)
 
     # Fault injection: one simulated limit per Task, after N Steps of an Attempt.

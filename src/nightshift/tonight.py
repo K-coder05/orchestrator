@@ -2,19 +2,23 @@
 long-task window (midnight to 7am by default), in queue order, and roughly
 how much usage it will take.
 
-It replays the queue on a simulated clock, one Task at a time as the daemon
-runs them, from now until the window ends:
+It replays the queue on a simulated clock, as the daemon runs it, from now
+until the window ends: one Task at a time in each lane (§5 item 5: the
+Claude lane and the Gemini lane run side by side), at most
+``daemon.max_running`` in all.
 
 * Tasks in the queue now, Tasks in ``retry_wait`` (from their ``retry_at``)
   and Tasks paused on a usage limit or the daily spend cap (from their
-  ``resume_at``) are the candidates; the running Task holds the queue until
+  ``resume_at``) are the candidates; each running Task holds its lane until
   its estimate runs out.
 * Enabled Schedules add the Occurrences they will create, at each fire
   (after the Overlap rule ``skip``: a fire while the Schedule's previous
   Occurrence is still unfinished creates nothing).
-* At each step the next Task is ``priority.pick_next``'s, so the order is
+* Whenever a lane is free, its next Task is the first in
+  ``priority.order`` among the Tasks of that lane's agents, so the order is
   the queue's own: Effective priority (deadlines coming within 24 hours
-  turn urgent as the clock moves), long-Task gating and ``--at``.
+  turn urgent as the clock moves), long-Task gating and ``--at``. A Task's
+  lane is its agent's now (failovers are not predicted).
 * Each Task takes its ``estimated_minutes`` (``DEFAULT_MINUTES`` when it has
   none).
 
@@ -39,6 +43,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import pauses, planning, priority, schedules, templates, usage
+from .adapters import lane_of
 from .config import Config, ConfigError
 from .db import Database
 from .states import TERMINAL, TaskState
@@ -123,6 +128,8 @@ class TonightEntry:
     title: str
     task_type: str
     agent: str
+    #: The queue runner lane it runs in (its agent's).
+    lane: str
     priority: str
     #: The Effective priority when it is expected to start.
     effective_priority: str
@@ -224,19 +231,19 @@ def _candidates(cfg: Config, db: Database, now: datetime) -> list[_Item]:
     return items
 
 
-def _running(cfg: Config, db: Database, now: datetime) -> tuple[_Item, datetime] | None:
-    """The running Task (the oldest, were there several) and when its estimate runs out."""
-    rows = db.tasks_in_state(TaskState.RUNNING)
-    if not rows:
-        return None
-    r = rows[0]
-    attempts = db.attempts(r["id"])
-    started = (parse_iso(attempts[-1]["started_at"]) if attempts and not attempts[-1]["ended_at"]
-               else parse_iso(r["state_changed_at"]))
-    total = _minutes(r["estimated_minutes"])
-    left = max(total - (now - started).total_seconds() / 60, 1.0)
-    return _Item(dict(r), now, left, r["estimated_minutes"], ["running now"]), now + timedelta(
-        minutes=left)
+def _running(cfg: Config, db: Database, now: datetime) -> list[tuple[_Item, datetime]]:
+    """Every running Task (one per lane) and when its estimate runs out."""
+    out = []
+    for r in db.tasks_in_state(TaskState.RUNNING):
+        attempts = db.attempts(r["id"])
+        started = (parse_iso(attempts[-1]["started_at"])
+                   if attempts and not attempts[-1]["ended_at"]
+                   else parse_iso(r["state_changed_at"]))
+        total = _minutes(r["estimated_minutes"])
+        left = max(total - (now - started).total_seconds() / 60, 1.0)
+        out.append((_Item(dict(r), now, left, r["estimated_minutes"], ["running now"]),
+                    now + timedelta(minutes=left)))
+    return out
 
 
 @dataclass
@@ -311,13 +318,17 @@ def preview(cfg: Config, db: Database, now: datetime,
              if r["schedule_name"] and TaskState(r["state"]) not in TERMINAL
              and r["id"] not in in_replay and r["state"] != str(TaskState.RUNNING)}
 
+    from .daemon import running_cap  # late: the daemon module imports a lot
+
+    cap = running_cap(cfg)
     t = now
-    running = _running(cfg, db, now)
-    if running is not None:
-        item, until = running
+    #: Each busy lane and when its Task is expected to end.
+    busy: dict[str, datetime] = {}
+    for item, until in _running(cfg, db, now):
         ev = priority.evaluate(cfg, item.row, now)
         ran.append((item, now, until, ev.effective))
-        t = until
+        lane = lane_of(item.row["agent"])
+        busy[lane] = max(until, busy.get(lane, until))
 
     def unfinished(name: str, at: datetime) -> bool:
         if name in stuck:
@@ -327,6 +338,7 @@ def preview(cfg: Config, db: Database, now: datetime,
         return any(i.row.get("schedule_name") == name and e > at for i, _, e, _ in ran)
 
     for _ in range(MAX_STEPS):
+        busy = {lane: until for lane, until in busy.items() if until > t}
         while fires and fires[0].at <= t:
             f = fires.pop(0)
             if f.schedule.overlap == schedules.OVERLAP_SKIP and unfinished(f.schedule.name, f.at):
@@ -337,17 +349,20 @@ def preview(cfg: Config, db: Database, now: datetime,
         if t >= end:
             break
         ready = [i for i in pending if i.available_at <= t]
-        order = priority.order(cfg, [i.row for i in ready], t)
-        pick = next((ev for ev in order if ev.blocked is None), None)
+        pick = None
+        if len(busy) < cap:
+            free = [i.row for i in ready if lane_of(i.row["agent"]) not in busy]
+            pick = next((ev for ev in priority.order(cfg, free, t) if ev.blocked is None), None)
         if pick is not None:
             item = next(i for i in ready if i.row is pick.row)
             pending.remove(item)
             finish = t + timedelta(minutes=item.minutes)
             ran.append((item, t, finish, pick.effective))
-            t = finish
-            continue
-        # Nothing may start now: jump to the next moment something changes.
-        wake = [i.available_at for i in pending if i.available_at > t]
+            busy[lane_of(item.row["agent"])] = finish
+            continue  # another lane may start at the same moment
+        # Nothing more may start now: jump to the next moment something changes.
+        wake = list(busy.values())
+        wake += [i.available_at for i in pending if i.available_at > t]
         wake += [parse_iso(i.row["run_at"]) for i in ready
                  if i.row["run_at"] and parse_iso(i.row["run_at"]) > t]
         if fires:
@@ -373,7 +388,8 @@ def preview(cfg: Config, db: Database, now: datetime,
         rate = history.rate(row["agent"], row.get("template"), row["task_type"])
         entries.append(TonightEntry(
             task_id=row["id"], title=row["title"], task_type=row["task_type"],
-            agent=row["agent"], priority=row["priority"], effective_priority=eff,
+            agent=row["agent"], lane=lane_of(row["agent"]), priority=row["priority"],
+            effective_priority=eff,
             start=s.astimezone(tz), end=e.astimezone(tz),
             estimated_minutes=item.estimated_minutes, minutes=item.minutes,
             schedule=row.get("schedule_name"), notes=notes,

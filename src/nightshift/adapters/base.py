@@ -187,6 +187,10 @@ class AgentAdapter(ABC):
     #: (no process under the agent's own) and no output for this many
     #: seconds is stopped as a Failed Attempt. None: no guard.
     stall_seconds: float | None = None
+    #: The queue runner's lane (§5 item 5): it runs at most one Task per
+    #: lane at a time, so agents that share a lane never run at once. None:
+    #: a lane of the agent's own.
+    lane: str | None = None
 
     @abstractmethod
     def build_command(

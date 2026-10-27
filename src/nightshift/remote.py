@@ -6,7 +6,7 @@ message from ``telegram.user_id`` to :func:`run`, which answers through
 
 | Command                 | Does                                              |
 |-------------------------|---------------------------------------------------|
-| ``status``              | daemon up or down, running Task, queue, needs you |
+| ``status``              | daemon, running Tasks, queue, needs you           |
 | ``list [state ...]``    | Tasks grouped by status, optionally some states   |
 | ``approve <id>``        | approve a plan, or a needs-you request (requeued) |
 | ``deny <id>``           | deny it (a plan: cancelled; a request: requeued)  |
@@ -68,7 +68,7 @@ FINISHED_LIMIT = 10
 TITLE_CHARS = 50
 
 HELP = """Nightshift commands:
-status - daemon, running Task, queue, needs you
+status - daemon, running Tasks, queue, needs you
 list [state ...] - Tasks by status (e.g. list queued failed)
 approve <id> - approve a Task's plan, or its needs-you request
 deny <id> - deny it (a plan: cancelled; a request: requeued without it)
@@ -212,7 +212,8 @@ def status_text(cfg: Config, db: Database) -> str:
         if _status_only(r["task_type"]):
             lines.append(f"Running: {r['id']} {r['state']}")
         else:
-            lines.append(f"Running: {r['id']} {r['task_type']}: {r['title'][:TITLE_CHARS]}")
+            lines.append(f"Running: {r['id']} {r['task_type']} on {r['agent']}: "
+                         f"{r['title'][:TITLE_CHARS]}")
     counts, groups = views.queue_summary(db), dict(queries.STATUS_GROUPS)
     waiting = sum(counts.get(str(s), 0) for s in groups["queued"])
     paused = sum(counts.get(str(s), 0) for s in groups["paused"])

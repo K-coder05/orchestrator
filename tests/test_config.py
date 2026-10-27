@@ -193,8 +193,14 @@ def test_telegram_user_id_is_validated_and_redacted(tmp_path):
     assert cfg.secrets.redact("sent to 424242424") == "sent to [REDACTED]"
 
 
-@pytest.mark.parametrize("bad", [0, 2, "1", True, 1.5])
-def test_daemon_max_running_must_be_one_for_now(tmp_path, bad):
+@pytest.mark.parametrize("bad", [0, -1, "1", True, 1.5])
+def test_daemon_max_running_must_be_a_positive_whole_number(tmp_path, bad):
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({"daemon": {"max_running": bad}}))
     with pytest.raises(ConfigError, match="daemon.max_running"):
         load_config(tmp_path, host=FakeHost())
+
+
+@pytest.mark.parametrize("cap", [1, 2, 3])
+def test_daemon_max_running_may_be_any_cap_since_lanes_hold_one_each(tmp_path, cap):
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"daemon": {"max_running": cap}}))
+    assert load_config(tmp_path, host=FakeHost()).data["daemon"]["max_running"] == cap

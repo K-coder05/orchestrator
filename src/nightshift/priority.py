@@ -174,8 +174,9 @@ def pick_next(
     """The queued Task to start now, or None if none may start.
 
     Urgent jumps the queue, normal runs in order, and background runs only
-    when nothing else is waiting: since only one Task runs at a time, it is
-    picked only when no urgent or normal Task may start now. A Task held back
+    when nothing else is waiting: it is picked only when no urgent or normal
+    Task among ``rows`` may start now. The queue runner passes the queued
+    Tasks of its free lanes only (§5 item 5), so this holds per lane. A Task held back
     by ``--at`` or the long-task window isn't waiting to run yet, so it
     doesn't block the queue.
     """

@@ -49,6 +49,10 @@ A Schedule's rule for fires missed while the machine slept: run within N hours o
 **Overlap rule**:
 A Schedule's rule for when it fires while its previous Occurrence is not yet finished: `skip` the new fire (default) or `replace` the old Occurrence.
 
+**Lane**:
+One of the daemon's parallel tracks, each running one Task at a time: the Claude lane (Claude, or Codex when it has taken over for Claude) and the Gemini lane (Gemini and its paid API path). A Task is in the lane of its current agent, so a failover can move it to the other lane.
+_Avoid_: Slot, worker, queue
+
 ### Outcomes
 
 **Failed Attempt**:

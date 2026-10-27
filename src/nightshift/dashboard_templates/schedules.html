@@ -59,7 +59,7 @@
         </div>
         <div class="meta">
           {% if e.task_id %}<code>{{ e.task_id }}</code>{% else %}<span>new Occurrence of {{ e.schedule }}</span>{% endif %}
-          <span>{{ e.task_type }} · {{ e.agent }}</span>
+          <span>{{ e.task_type }} · {{ e.agent }} · {{ e.lane }} lane</span>
           <span{% if e.effective_priority == "urgent" %} class="urgent"{% endif %}>{{ e.effective_priority }}{% if e.effective_priority != e.priority %} (assigned {{ e.priority }}){% endif %}</span>
           <span>{{ e.minutes|minutes }}</span>
           {% for n in e.notes %}<span>{{ n }}</span>{% endfor %}
