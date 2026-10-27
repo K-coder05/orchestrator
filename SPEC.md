@@ -2,7 +2,7 @@
 
 > **Instructions for Claude Code**
 >
-> **CURRENT PHASE: 2.** Build only the current phase. Do not start work listed under a later phase, even if it looks easy. Do not implement anything listed under "Open decisions" (§7) until it is resolved in this file.
+> **CURRENT PHASE: 3.** Build only the current phase. Do not start work listed under a later phase, even if it looks easy. Do not implement anything listed under "Open decisions" (§7) until it is resolved in this file.
 >
 > - If something in this spec is ambiguous or contradicts itself, stop and ask. Do not guess.
 > - If a CLI flag, output format or error message named here doesn't match the installed tool, trust the tool (`--help`, real output), record what you found in `docs/adapters.md`, and tell me.
