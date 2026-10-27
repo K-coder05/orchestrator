@@ -2247,3 +2247,109 @@ lasting consequences go in `docs/adr/` instead.
   daemon's next fire), bad values refused in place, plain posts, the guard
   on all three routes (missing, foreign and other-port Origin, missing and
   wrong token, fragment and plain, cross-site fetch), GETs are 405.
+
+## Phase 3, issue #39: research templates (`research-report`, `company-brief`)
+
+- **Two templates, one post-hook.** `templates/research-report.yaml` (a
+  report on a topic, result `output/research.md`) and
+  `templates/company-brief.yaml` (the company and interviewer brief, result
+  `output/brief.md`; named for what it makes, as `resume-tailor` is). Both
+  end with the new `research_rules` hook (`nightshift.research`, wired in
+  `templates.HOOKS`), so a failing check is a Failed Attempt through the
+  usual post-hook path, with its retries. No intake path knows about them:
+  `orch add --template`, Telegram `add <template> <request>` and the
+  dashboard all go through `control.propose`/`create` as for any template.
+- **Task type `research`, agent `claude`, failover to Gemini.** As the
+  issue says: internet on, long (midnight-7am unless urgent;
+  `--priority urgent` for an interview tomorrow), and §2.8's row "Research
+  ... out of Claude usage: fail over to Gemini" through
+  `task_types.research.failover` (`[claude, gemini]`, `when: always`).
+  Gemini was the first choice (§1 gives it "web research"; posting-scan and
+  company-rescrape run there), but the real run below showed that on this
+  Mac's Gemini sign-in (the AI Studio key, #17) `google_web_search` answers
+  429 "You exceeded your current quota" on every call. The CLI retries it
+  silently until the stall guard ends the Attempt, twice, before the
+  second retry switches to Claude: 10+ minutes lost per Task. So Claude
+  runs them, and Gemini takes over only when Claude is out (its `web_fetch`
+  still works for pages it is pointed at). Revisit if Gemini's search
+  quota changes; `--agent gemini` tries it per Task.
+- **Estimates.** `research-report` 45 min (over 30, so a one-off gets a
+  plan.md to approve, §2.4, one tap on Telegram), cap 120.
+  `company-brief` 30 min (no plan approval; usually wanted quickly), cap 90.
+- **What a "claim" is.** Each sentence of a paragraph, list item, table row
+  or quote with at least 4 words that doesn't end in `?` (a question, such
+  as the brief's "Questions I could ask") or `:` (a lead-in to a list).
+  Headings, fenced code, HTML comments, a table's header row and the
+  Sources section are not claims. Sentence level, not paragraph level: a
+  paragraph with one citation and four uncited facts must not pass ("every
+  claim cites a URL"). A sentence is cited by an http(s) URL in it (bare or
+  a Markdown link) or a `[n]`/`[n, m]`/`[n-m]`/`[^n]` marker naming a
+  Sources entry; a marker left alone after the full stop (`... 2019. [3]`
+  or `... 2019. [3] Next ...`) is the sentence before's. Abbreviations
+  (`Inc.`, `e.g.`, `U.S.`) and initials don't end a sentence.
+- **The label is `*unverified*`** (italic, as §2.11 writes it; `_..._` and
+  bold are taken too). A cited sentence that also carries it counts as
+  cited.
+- **"5 distinct sources" = 5 distinct cited URLs**, normalized like Tracker
+  posting URLs (`tracker.normalize_url`: `www.`, scheme, trailing slash,
+  tracking parameters). A Sources entry nothing cites doesn't count (it
+  sources no claim). Distinct pages, not domains: a company brief draws on
+  the company's own pages, and counting domains would push it toward
+  weaker sources.
+- **"One page" = 500 words** of body text (`min_words`, hook-configurable),
+  about one single-spaced page; the Sources section, headings and URLs
+  don't count, so a padded bibliography can't make up the length.
+- **Also fails:** a `[n]` with no Sources entry `n` (a made-up citation),
+  and any cited URL on `permissions.denied_domains` (no LinkedIn even as a
+  citation; the web tools already deny fetching it).
+- **The report lists the sources.** Nightshift writes a Sources section
+  into `report.md` (the appendix after section 9) from the result file,
+  never from the agent's report: every distinct cited source, numbered,
+  title and URL, then the count of *unverified* claims. The agent is told
+  not to repeat the list in its Summary.
+- **Interviewers.** Public professional work only (talks, papers, posts,
+  open source, company team pages); nothing personal or from social media
+  profiles; never contacting anyone. Instruction-only (docs/safety.md).
+- **Tests.** `tests/test_research.py`: the rules one by one (fewer than 5
+  distinct sources, the same page twice, uncited entries, an uncited claim,
+  each label form, under one page, Sources not counted toward length, a
+  dangling marker, LinkedIn, inline links and bare URLs, what isn't a
+  claim, abbreviations and trailing markers, marker forms, reference
+  definitions), hook validation, both templates loading and rendering, and
+  end to end with the fake Claude (`FAKE_RESEARCH`, also in the fake
+  Gemini): `orch add --template research-report` with its plan approved,
+  run to `done` with the Sources section in the report; `company-brief`
+  failing each check as Failed Attempts until the Task is `failed`; a
+  missing result; a retry that passes; the Telegram intake parsing both.
+  `tests/test_research.py::test_research_report_real` is the opt-in real
+  run (`NIGHTSHIFT_REAL_AGENT=1`).
+- **A bold lead-in is a label, not a claim.** Found in the real run:
+  Claude wrote list items as `**Page size is fixed.** You cannot change
+  ... [1].`, and the bold phrase was split off as an uncited sentence. A
+  sentence that is all bold now goes with the sentence after it. Prompts
+  also say topic sentences need a citation (the one genuine miss there).
+- **The report's Sources list keeps the result's numbers** (`- [3] Title -
+  <url>`), sorted by number, so a `[3]` in the result finds its line;
+  sources cited only inline follow in order of first citation.
+- **Real runs (2026-10-27).** Throwaway config and agents root under
+  pytest's tmp dir, `research-report`, request "Research how SQLite's
+  write-ahead log (WAL) mode works and when to use it", urgent, plan
+  approved without a planning call.
+  - On Gemini first (as then templated; `gemini-3.5-flash`, then
+    `gemini-3.5-flash-lite`, AI Studio key): `gemini-3.5-flash` answered 503
+    "high demand"; on flash-lite every `google_web_search` got 429 "You
+    exceeded your current quota" and both Gemini Attempts ended by the stall
+    guard after 5 min. The second retry switched to Claude (retry-with-
+    switch, §2.7), which wrote a 1,913-word report with 8 distinct sources;
+    `research_rules` failed it on 4 "uncited" sentences: 3 bold lead-ins
+    (a parser bug, fixed above) and one real uncited topic sentence. Task
+    `failed` after 3 Attempts, 13 min. This run is why the templates now
+    start on Claude.
+  - On Claude (`tests/test_research.py::test_research_report_real`, the
+    CLI's default model): Task `dumo`, one Attempt, `done` in 2m 31s.
+    `output/research.md` 1,813 words, 79 claims, 9 distinct sources (8
+    pages of sqlite.org and the Fly.io blog), 0 unverified, 0 uncited: all
+    pass. The report's Sources section lists all 9 with their numbers.
+    Usage: 110k input / 31k output tokens, 10 requests, $0.62
+    cost-equivalent, $0 spent (subscription). `company-brief` was not run
+    for real (same hook and path; its prompt differs only in content).

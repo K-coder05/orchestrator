@@ -155,6 +155,12 @@ if os.environ.get("FAKE_PROPOSED"):
 if os.environ.get("FAKE_PAGES"):
     # A company-rescrape agent's career page listing (FAKE_PAGES names it).
     Path("output/career_pages.json").write_text(Path(os.environ["FAKE_PAGES"]).read_text())
+if os.environ.get("FAKE_RESEARCH"):
+    # A research template's result (research-report, company-brief), copied
+    # to FAKE_RESEARCH_TO (default output/research.md).
+    Path("output").mkdir(exist_ok=True)
+    Path(os.environ.get("FAKE_RESEARCH_TO") or "output/research.md").write_text(
+        Path(os.environ["FAKE_RESEARCH"]).read_text())
 
 result = os.environ.get("FAKE_RESULT", "done")
 if result != "none":

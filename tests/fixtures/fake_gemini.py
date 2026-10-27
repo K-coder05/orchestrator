@@ -23,6 +23,8 @@ FAKE_GEMINI_CALL_TOKENS (JSON usage of each call), FAKE_GEMINI_CALL_MODEL.
 FAKE_PROPOSED (shared with fake_claude.py): a posting-scan agent's
 Proposed rows, copied to output/proposed_rows.csv. FAKE_PAGES (also
 shared): a company-rescrape agent's output/career_pages.json.
+FAKE_RESEARCH (also shared): a research template's result, copied to
+FAKE_RESEARCH_TO (default output/research.md).
 """
 import json
 import os
@@ -165,6 +167,9 @@ if os.environ.get("FAKE_PROPOSED"):
     Path("output/proposed_rows.csv").write_text(Path(os.environ["FAKE_PROPOSED"]).read_text())
 if os.environ.get("FAKE_PAGES"):
     Path("output/career_pages.json").write_text(Path(os.environ["FAKE_PAGES"]).read_text())
+if os.environ.get("FAKE_RESEARCH"):
+    Path(os.environ.get("FAKE_RESEARCH_TO") or "output/research.md").write_text(
+        Path(os.environ["FAKE_RESEARCH"]).read_text())
 with open("progress.md", "a") as f:
     f.write("- gemini: wrote output/notes.md\n")
 result = os.environ.get("FAKE_GEMINI_RESULT", "done")

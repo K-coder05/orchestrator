@@ -21,6 +21,8 @@ orch daemon install          # launchd agent (KeepAlive) that runs queued Tasks;
 orch add "Write a haiku about the night shift to output/haiku.txt"   # asks y/n
 orch add "Tailor my resume" --priority urgent --deadline 2026-11-01 --at 02:00
 orch add "Tailor my resume and a cover letter for <posting URL>" --template resume-tailor
+orch add "Research <topic>" --template research-report
+orch add "Brief me on <company> for my interview with <names>" --template company-brief --priority urgent
 orch priority <id> background   # urgent | normal | background
 orch approve <id>            # or `orch deny <id>`, for Tasks awaiting approval
 orch retry <id>              # failed/partial: run again; retry_wait: retry now
@@ -84,6 +86,11 @@ Task folder, and Nightshift compiles the agent's `output/resume.tex` and
 Attempt fails unless the resume PDF is exactly 1 page. The posting's stated
 close date becomes the deadline unless `--deadline` is given. Nothing is ever
 submitted: you review `output/` and apply yourself.
+`research-report` and `company-brief` (public sources only, never LinkedIn)
+write `output/research.md` / `output/brief.md`; the Attempt fails unless
+every claim cites a URL or is labelled *unverified*, at least 5 distinct
+sources are cited and it is at least a page (500 words). The report lists
+the sources.
 
 The queue runs by Effective priority: urgent first (nearest deadline first),
 then normal in order, then background only when nothing else can start. A

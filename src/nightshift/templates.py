@@ -36,7 +36,9 @@ A template with a ``merge_tracker`` post-hook (posting-scan) also gets a New
 postings section there, written from the Tracker merge result (§3.1 item 9).
 One with a ``snapshot_pages`` post-hook (company-rescrape) gets a Career pages
 snapshot section: the diff against the previous Task's snapshot as counts
-(``snapshots``).
+(``snapshots``). One with a ``research_rules`` post-hook (research-report,
+company-brief) gets a Sources section: the distinct sources its result cites,
+read by Nightshift from the result file (``research``).
 """
 
 from __future__ import annotations
@@ -54,7 +56,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from . import latex, snapshots, trace, tracker
+from . import latex, research, snapshots, trace, tracker
 from .config import Config
 from .db import Database
 from .failures import PostHook, PostHookFailed
@@ -696,6 +698,48 @@ def _build_snapshot(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHook
     return _named(hook, "snapshot_pages")
 
 
+def _validate_research(name: str, h: dict) -> None:
+    unknown = sorted(set(h) - {"hook", "file", "min_sources", "min_words"})
+    if unknown:
+        raise TemplateError(f"template {name!r}: research_rules has unknown keys {', '.join(unknown)}")
+    _rel_path(name, "research_rules file", h.get("file"))
+    if not str(h["file"]).endswith(".md"):
+        raise TemplateError(f"template {name!r}: research_rules checks a Markdown (.md) file")
+    for key, floor in (("min_sources", research.MIN_SOURCES), ("min_words", 1)):
+        if key in h and not (_positive(h[key]) and h[key] >= floor):
+            raise TemplateError(f"template {name!r}: research_rules {key} must be an integer "
+                                f"of at least {floor}")
+
+
+def _research_check(cfg: Config, folder: Path, h: dict) -> research.Result:
+    text = _read_text(_regular_file(folder, h["file"]), h["file"])
+    return research.check(text, name=h["file"],
+                          min_sources=h.get("min_sources", research.MIN_SOURCES),
+                          min_words=h.get("min_words", research.MIN_WORDS),
+                          denied_domains=denied_domains(cfg))
+
+
+def _build_research(cfg: Config, host: Host, tpl: Template, h: dict) -> PostHook:
+    """The §2.11 Research rules, checked by Nightshift on the result file
+    (see ``research``): every claim cites a URL or is labelled *unverified*,
+    at least 5 distinct sources, never under one page."""
+
+    def hook(folder: Path, row: Mapping[str, Any]) -> None:
+        res = _research_check(cfg, folder, h)
+        say = lambda line: log_line(folder, line, cfg.secrets.redact, cfg.timezone)  # noqa: E731
+        say(res.summary(h["file"]) + (": all pass" if res.ok else f": {len(res.problems)} "
+                                      "problem(s)"))
+        for c in res.uncited:
+            say(f"  uncited claim, line {c.line}: {c.text}")
+        for s in res.unused:
+            say(f"  Sources entry never cited, line {s.line}: {s.url}")
+        if not res.ok:
+            for p in res.problems:
+                say(f"  research rules: {p}")
+            raise PostHookFailed("; ".join(res.problems))
+    return _named(hook, "research_rules")
+
+
 HOOKS: dict[str, HookKind] = {
     "require_outputs": HookKind(_validate_require, _build_require),
     "compile_latex": HookKind(_validate_compile, _build_compile),
@@ -703,6 +747,7 @@ HOOKS: dict[str, HookKind] = {
     "trace_changes": HookKind(_validate_trace, _build_trace, file_keys=("master",)),
     "merge_tracker": HookKind(_validate_merge, _build_merge),
     "snapshot_pages": HookKind(_validate_snapshot, _build_snapshot),
+    "research_rules": HookKind(_validate_research, _build_research),
 }
 
 
@@ -769,6 +814,16 @@ def snapshot_section(cfg: Config, row: Mapping[str, Any], template: str) -> str:
     return "\n".join(lines)
 
 
+def research_sources(cfg: Config, row: Mapping[str, Any], h: dict) -> str:
+    """The report's Sources section for one ``research_rules`` result file,
+    read from the file (never from the agent's report)."""
+    try:
+        res = _research_check(cfg, Path(row["folder"]), h)
+    except PostHookFailed as exc:
+        return f"### Sources\n\nNo sources to list: {exc}."
+    return research.sources_section(res, h["file"])
+
+
 def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
     """The Nightshift-written part of a template Task's ``report.md``: each
     ``report_diffs`` item as a unified diff of an output against the pristine
@@ -785,6 +840,9 @@ def report_appendix(cfg: Config, row: Mapping[str, Any]) -> str | None:
         parts.append(new_postings(cfg, row))
     if any(h["hook"] == "snapshot_pages" for h in tpl.post_hooks):
         parts.append(snapshot_section(cfg, row, tpl.name))
+    for h in tpl.post_hooks:
+        if h["hook"] == "research_rules":
+            parts.append(research_sources(cfg, row, h))
     if not tpl.report_diffs:
         return "\n\n".join(parts) or None
     folder = Path(row["folder"])

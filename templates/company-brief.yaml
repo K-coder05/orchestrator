@@ -1,0 +1,95 @@
+# company-brief (§5 item 3): a company and interviewer research brief, from
+# public sources only. Usage:
+#   orch add "Brief me on <company> for my <role> interview[, with <interviewer names>]" --template company-brief
+#   (Telegram: add company-brief <request>)
+#
+# The agent researches the company (and any interviewers the request names)
+# from public sources with its web search and fetch tools, and writes the
+# brief to output/brief.md. Never LinkedIn (a denied domain, §1.6), never
+# contacting anyone. The same research_rules post-hook as research-report
+# enforces the §2.11 Research rules on the brief (every claim cites a URL or
+# is labelled *unverified*, at least 5 distinct sources, never under one
+# page); any miss is a Failed Attempt. The report gets a Sources section
+# Nightshift writes from the file.
+#
+# A `research` Task: internet on, long (starts midnight-7am unless urgent:
+# use --priority urgent for an interview tomorrow), fails over to Gemini
+# when Claude is out (§2.8). 30 minutes, so it needs no plan approval (§2.4).
+name: company-brief
+description: A company and interviewer research brief from public sources (never LinkedIn)
+task_type: research
+agent: claude
+estimated_minutes: 30
+max_runtime_minutes: 90
+long: true
+internet: "on"
+
+values:
+  denied_domains: {config: permissions.denied_domains}
+
+post_hooks:
+  - hook: require_outputs
+    files: [output/brief.md]
+  - hook: research_rules
+    file: output/brief.md
+    min_sources: 5
+    min_words: 500
+
+prompt: |
+  Write me a research brief on a company, and on the people interviewing
+  me there if I name any, to prepare for an interview. My request:
+  "{{request}}"
+
+  Do this in order, keeping `progress.md` current after each step:
+
+  1. Work out the company, the role, and any interviewers my request names.
+     If it names no company, write `needs_you.json` and stop.
+  2. Research the company from public sources with your web search and
+     fetch tools: what it does, its products and customers, size, funding
+     or financials, recent news (last 12 months), engineering culture and
+     tech stack (engineering blog, open source, talks), the team or org the
+     role sits in, and its interview process as it describes it publicly.
+     Use at least 5 distinct sources; prefer the company's own site,
+     engineering blog, filings and established news.
+  3. For each interviewer my request names (if none, skip this and say so in
+     the brief): only their public professional work, such as talks,
+     papers, blog posts, open-source projects and the company's own team
+     pages. Nothing about their personal life, family, home, health or
+     politics, and nothing from social media profiles. If you can't be sure
+     a source is about the same person, leave it out or label it
+     `*unverified*`.
+  4. Never visit these domains or follow links to them (no LinkedIn, ever):
+  {{denied_domains}}
+     Respect robots.txt and site terms. Never log in, create an account,
+     fill in a form, or contact the company, the interviewers or anyone
+     else.
+  5. Write the brief to `output/brief.md` in Markdown:
+     - A `# <company>: interview brief` title, then `##` sections: At a
+       glance, Company, Recent news, Engineering, The role and team,
+       Interviewers (if any), Questions I could ask, Sources. At least 500
+       words of body text.
+     - Cite every claim. Each sentence that states a fact ends with a
+       numbered marker such as `[1]` or `[2, 4]`, naming entries of the
+       Sources section (a sentence may instead carry the URL itself, as a
+       Markdown link). This includes topic sentences that open a
+       paragraph, and At a glance.
+     - A claim you couldn't find a source for gets the label `*unverified*`
+       in its sentence, exactly so (with the asterisks). Never invent a
+       source or cite one that doesn't say what you claim. Suggested
+       questions end with a question mark and need no citation.
+     - End with a `## Sources` section, one numbered line per source, in
+       this form:
+
+           1. <title of the page> - <full URL>
+
+       Every entry must be cited at least once in the text.
+  6. Write `report.md`. Under Summary give the three things most worth
+     knowing; don't list the sources there (Nightshift adds a Sources
+     section from `output/brief.md`).
+
+  Nightshift checks `output/brief.md` after you finish and fails this
+  Attempt if any sentence making a claim has no citation and no
+  `*unverified*` label, if fewer than 5 distinct source URLs are cited, if
+  a `[n]` has no Sources entry, or if the text is under 500 words. If
+  `logs/nightshift.log` shows a failed post-hook from an earlier Attempt,
+  fix what it names first.

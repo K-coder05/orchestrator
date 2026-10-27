@@ -188,6 +188,21 @@ checked by Nightshift, not left to the agent:
 | Every changed resume line traces to `master.tex` | **Technically enforced** (mechanically; meaning is for you) | The `trace_changes` post-hook fails the Attempt if a changed body line of `output/resume.tex` has no `changes.md` entry, an entry cites no `master.tex` line or a line that doesn't exist (or only blank ones), or has no reason. It reads Nightshift's pristine copy of `master.tex`, which the agent can't reach. It can't tell whether a reword *means* the same as the cited line (e.g. "multi-user" -> "collaborative"): the unified diff in the report is there for that review. |
 | No invented numbers | **Technically enforced** | Every number in the resume's document body (percentages, counts, amounts, years) must appear somewhere in `master.tex`. LaTeX lengths and comments are skipped. A real number used in a new context (a "40%" moved to another bullet) still passes. |
 
+### Research results (§2.11)
+
+`research-report` and `company-brief` write their result to
+`output/research.md` / `output/brief.md`; the `research_rules` post-hook
+(`nightshift.research`, Nightshift code) checks it after the Attempt and
+fails the Attempt on any miss.
+
+| Limit | Status | How |
+|---|---|---|
+| Every claim cites a URL or is labelled *unverified* | **Technically enforced** (mechanically; meaning is for you) | Each body sentence of 4+ words (not a heading, question, `...:` lead-in, code or the Sources section) must carry a URL or a `[n]` naming a Sources entry, or the `*unverified*` label. It can't tell whether the cited page says what the sentence claims: the Sources list in the report is there for that review. Sentence splitting is heuristic (abbreviations and initials are kept whole). |
+| At least 5 distinct sources | **Technically enforced** | Distinct cited URLs, normalized like Tracker posting URLs; entries nothing cites don't count. Five pages of one site count as five. |
+| Never under one page | **Technically enforced** | At least 500 words of body text (`min_words`), Sources section, headings and URLs not counted. |
+| No LinkedIn | **Technically enforced** twice | The agent's web tools deny `permissions.denied_domains` (as for every internet-on Task), and the hook fails a result that cites one. |
+| Interviewers: public professional work only, no contacting anyone | **Instruction-only** | The prompt says so; nothing checks what a sentence is about. The never-list (§1.6) and the agents' tool limits stop sending messages or logging in. |
+
 ### The Tracker (§1.7)
 
 `posting-scan` agents never write the Tracker (`applications.csv`). They
